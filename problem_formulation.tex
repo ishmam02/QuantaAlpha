@@ -1,0 +1,481 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{booktabs}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newtheorem{property}{Property}
+
+% ==== convenience macros ====
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Fspace}{\mathcal{F}}
+\newcommand{\gates}{\mathcal{G}}
+\newcommand{\proto}{\Theta}
+\newcommand{\evalop}{\mathcal{E}}
+\newcommand{\feasible}{\Fspace_{\proto}}
+\newcommand{\sign}{\mathbf{z}}
+\newcommand{\wt}{\mathbf{w}}
+\newcommand{\zoo}{\Fspace_{\mathrm{zoo}}}
+\newcommand{\pred}{\hat{\bm{y}}}
+\newcommand{\combiner}{\mathcal{M}}
+
+\title{\vspace{-2.5em}\textbf{Problem Formulation (Section 3)}\\[0.3em]
+\large A Strict, Net-of-Cost, Capacity-Aware Objective for Agentic Alpha Mining}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+
+%======================================================================
+\section{Problem Formulation}
+\label{sec:problem}
+
+We consider the formulaic alpha-mining setting, in which an automated, multi-agent
+generation process proposes candidate factors that are evaluated on historical market
+data. Our contribution in this work is confined to the \emph{objective}: what a
+candidate factor is scored on, and under what protocol that score is computed. We first
+restate the frictionless predictive objective that prevails in the LLM-driven
+factor-mining literature~\cite{han2026quantaalpha,shi2025alphajungle}
+(\S\ref{sub:prelim}), make explicit the gap
+between that objective and tradeable performance (\S\ref{sub:gap}), and then define a
+deterministic execution model with transaction cost \emph{and} latency
+(\S\ref{sub:exec}), a multi-objective factor-quality vector (\S\ref{sub:objectives}),
+and a strict, non-modifiable backtesting protocol (\S\ref{sub:protocol}). The full
+problem statement is given in \S\ref{sub:statement}.
+
+%----------------------------------------------------------------------
+\subsection{Preliminaries and the frictionless objective}
+\label{sub:prelim}
+
+Let $\mathcal{S}=\{s_1,\dots,s_N\}$ be a cross-section of $N$ tradeable assets and
+$\mathcal{T}=\{t_1,\dots,t_T\}$ a sequence of trading periods. Market observations
+form a feature tensor $\bm{X}\in\R^{N\times T\times D}$ over $D$ point-in-time
+features (e.g., open, high, low, close, volume, VWAP), with $\bm{X}_t\in\R^{N\times D}$
+the cross-sectional slice available at the close of period $t$. An \emph{alpha factor}
+is a function $f\in\Fspace$ mapping the information available at $t$ to a
+cross-sectional signal
+\begin{equation}
+  f(\bm{X}_{\le t}) \;=\; \sign_t \in \R^{N},
+  \label{eq:factor}
+\end{equation}
+intended to be predictive of the forward cross-sectional return
+$\bm{y}_{t+1}\in\R^{N}$. The base label is the next-period close-to-close return with a
+one-period implementation gap,
+$y_{i,t}=P^{\mathrm{close}}_{i,t+2}/P^{\mathrm{close}}_{i,t+1}-1$, a standard choice in
+the daily factor-mining literature; we generalize this gap into an explicit latency
+parameter in \S\ref{sub:exec}.
+
+\paragraph{Factor combination.}
+Individual factors are not traded in isolation. An \emph{effective-alpha repository}
+$\zoo\subseteq\Fspace$ accumulates the factors that have passed evaluation, and a
+supervised combination model $\combiner$ maps the vector of their signals to a single
+composite return prediction,
+\begin{equation}
+  \pred_t \;=\; \combiner\big(\,[\,f(\bm{X}_{\le t})\,]_{f\in\zoo}\,;\,\theta\,\big)\in\R^{N},
+  \label{eq:combiner}
+\end{equation}
+where $\combiner$ is a gradient-boosted decision-tree regressor (LightGBM). Its
+parameters $\theta$ are fit by supervised
+regression on the training split only, taking as inputs the signals of the factors in
+the \emph{frozen} library $\zoo$ and as target the realized label; the library is held
+fixed for each refit of $\combiner$, and no out-of-sample or test data enters the fit
+(\S\ref{sub:protocol}). The portfolio in \S\ref{sub:exec} is constructed from the
+composite prediction $\pred_t$, whereas the per-factor quality vector of
+\S\ref{sub:objectives} is computed on the individual signal $\sign_t$; a new factor is
+thus judged both on its stand-alone merit and, through Eq.~\eqref{eq:combiner}, on its
+marginal contribution to the combined book.
+
+Prior LLM-driven miners cast factor discovery as a regularized predictive-fit problem,
+selecting the factor that maximizes a scalar effectiveness measure $\mathcal{L}$
+(typically the Information Coefficient or a rank variant) against a novelty/complexity
+penalty $\mathcal{R}$:
+\begin{equation}
+  f^\star \;=\; \arg\max_{f\in\Fspace}\;
+  \mathcal{L}\!\big(f(\bm{X}),\,\bm{y}\big)\;-\;\lambda\,\mathcal{R}(f).
+  \label{eq:frictionless}
+\end{equation}
+Equation~\eqref{eq:frictionless} is, with minor variation, the objective of the broader
+IC-maximizing literature~\cite{han2026quantaalpha,shi2025alphajungle}. It is
+\emph{frictionless}: the
+effectiveness term $\mathcal{L}$ is a correlation between a signal and a forward return
+and is silent on whether the signal can be realized as profit once trading is priced
+in.
+
+%----------------------------------------------------------------------
+\subsection{The gap: frictionless prediction vs.\ tradeable performance}
+\label{sub:gap}
+
+A signal optimized purely for predictive correlation is not the same object as a
+tradeable factor. Maximizing~\eqref{eq:frictionless} systematically rewards signals
+whose predictive content is concentrated in small, illiquid names and whose exploitation
+requires high portfolio turnover---precisely the signals whose apparent edge is consumed
+by bid--ask spread, slippage, market impact, and the price drift incurred between the
+moment a signal is computed and the moment an order actually fills. Two frictions are
+routinely omitted from~\eqref{eq:frictionless} and are the focus of this work:
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Transaction cost.} Turnover is priced, not free. In the IC-maximizing
+        literature it appears, if at all, as a soft post-hoc penalty rather than inside
+        the reward.
+  \item \textbf{Transaction latency.} A factor is computed on information available at
+        decision time $t$, but no order fills at the decision-time price. The order
+        fills after a nonzero latency, at a later---and adversarially different---price.
+        The realized entry (buy) price is therefore a function of latency, not of the
+        price the signal was computed on.
+\end{enumerate}
+We therefore replace the frictionless objective~\eqref{eq:frictionless} with a
+\emph{net-of-cost, capacity-aware} objective in which both frictions are priced
+\emph{inside} the quantity the miner optimizes, and evaluated by a deterministic engine
+whose parameters the generation process cannot alter (\S\ref{sub:protocol}).
+
+%----------------------------------------------------------------------
+\subsection{Execution model: cost and latency}
+\label{sub:exec}
+
+\paragraph{Latency and the fill price.}
+Let $\delta\ge 0$ be a fixed \emph{execution latency}, measured in trading periods,
+between the decision time $t$ and the time an order is filled. A signal $\sign_t$
+computed at the close of $t$ is executed at a fill price determined at $t+\delta$:
+\begin{equation}
+  P^{\mathrm{fill}}_{i,t} \;=\; \Phi\!\big(P_i;\,t,\delta\big),
+  \label{eq:fill}
+\end{equation}
+where $\Phi$ is a fixed fill rule (e.g., the open of $t{+}1$ for $\delta{=}1$, or a
+VWAP over $[t,\,t+\delta]$). The tradeable per-asset return realized between consecutive
+fills,
+\begin{equation}
+  \tilde{y}_{i,t} \;=\; \frac{P^{\mathrm{fill}}_{i,t+1}}{P^{\mathrm{fill}}_{i,t}}-1,
+  \label{eq:realized}
+\end{equation}
+differs from the frictionless label $\bm{y}_{t+1}$ whenever $\delta>0$: latency
+determines the entry price and hence the return the strategy actually earns.
+
+\paragraph{Portfolio construction.}
+A fixed, deterministic map $g$ converts the composite
+prediction~\eqref{eq:combiner} into portfolio weights
+$\wt_t = g(\pred_t)\in\R^{N}$, \emph{not} an idealized equal-weight top decile. Weights
+are signed---$w_{i,t}>0$ is a long and $w_{i,t}<0$ is a short position---so the
+formulation considers both long and short selling; the canonical construction is a
+rank-based, dollar-neutral long--short book that goes long the top of the cross-section
+and short the bottom, with the gross-exposure (leverage) constraint
+$\sum_i |w_{i,t}|\le 1$. The one-way \emph{turnover} at $t$ is
+\begin{equation}
+  \mathrm{TO}_t \;=\; \tfrac{1}{2}\textstyle\sum_{i=1}^{N}
+  \big|\,w_{i,t}-w^{\mathrm{drift}}_{i,t}\,\big|,
+  \label{eq:turnover}
+\end{equation}
+where $w^{\mathrm{drift}}_{i,t}$ is the pre-rebalance weight after market drift.
+
+\paragraph{Cost and net return.}
+Trading incurs three modeled cost components. Writing the per-asset traded fraction as
+$\Delta w_{i,t}=w_{i,t}-w^{\mathrm{drift}}_{i,t}$, the per-period cost is
+\begin{equation}
+  c_t \;=\;
+  \underbrace{\kappa_0\,\mathrm{TO}_t}_{\text{spread}+\text{fees}}
+  \;+\;
+  \underbrace{\kappa_1\!\sum_{i}\sigma_{i,t}\,\big|\Delta w_{i,t}\big|}_{\text{slippage}}
+  \;+\;
+  \underbrace{\kappa_2\!\sum_{i}\phi\!\big(\Delta w_{i,t};\,\mathrm{ADV}_{i,t}\big)}_{\text{market impact}}
+  \;+\;
+  \underbrace{\sum_{i}\beta_{i,t}\,\max(0,-w_{i,t})}_{\text{short borrow}},
+  \label{eq:cost}
+\end{equation}
+with fixed coefficients $(\kappa_0,\kappa_1,\kappa_2)$ and a fixed, convex impact
+function $\phi$ (e.g., a square-root law $\phi(\Delta w;\mathrm{ADV})\propto
+|\Delta w|^{3/2}/\sqrt{\mathrm{ADV}}$). The first three terms are traded-size costs and
+the fourth is a holding cost on the short leg: $\beta_{i,t}\ge 0$ is the per-period
+borrow/financing rate for shorting asset $i$, charged on the short notional
+$\max(0,-w_{i,t})$, which also encodes hard-to-borrow names (large or infinite
+$\beta_{i,t}$) so that unshortable assets are penalized rather than assumed freely
+sellable. The size-dependent terms are deliberately distinct: the
+first is a size-independent charge proportional to turnover; the second is
+\emph{slippage}, the temporary execution shortfall from crossing the book, taken linear
+in traded size and scaled by the asset's return volatility $\sigma_{i,t}$; the third is
+\emph{market impact}, which grows super-linearly in trade size relative to available
+liquidity and is what makes the objective capacity-aware. The remaining, timing
+component of slippage---price drift between the decision at $t$ and the fill at
+$t+\delta$---is not modeled here but realized directly through the latency-aware fill
+price of Eqs.~\eqref{eq:fill}--\eqref{eq:realized}, so it is not double-counted in $c_t$.
+The \emph{net excess return} of the portfolio, computed on the latency-aware realized
+returns~\eqref{eq:realized}, is
+\begin{equation}
+  r^{\mathrm{net}}_{t}
+  \;=\; \wt_t^{\!\top}\tilde{\bm{y}}_{t}
+  \;-\; r^{\mathrm{bench}}_{t}
+  \;-\; c_t .
+  \label{eq:netreturn}
+\end{equation}
+Equations~\eqref{eq:fill}--\eqref{eq:netreturn} constitute the execution model: the
+single scalar that any downstream objective is built from is
+$r^{\mathrm{net}}_t$, which prices turnover, slippage/impact, and latency
+simultaneously.
+
+%----------------------------------------------------------------------
+\subsection{Multi-objective factor quality}
+\label{sub:objectives}
+
+We score a candidate factor $f$ on a vector of quality dimensions
+$\bm{m}(f)=\big(m_1,\dots,m_M\big)$, extending the multi-dimensional evaluation of
+formulaic miners~\cite{shi2025alphajungle} so that every economically meaningful
+dimension is computed on the net-of-cost, latency-aware quantities of
+\S\ref{sub:exec}. All statistics use $\bar{(\cdot)}$ for the temporal mean and
+$\sigma(\cdot)$ for the temporal standard deviation over the evaluation window.
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=3pt]
+\item \textbf{Effectiveness.} Predictive alignment via the Information Coefficient
+      $\mathrm{IC}_t=\mathrm{corr}(\sign_t,\bm{y}_{t+1})$ and its rank analogue
+      $\mathrm{RankIC}_t$, together with the realized economic edge, the
+      \emph{net-of-cost} Information Ratio
+      $\mathrm{IR}=\big(\overline{r^{\mathrm{net}}}/\sigma(r^{\mathrm{net}})\big)\sqrt{P}$,
+      where $P$ is the number of periods per year.
+
+\item \textbf{Annualized return.} The annualized net excess return
+      $\mathrm{ARR}=\big(\prod_t (1+r^{\mathrm{net}}_t)\big)^{P/T_{\text{eval}}}-1$,
+      reported as a headline economic objective alongside maximum drawdown (MDD) for
+      risk context.
+
+\item \textbf{Stability.} Temporal consistency of the signal, via the IC information
+      ratios $\mathrm{ICIR}=\overline{\mathrm{IC}}/\sigma(\mathrm{IC})$ and
+      $\mathrm{RankICIR}$, and the fraction of periods with positive IC. Stability
+      penalizes signals whose edge is realized in a few episodes and is otherwise
+      noise.
+
+\item \textbf{Turnover.} Mean one-way turnover $\overline{\mathrm{TO}}$
+      from~\eqref{eq:turnover}. Beyond feeding the cost term~\eqref{eq:cost}, turnover
+      is a first-class capacity dimension: it bounds the size at which the factor can be
+      deployed.
+
+\item \textbf{Diversity.} Redundancy against the existing repository $\zoo$, measured
+      as the maximum absolute cross-sectional correlation of the candidate's signal
+      with any incumbent, $\rho_{\max}(f)=\max_{f'\in\zoo}\big|\mathrm{corr}(\sign^{f},\sign^{f'})\big|$.
+      Low $\rho_{\max}$ favors orthogonal signals and directly combats factor crowding.
+
+\item \textbf{Over-fitting risk.} A composite of (i) structural complexity
+      $\mathrm{cx}(f)$---expression length / node count / free-parameter count of the
+      factor's syntax tree, following the AST-based complexity control
+      of~\cite{tang2025alphaagent}---and (ii) the in-sample-to-out-of-sample
+      degradation $\Delta_{\mathrm{IS\to OOS}}(f)=m^{\mathrm{IS}}(f)-m^{\mathrm{OOS}}(f)$
+      of the effectiveness metric. Higher complexity and larger degradation both raise
+      the estimated risk that a backtested edge is spurious.
+
+\item \textbf{Decay resistance (optional).} Persistence of predictive power across the
+      out-of-sample horizon. Partition the OOS window into $K$ consecutive sub-periods
+      and let $\mathrm{IC}^{(k)}$ be the mean IC in sub-period $k$. Fit the linear trend
+      $\mathrm{IC}^{(k)}=a+b\,k+\varepsilon_k$; the \emph{decay slope} $b$ (and the
+      persistence ratio $\mathrm{IC}^{(K)}/\mathrm{IC}^{(1)}$) summarize how quickly the
+      edge erodes. We report a persistence-adjusted effectiveness
+      $\mathrm{IC}^{\mathrm{pers}}=\overline{\mathrm{IC}}\cdot\big(1-\lambda_d\max(0,-\hat{b}_{\text{norm}})\big)$
+      as a decay-aware summary. See Remark~\ref{rem:decay} on its status and scope.
+\end{enumerate}
+
+\paragraph{Adaptive scoring against the evolving repository.}
+Admissibility and scoring are distinct steps. The gates of~\eqref{eq:feasible} decide
+\emph{whether} a factor enters the feasible set $\feasible$, using the fixed, absolute
+floors above; once a factor is admissible, we must still decide \emph{how good} it is
+relative to the others, and here fixed cutoffs are the wrong tool. Because the
+effective-alpha repository $\zoo$ grows as mining proceeds, a scoring bar that is
+informative early becomes trivial late; we therefore score each admissible factor's
+dimensions by their \emph{relative rank} within the current repository,
+following~\cite{shi2025alphajungle}.
+For a dimension metric $m$ (oriented so that larger is better), the rank of a candidate
+against the repository is
+\begin{equation}
+  R(f, m, \zoo) \;=\; \frac{1}{|\zoo|}\sum_{f'\in\zoo}\mathbb{1}\!\big[\,m(f) < m(f')\,\big],
+  \label{eq:relrank}
+\end{equation}
+where $\mathbb{1}[\cdot]$ is the indicator function, and the corresponding dimension
+score is the percentile complement $e_i(f)=1-R(f,m_i,\zoo)\in[0,1]$, so a factor that
+outperforms more incumbents scores higher. This gives an adaptive criterion whose bar
+rises automatically as $\zoo$ improves, avoiding fixed thresholds that are too stringent
+at the start or too lenient once many strong factors have accumulated. Over-fitting risk
+(item~6) is the exception: it is assessed from the factor's structure and refinement
+history rather than by repository rank. The scalar utility $\mathcal{U}$ of
+\S\ref{sub:statement} aggregates these per-dimension scores $e_i(f)$. Note the two roles
+the repository plays are distinct: for \emph{combination} (Eq.~\eqref{eq:combiner}) the
+library is frozen to fit $\combiner$, while for \emph{scoring} (Eq.~\eqref{eq:relrank})
+it is the moving reference set against which each new candidate is ranked; the same
+accumulated set of effective alphas underlies both.
+
+\begin{remark}[On ``decay-resistant IC'']
+\label{rem:decay}
+Decay resistance is a well-motivated \emph{property}~\cite{tang2025alphaagent}: factors
+lose predictive power as regimes shift and crowding sets in, and a net-of-cost objective
+is by construction non-stationary. It is not, however, a standard closed-form metric;
+in prior work it is achieved through regularization and demonstrated \emph{empirically}
+as IC/IR persistence over time. We therefore treat it as an out-of-sample persistence
+diagnostic (the decay slope $b$ and $\mathrm{IC}^{\mathrm{pers}}$ above) rather than a
+new headline statistic. It is partially---but not fully---subsumed by Stability
+(which measures IC \emph{variance}) and Over-fitting risk (which measures the IS$\to$OOS
+\emph{level gap}): neither captures a monotone \emph{temporal trend} within the OOS
+window, which is the distinct signal $b$ provides. We include it as an optional
+diagnostic and defer a formal significance treatment of alpha decay to the falsification
+component discussed in \S\ref{sub:statement}.
+\end{remark}
+
+%----------------------------------------------------------------------
+\subsection{Strict deterministic backtesting protocol}
+\label{sub:protocol}
+
+The objective above is only as trustworthy as the procedure that computes it. We
+enforce a strict separation of concerns, in the spirit of the deterministic evaluation
+engine of~\cite{huang2026hypotheses}: the generation process proposes factors, while a
+fixed evaluation engine---and only the engine---assigns scores.
+
+Let the \emph{protocol}
+$\proto=\big(\mathcal{D}_{\mathrm{tr}},\mathcal{D}_{\mathrm{va}},\mathcal{D}_{\mathrm{te}};\,
+\gates;\,\kappa_0,\kappa_1,\kappa_2,\phi,\beta;\,\delta,\Phi;\,g\big)$
+collect every parameter of evaluation: the frozen train/validation/test splits, the
+selection gates $\gates$, the cost model, the latency and fill rule, and the portfolio
+map. Given $\proto$, a \emph{deterministic evaluation operator} $\evalop_\proto$ maps any
+factor to its metric vector,
+\begin{equation}
+  \bm{m}(f) \;=\; \evalop_\proto(f),
+  \label{eq:evalop}
+\end{equation}
+computed strictly on point-in-time data with no look-ahead. The engine guarantees:
+
+\begin{property}[Immutability]
+\label{prop:immut}
+$\proto$ is fixed before search and is a constant of the environment. The
+generation process can propose any $f\in\Fspace$ but cannot alter any element of
+$\proto$---it cannot move a window boundary, relax a gate threshold, re-price a cost, or
+change the latency. Reported metrics thus cannot be inflated by tuning the protocol to
+the factor---the reuse of evaluation windows during search being a documented source of
+performance overestimation~\cite{deng2025autoquant}.
+\end{property}
+
+\begin{property}[Determinism and reproducibility]
+\label{prop:det}
+$\evalop_\proto$ is a pure function of $(f,\proto)$: identical inputs yield identical
+$\bm{m}(f)$, so every trial is exactly reproducible and auditable.
+\end{property}
+
+\begin{property}[Point-in-time integrity]
+\label{prop:pit}
+All features, labels~\eqref{eq:realized}, fills~\eqref{eq:fill}, and
+costs~\eqref{eq:cost} use only information available at or before their timestamp;
+the test split $\mathcal{D}_{\mathrm{te}}$ is never touched during selection.
+\end{property}
+
+The \emph{selection gates} $\gates$ act as hard feasibility constraints, evaluated on
+the training/validation splits only:
+\begin{equation}
+  \feasible \;=\; \Big\{\, f\in\Fspace \;:\;
+  \mathrm{RankIC}(f)\ge \gamma_{\mathrm{ic}},\;
+  \mathrm{RankICIR}(f)\ge \gamma_{\mathrm{ir}},\;
+  \overline{\mathrm{TO}}(f)\le \tau_{\max},\;
+  \rho_{\max}(f)\le \bar{\rho},\;
+  \mathrm{cx}(f)\le \gamma_{\mathrm{cx}}
+  \,\Big\},
+  \label{eq:feasible}
+\end{equation}
+with all thresholds $(\gamma_{\mathrm{ic}},\gamma_{\mathrm{ir}},\tau_{\max},\bar{\rho},
+\gamma_{\mathrm{cx}})\in\proto$ frozen. Gates encode the tradeability and
+diversity requirements as \emph{admissibility}, not as soft preferences: they answer the
+binary question of whether a factor can be traded at all, and their thresholds are
+absolute physical floors---a turnover cap or a redundancy ceiling is a property of the
+market and the existing book, not a bar that should drift with search progress. This is a
+separate question from how the admissible factors are then \emph{scored} and ranked
+against one another, which we turn to next.
+
+%----------------------------------------------------------------------
+\subsection{Problem statement}
+\label{sub:statement}
+
+We can now state the problem. Given a frozen protocol $\proto$ and its deterministic
+evaluation operator $\evalop_\proto$, we seek factors that maximize a net-of-cost
+economic utility over the feasible set defined by the frozen gates:
+\begin{equation}
+  \boxed{\;
+  f^\star \;=\; \arg\max_{f\in\feasible}\;
+  \mathcal{U}\!\big(\bm{m}(f)\big),
+  \qquad \bm{m}(f)=\evalop_\proto(f),
+  \;}
+  \label{eq:problem}
+\end{equation}
+where $\mathcal{U}$ is a net-of-cost economic objective---at minimum the net Information
+Ratio / ARR of~\eqref{eq:netreturn}, optionally a fixed scalarization
+$\mathcal{U}(\bm{m})=\sum_j \omega_j \hat{m}_j$ with $\hat{m}_j \equiv e_j(f)$, i.e.\ the
+normalized quality dimensions of \S\ref{sub:objectives} are exactly the
+repository-relative dimension scores $e_j(f)=1-R(f,m_j,\zoo)$ of
+Eq.~\eqref{eq:relrank}, combined with fixed weights $\bm{\omega}\in\proto$ to rank
+candidates and give dimension-targeted feedback to the generation process. Because
+the repository $\zoo$ is built incrementally, both the diversity term $\rho_{\max}$
+in~\eqref{eq:feasible} and the relative ranks in~\eqref{eq:relrank} are evaluated against
+the current $\zoo$, so~\eqref{eq:problem} defines the marginal contribution of each factor
+to a jointly non-redundant, capacity-robust portfolio.
+
+Two properties distinguish~\eqref{eq:problem} from the frictionless
+objective~\eqref{eq:frictionless}. First, \emph{costs and latency are inside the
+objective}: $\bm{m}(f)$ is computed from $r^{\mathrm{net}}$, so the miner is rewarded for
+capacity-robust structure rather than for illiquid, high-turnover mirages. Second, the
+objective is \emph{honest by construction}: by Properties~\ref{prop:immut}--\ref{prop:pit},
+the score of every candidate is a deterministic, reproducible, look-ahead-free function
+of a protocol the generator cannot bend to its own factors.
+
+\paragraph{Scope and roadmap.}
+This work is the first component of a larger system and is deliberately scoped to the
+objective and its enforcement: the factor-generation process is held fixed and we change
+only what it optimizes and how that is measured. Concretely, the evaluation protocol
+$\proto$---markets, data splits, feature set, and the combination model
+$\combiner$---is instantiated with the configuration of a published IC-maximizing
+baseline~\cite{han2026quantaalpha} and held fixed, so that the baseline's reported
+results are directly comparable and the effect of the objective change can be isolated
+without re-running the baseline pipeline. Subsequent components---a falsification critic that supplies a
+selection-bias-corrected significance test over the complete population of trials
+(e.g., a deflated Sharpe ratio~\cite{bailey2014dsr} under multiple-testing
+correction~\cite{harvey2016cross}), and a
+continually refreshed, decay-monitored factor library with per-factor provenance for
+deployment---build on the reproducible trial record that
+Properties~\ref{prop:immut}--\ref{prop:det} make available, and are outside the scope of
+this section.
+
+%======================================================================
+\begin{thebibliography}{9}
+\small
+\bibitem{han2026quantaalpha}
+J.~Han, S.~Zhang, W.~Li, et al.
+\newblock QuantaAlpha: An Evolutionary Framework for LLM-Driven Alpha Mining.
+\newblock \emph{arXiv:2602.07085}, 2026.
+
+\bibitem{shi2025alphajungle}
+Y.~Shi, Y.~Duan, and J.~Li.
+\newblock Navigating the Alpha Jungle: An LLM-Powered MCTS Framework for Formulaic
+Factor Mining.
+\newblock \emph{arXiv:2505.11122}, 2025.
+
+\bibitem{tang2025alphaagent}
+Z.~Tang, et al.
+\newblock AlphaAgent: LLM-Driven Alpha Mining with Regularized Exploration to
+Counteract Alpha Decay.
+\newblock \emph{Proc.\ ACM SIGKDD (KDD~'25)}; arXiv:2502.16789, 2025.
+
+\bibitem{huang2026hypotheses}
+Y.~Huang, Z.~Fan, K.~Hu, and Y.~Ye.
+\newblock From Hypotheses to Factors: Constrained LLM Agents in Cryptocurrency Markets.
+\newblock \emph{arXiv:2604.26747}, 2026.
+
+\bibitem{deng2025autoquant}
+K.~Deng.
+\newblock AutoQuant: An Auditable Expert-System Framework for Execution-Constrained
+Auto-Tuning in Cryptocurrency Perpetual Futures.
+\newblock \emph{arXiv:2512.22476}, 2025.
+
+\bibitem{bailey2014dsr}
+D.~H. Bailey and M.~L\'opez de Prado.
+\newblock The Deflated Sharpe Ratio: Correcting for Selection Bias, Backtest
+Overfitting, and Non-Normality.
+\newblock \emph{J.\ Portfolio Management}, 40(5), 2014.
+
+\bibitem{harvey2016cross}
+C.~R. Harvey, Y.~Liu, and H.~Zhu.
+\newblock $\ldots$ and the Cross-Section of Expected Returns.
+\newblock \emph{Review of Financial Studies}, 29(1), 2016.
+\end{thebibliography}
+
+\end{document}
