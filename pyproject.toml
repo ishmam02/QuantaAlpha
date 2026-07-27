@@ -42,6 +42,14 @@ issue = "https://github.com/QuantaAlpha/quantaalpha/issues"
 [tool.setuptools]
 packages = {find = {where = ["."]}}
 
+# The package ships data files that are loaded relative to __file__: the
+# evaluation protocol (quantaalpha/eval/protocol_csi300.yaml), the Qlib config
+# templates, and every prompts.yaml. Editable installs read them from the source
+# tree regardless, but without this a real install silently omits them and the
+# first protocol load fails with FileNotFoundError.
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json", "*.txt", "*.jinjia2"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 

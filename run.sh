@@ -9,6 +9,19 @@
 # Examples:
 #   ./run.sh "price-volume factor mining"
 #   ./run.sh "momentum reversal factors" "exp_momentum"
+#
+# ARM SELECTION (QA_ARM)
+#   The default is the TREATMENT arm: the net-of-cost, capacity-aware objective
+#   of problem_formulation.tex section 3, evaluated by E_Theta.
+#
+#     ./run.sh "price-volume factor mining"                  # treatment (default)
+#     QA_ARM=control ./run.sh "price-volume factor mining"   # published baseline
+#
+#   Treatment swaps only the runner and the summarizer, through the existing
+#   plugin env vars; the generation process (loop, DSL, CoSTEER, mutation and
+#   crossover prompt bodies) is identical in both arms. For a valid A/B the two
+#   arms must share the model, the seed, the config and the scale -- only the
+#   objective may differ.
 
 # =============================================================================
 # Locate project root
@@ -68,8 +81,23 @@ echo ""
 # =============================================================================
 CONFIG_PATH=${CONFIG_PATH:-"configs/experiment.yaml"}
 
+# -----------------------------------------------------------------------------
+# Arm selection
+# -----------------------------------------------------------------------------
+# Treatment is the default: this is the net-of-cost objective branch, and the
+# baseline is reachable with QA_ARM=control. The banner below prints the active
+# arm unconditionally so a run can never be misattributed after the fact.
+case "$(echo "${QA_ARM:-treatment}" | tr '[:upper:]' '[:lower:]')" in
+    treatment|b|new|netcost|net_cost) QA_ARM_RESOLVED="treatment" ;;
+    control|a|baseline|rankic)        QA_ARM_RESOLVED="control" ;;
+    *)
+        echo "Error: unknown QA_ARM='${QA_ARM}' (expected 'treatment' or 'control')"
+        exit 1
+        ;;
+esac
+
 if [ -z "${EXPERIMENT_ID}" ]; then
-    EXPERIMENT_ID="exp_$(date +%Y%m%d_%H%M%S)"
+    EXPERIMENT_ID="${QA_ARM_RESOLVED}_$(date +%Y%m%d_%H%M%S)"
 fi
 export EXPERIMENT_ID
 
@@ -128,13 +156,79 @@ LIBRARY_SUFFIX="$2"
 
 if [ -n "${LIBRARY_SUFFIX}" ]; then
     export FACTOR_LIBRARY_SUFFIX="${LIBRARY_SUFFIX}"
+else
+    # Keep the two arms' factor libraries apart by default; the head-to-head in
+    # scripts/qa_compare_arms.py needs both, and a shared filename loses one.
+    export FACTOR_LIBRARY_SUFFIX="${EXPERIMENT_ID}"
+fi
+
+# =============================================================================
+# Wire the objective
+# =============================================================================
+if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
+    # NOTE: QLIB_FACTOR_ is a shared env prefix across all three settings classes
+    # (settings.py:50/63/76), so this swaps the runner everywhere at once. That
+    # is what we want here.
+    export QLIB_FACTOR_RUNNER="quantaalpha.factors.net_cost_runner.NetCostFactorRunner"
+    export QLIB_FACTOR_SUMMARIZER="quantaalpha.factors.net_cost_feedback.NetCostFactorFeedback"
+    export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-U}"
+    export QA_REQUIRE_FEASIBLE="${QA_REQUIRE_FEASIBLE:-true}"
+    # Absolute paths: the loop runs factor code inside per-factor workspaces, and
+    # a relative protocol/ledger path would resolve against whatever the cwd
+    # happens to be at that moment.
+    export QA_PROTOCOL="${QA_PROTOCOL:-${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml}"
+    export QA_LEDGER="${QA_LEDGER:-${SCRIPT_DIR}/${RESULTS_BASE#./}/ledger_${EXPERIMENT_ID}.jsonl}"
+    mkdir -p "$(dirname "${QA_LEDGER}")"
+fi
+
+# -----------------------------------------------------------------------------
+# Preflight: fail before any LLM spend, not five minutes into the run
+# -----------------------------------------------------------------------------
+if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
+    THETA_HASH=$(python - <<'PY' 2>/dev/null
+import os, sys
+try:
+    from quantaalpha.core.utils import import_class
+    from quantaalpha.eval.protocol import load_protocol
+    theta = load_protocol(os.environ["QA_PROTOCOL"])
+    import_class(os.environ["QLIB_FACTOR_RUNNER"])
+    import_class(os.environ["QLIB_FACTOR_SUMMARIZER"])
+    print(theta.hash)
+except Exception as exc:
+    print(f"PREFLIGHT_FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+    )
+    if [ -z "${THETA_HASH}" ]; then
+        echo "Error: treatment-arm preflight failed."
+        echo "  Re-run this to see the error:"
+        echo "    python -c \"from quantaalpha.eval.protocol import load_protocol; load_protocol('${QA_PROTOCOL}')\""
+        exit 1
+    fi
 fi
 
 echo ""
+echo "========================================================================"
+if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
+    echo "  ARM: TREATMENT  --  net-of-cost, capacity-aware objective (E_Theta)"
+    echo "------------------------------------------------------------------------"
+    echo "  objective    : ${QA_PRIMARY_METRIC}   (feasibility enforced: ${QA_REQUIRE_FEASIBLE})"
+    echo "  protocol     : ${QA_PROTOCOL}"
+    echo "  theta hash   : ${THETA_HASH}"
+    echo "  runner       : ${QLIB_FACTOR_RUNNER##*.}"
+    echo "  summarizer   : ${QLIB_FACTOR_SUMMARIZER##*.}"
+    echo "  ledger       : ${QA_LEDGER}"
+else
+    echo "  ARM: CONTROL  --  published RankIC objective (unmodified pipeline)"
+    echo "------------------------------------------------------------------------"
+    echo "  objective    : RankIC   (stock runner/summarizer, no feasibility gate)"
+fi
+echo "========================================================================"
 echo "Starting experiment..."
 echo "Config: ${CONFIG_PATH}"
 echo "Data: ${QLIB_DATA}"
 echo "Results: ${RESULTS_BASE}"
+echo "Factor library suffix: ${FACTOR_LIBRARY_SUFFIX}"
 echo "----------------------------------------"
 
 if [ -n "${STEP_N}" ]; then
