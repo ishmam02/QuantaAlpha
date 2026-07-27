@@ -123,6 +123,22 @@ class NetCostFactorRunner(QlibFactorRunner):
         if exp.based_experiments and exp.based_experiments[-1].result is None:
             exp.based_experiments[-1] = self.develop(exp.based_experiments[-1], use_local=use_local)
 
+        # A based/container experiment carries accumulated state but no factors
+        # of its own. The recursion above hands us exactly that, and raising
+        # FactorEmptyError here aborts the whole develop before the real
+        # candidate -- which does have sub-workspaces -- is ever evaluated.
+        # QlibFactorRunner never hits this because it guards its entire
+        # factor-loading block behind `if exp.based_experiments:`, so a based
+        # experiment skips straight to qrun.
+        if not (getattr(exp, "sub_workspace_list", None) or []):
+            logger.info(
+                "Experiment has no sub-workspaces (based/container experiment); "
+                "nothing for E_theta to evaluate here"
+            )
+            if getattr(exp, "result", None) is None:
+                exp.result = pd.Series(dtype=float)
+            return exp
+
         # Shares the control arm's recovery path: a missing result.h5 is re-run
         # rather than treated as a dead loop. Calling process_factor_data
         # directly here made a single missing output skip the whole loop before
