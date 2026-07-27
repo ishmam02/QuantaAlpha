@@ -274,12 +274,36 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
 
         # Collect all exp's dataframes
         for exp in exp_or_list:
+            n_ws = len(getattr(exp, "sub_workspace_list", None) or [])
+            logger.info(f"process_factor_data: {n_ws} sub-workspace(s) to execute")
+            if n_ws == 0:
+                logger.warning(
+                    "Experiment has an empty sub_workspace_list -- nothing to execute. "
+                    "The factors were never attached to the experiment reaching the runner."
+                )
             # Iterate over sub-implementations and execute them to get each factor data
             message_and_df_list = multiprocessing_wrapper(
                 [(implementation.execute, ("All",)) for implementation in exp.sub_workspace_list],
                 n=RD_AGENT_SETTINGS.multi_proc_n,
             )
             for idx, (message, df) in enumerate(message_and_df_list):
+                # Why a factor was dropped. `execute` returns its failure as the
+                # *message* and None as the DataFrame, and this loop only ever
+                # inspected the DataFrame -- so a subprocess traceback, a missing
+                # data folder, or an unset code_dict all collapsed into the same
+                # opaque "No valid factor data found to merge" with the actual
+                # cause discarded. Log it once per rejected factor.
+                if df is None or "datetime" not in getattr(df.index, "names", []):
+                    ws_name = ""
+                    if idx < len(exp.sub_workspace_list):
+                        ws_name = Path(exp.sub_workspace_list[idx].workspace_path).name[:12]
+                    reason = "no dataframe" if df is None else f"index names {list(df.index.names)}"
+                    detail = str(message).strip() if message else "(no feedback)"
+                    logger.warning(
+                        f"Factor {idx} [{ws_name}] produced no usable data ({reason}). "
+                        f"execute() feedback:\n{detail[-1500:]}"
+                    )
+
                 # Check if factor generation was successful
                 if df is not None and "datetime" in df.index.names:
                     # Convert Series to DataFrame if needed
@@ -296,6 +320,10 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                     time_diff = df.index.get_level_values("datetime").to_series().diff().dropna().unique()
                     if pd.Timedelta(minutes=1) not in time_diff:
                         factor_dfs.append(df)
+                    else:
+                        logger.warning(
+                            f"Factor {idx} rejected: minute-level timestamps found in the index"
+                        )
 
         # Combine all successful factor data
         if factor_dfs:
