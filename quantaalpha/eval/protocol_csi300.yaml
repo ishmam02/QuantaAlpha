@@ -76,7 +76,12 @@ costs: # Eq. 7
 
 gates: # F_Θ — Eq. 9; absolute floors, train+valid only
   gamma_ic: 0.02
-  gamma_ir: 0.20
+  # Calibrated against the measured distribution of *individual* factor RankICIR
+  # on the existing library (max 0.1652, median 0.0742). The original 0.20 was
+  # at combined-model scale -- the repo's own combined run scores 0.3225 -- and
+  # admitted 0/12. At 0.15 exactly the four factors that also clear gamma_ic
+  # pass, so the gate discriminates instead of rejecting everything.
+  gamma_ir: 0.15
   tau_max: 0.30
   rho_bar: 0.70
   gamma_cx: 250 # matches FACTOR_CoSTEER_SYMBOL_LENGTH_THRESHOLD in .env

@@ -56,7 +56,12 @@ class NetCostFactorRunner(QlibFactorRunner):
         self.theta = load_protocol(default_protocol_path())
         self.op = EvaluationOperator(self.theta)
         self.ledger = Ledger(os.environ.get("QA_LEDGER", DEFAULT_LEDGER_PATH))
-        self._zoo_metrics: list[dict] = []
+        # THE effective-alpha repository. Ordered {expression -> (signal, metrics)},
+        # appended to only when a factor is admissible. Deriving both the
+        # combination inputs and the ranking incumbents from this one object is
+        # what keeps Eq. 2 and Eq. 11 synchronized on the same repository state:
+        # two separate accumulators would silently drift apart.
+        self._repository: dict[str, tuple[Any, dict]] = {}
         logger.info(
             "NetCostFactorRunner active: theta=%s protocol=%s ledger=%s",
             self.theta.hash, default_protocol_path(), self.ledger.path,
@@ -83,10 +88,15 @@ class NetCostFactorRunner(QlibFactorRunner):
             # Preserve the skip-loop semantics at workflow.py:116.
             raise FactorEmptyError("No valid factor data found to merge.")
 
-        zoo_signals = self._zoo(exp)
+        # One repository state, read once, used for BOTH the combiner refit and
+        # the relative ranking (Eq. 2 and Eq. 11 synchronized at the evaluation).
+        # Held fixed across every candidate in this experiment: admitting a
+        # sibling mid-loop would make the score depend on column ordering.
+        zoo_signals, zoo_metrics = self._zoo(exp)
         expressions = self._expressions(exp, new_factors.columns)
 
         results: list[dict] = []
+        admitted: list[tuple[str, Any, dict]] = []
         for column in new_factors.columns:
             expr = expressions.get(column, str(column))
             signal = new_factors[column].dropna()
@@ -94,12 +104,14 @@ class NetCostFactorRunner(QlibFactorRunner):
                 logger.warning("candidate %s produced an empty signal; skipping", column)
                 continue
             try:
-                res = self.op.evaluate(signal, expr, zoo_signals, self._zoo_metrics)
+                res = self.op.evaluate(signal, expr, zoo_signals, zoo_metrics)
             except Exception:
                 logger.exception("E_theta evaluation failed for %s", column)
                 continue
             res["factor_name"] = str(column)
             results.append(res)
+            if res.get("feasible"):
+                admitted.append((expr, signal, {k[2:]: v for k, v in res.items() if k.startswith("m_")}))
             self.ledger.append(
                 {
                     "factor_id": md5_hash(f"{column}_{expr}")[:16],
@@ -120,8 +132,24 @@ class NetCostFactorRunner(QlibFactorRunner):
             raise FactorEmptyError("E_theta produced no evaluable factors.")
 
         best = self._best(results)
-        # Incumbents for the next candidate's repository-relative ranking.
-        self._zoo_metrics.extend({k[2:]: v for k, v in r.items() if k.startswith("m_")} for r in results)
+
+        # Only ADMISSIBLE factors join the repository. F_Theta is what decides
+        # whether a factor enters the feasible set at all; letting a rejected
+        # factor become an incumbent would pollute the combiner's inputs, lower
+        # the bar every later candidate is ranked against, and inflate rho_max
+        # against signals that were never supposed to be in the book.
+        for expr, signal, metrics in admitted:
+            self._repository[expr] = (signal, metrics)
+        if admitted:
+            logger.info(
+                "repository: admitted %d/%d candidate(s); |zoo| = %d",
+                len(admitted), len(results), len(self._repository),
+            )
+        else:
+            logger.info(
+                "repository: admitted 0/%d candidate(s) (all infeasible); |zoo| = %d",
+                len(results), len(self._repository),
+            )
 
         exp.result = self._to_series(best)
         return exp
@@ -134,19 +162,34 @@ class NetCostFactorRunner(QlibFactorRunner):
         pool = feasible or results
         return max(pool, key=lambda r: (r.get("U") if r.get("U") == r.get("U") else float("-inf")))
 
-    def _zoo(self, exp: QlibFactorExperiment) -> dict[str, pd.Series]:
-        """Repository signals — ``runner.py:89`` already builds exactly this."""
-        if not exp.based_experiments:
-            return {}
-        try:
-            frame = self.process_factor_data(exp.based_experiments)
-        except FactorEmptyError:
-            logger.warning("no SOTA factor data available; scoring against an empty zoo")
-            return {}
-        if frame is None or frame.empty:
-            return {}
-        names = self._expressions(exp.based_experiments, frame.columns)
-        return {names.get(c, str(c)): frame[c].dropna() for c in frame.columns}
+    def _zoo(self, exp: QlibFactorExperiment) -> tuple[dict[str, Any], list[dict]]:
+        """The effective-alpha repository: admissible factors only.
+
+        Returns ``(signals, metrics)`` drawn from the *same* ordered store, so
+        the combiner refit (Eq. 2) and the relative ranking (Eq. 11) always see
+        an identical repository state.
+
+        Note this deliberately does **not** use ``exp.based_experiments``
+        wholesale the way ``runner.py:89`` does. That chain carries every factor
+        the loop has produced, admissible or not; the repository is by
+        definition the subset that passed evaluation.
+
+        Caveat for parallel mode: each worker process builds its own runner and
+        therefore its own repository, so rho_max is measured within a branch
+        rather than globally. The serial path sees the full accumulation.
+        """
+        if not self._repository:
+            if exp.based_experiments:
+                logger.info(
+                    "repository empty (%d based experiment(s) present but none admitted yet); "
+                    "scoring this candidate against an empty zoo",
+                    len(exp.based_experiments),
+                )
+            return {}, []
+
+        signals = {expr: signal for expr, (signal, _) in self._repository.items()}
+        metrics = [m for _, (_, m) in self._repository.items()]
+        return signals, metrics
 
     @staticmethod
     def _expressions(exp_or_list: Any, columns: Any) -> dict[str, str]:

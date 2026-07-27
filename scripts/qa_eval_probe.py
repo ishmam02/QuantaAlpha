@@ -97,6 +97,8 @@ def main() -> int:
     parser.add_argument("--rho-bar", type=float, default=None, help="override the redundancy ceiling")
     parser.add_argument("--gamma-ic", type=float, default=None, help="override the RankIC floor")
     parser.add_argument("--gamma-ir", type=float, default=None, help="override the RankICIR floor")
+    parser.add_argument("--admit-all", action="store_true",
+                        help="put every factor in the zoo, not just admissible ones (diagnostic)")
     parser.add_argument("--report", action="store_true", help="score on final_test instead of the OOS proxy")
     args = parser.parse_args()
 
@@ -140,9 +142,16 @@ def main() -> int:
                 "U": res["U"], "feasible": res["feasible"], "failed_gates": res["failed_gates"],
             })
 
-        logger.info("[%d/%d] %.1fs %s", i, len(factors), elapsed, name[:44])
-        zoo_signals[expr] = signal
-        zoo_metrics.append({k[2:]: v for k, v in res.items() if k.startswith("m_")})
+        # The repository accumulates only ADMISSIBLE factors, matching
+        # NetCostFactorRunner. --admit-all reproduces the pre-gate behaviour for
+        # diagnostics; it is not what a real run does.
+        if res.get("feasible") or args.admit_all:
+            zoo_signals[expr] = signal
+            zoo_metrics.append({k[2:]: v for k, v in res.items() if k.startswith("m_")})
+
+        logger.info("[%d/%d] %.1fs %s | admitted=%s |zoo|=%d",
+                    i, len(factors), elapsed, name[:36],
+                    bool(res.get("feasible")) or args.admit_all, len(zoo_signals))
 
     _print_table(rows, theta)
     return 0

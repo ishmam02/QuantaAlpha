@@ -76,9 +76,13 @@ def score_arm(label: str, library: Path, theta, report: bool) -> list[dict]:
         res = op.evaluate(signal, expr, zoo_signals, zoo_metrics, report=report)
         res["factor_name"] = name
         rows.append(res)
-        zoo_signals[expr] = signal
-        zoo_metrics.append({k[2:]: v for k, v in res.items() if k.startswith("m_")})
-        logger.info("%s [%d/%d] %s", label, i, len(factors), name[:44])
+        # Admissible factors only -- the repository is the subset that passed
+        # evaluation, matching NetCostFactorRunner and Eq. 11's definition.
+        if res.get("feasible"):
+            zoo_signals[expr] = signal
+            zoo_metrics.append({k[2:]: v for k, v in res.items() if k.startswith("m_")})
+        logger.info("%s [%d/%d] %s | admitted=%s |zoo|=%d",
+                    label, i, len(factors), name[:36], bool(res.get("feasible")), len(zoo_signals))
 
     return rows
 
