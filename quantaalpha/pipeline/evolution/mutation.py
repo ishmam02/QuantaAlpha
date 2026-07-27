@@ -106,14 +106,25 @@ class MutationOperator:
         else:
             parent_factors = "N/A"
         
+        from quantaalpha.pipeline.evolution.trajectory import (
+            format_metric,
+            format_objective_note,
+        )
+
         parent_metrics = ""
         if parent.backtest_metrics:
             for k, v in parent.backtest_metrics.items():
                 if v is not None:
-                    parent_metrics += f"- {k}: {v:.4f}\n"
+                    parent_metrics += f"- {k}: {format_metric(v)}\n"
         if not parent_metrics:
             parent_metrics = "N/A"
-        
+
+        # Whether the parent was admitted, and if not, which gate it missed.
+        # Empty string under the control arm, so Arm A's prompt is unchanged.
+        objective_note = format_objective_note(parent)
+        if objective_note:
+            parent_metrics = f"{objective_note}\n{parent_metrics}"
+
         parent_feedback = parent.feedback or "N/A"
         
         # Build prompt

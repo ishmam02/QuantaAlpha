@@ -90,13 +90,23 @@ class CrossoverOperator:
         else:
             factors_str = "  N/A\n"
         
+        from quantaalpha.pipeline.evolution.trajectory import (
+            format_metric,
+            format_objective_note,
+        )
+
         metrics_str = ""
         if parent.backtest_metrics:
             for k, v in parent.backtest_metrics.items():
                 if v is not None:
-                    metrics_str += f"  - {k}: {v:.4f}\n"
+                    metrics_str += f"  - {k}: {format_metric(v)}\n"
         if not metrics_str:
             metrics_str = "  N/A\n"
+
+        # Admissibility verdict + the gate it missed. Empty under the control arm.
+        objective_note = format_objective_note(parent)
+        if objective_note:
+            metrics_str = f"  {objective_note}\n{metrics_str}"
         
         template = self.prompts.get("parent_template", "")
         if template:
@@ -256,11 +266,23 @@ class CrossoverOperator:
         """
         crossover_result = self.generate_crossover(parents, use_detailed_prompt=True)
         
+        from quantaalpha.pipeline.evolution.trajectory import (
+            _PRIMARY_METRIC,
+            format_metric,
+            format_objective_note,
+        )
+
         parent_summaries = []
         for i, p in enumerate(parents):
+            # Name the metric actually being optimized. Hardcoding "RankIC" here
+            # would advertise the control-arm objective while the search
+            # maximizes U.
             summary = f"""**Parent {i+1}** (Direction {p.direction_id}, {p.phase.value}):
 - Hypothesis: {p.hypothesis[:200] if p.hypothesis else 'N/A'}...
-- Key Metric: RankIC={p.backtest_metrics.get('RankIC', 'N/A')}"""
+- Key Metric: {_PRIMARY_METRIC}={format_metric(p.backtest_metrics.get(_PRIMARY_METRIC))}"""
+            note = format_objective_note(p)
+            if note:
+                summary += f"\n- {note}"
             parent_summaries.append(summary)
         
         # Use template from prompts if available

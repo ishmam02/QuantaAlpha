@@ -16,7 +16,13 @@ from typing import Any, Optional
 import threading
 
 from quantaalpha.log import logger
-from .trajectory import StrategyTrajectory, TrajectoryPool, RoundPhase
+from .trajectory import (
+    StrategyTrajectory,
+    TrajectoryPool,
+    RoundPhase,
+    _REQUIRE_FEASIBLE,
+    is_admissible,
+)
 from .mutation import MutationOperator
 from .crossover import CrossoverOperator
 
@@ -498,6 +504,11 @@ class EvolutionController:
             # Fallback: get all trajectories from previous round
             prev_phase_trajs = [t for t in self.pool.get_all() if t.round_idx == prev_round]
         
+        # Do not mutate a factor that F_Theta rejected (treatment arm only).
+        prev_phase_trajs = self._admissible_parents(
+            prev_phase_trajs, minimum=1, what="mutation targets"
+        )
+
         # Sort by direction_id for consistent ordering
         prev_phase_trajs.sort(key=lambda t: t.direction_id)
         self._mutation_targets = prev_phase_trajs
@@ -519,8 +530,12 @@ class EvolutionController:
         not arbitrarily old trajectories.
         """
         # Find the two most recent rounds to use as crossover candidates
-        candidates = self._get_crossover_candidates()
-        
+        candidates = self._admissible_parents(
+            self._get_crossover_candidates(),
+            minimum=self.config.crossover_size,
+            what="crossover candidates",
+        )
+
         if len(candidates) < self.config.crossover_size:
             logger.warning(f"Not enough candidates for crossover: {len(candidates)} < {self.config.crossover_size}")
             self._crossover_groups = []
@@ -538,6 +553,47 @@ class EvolutionController:
         self._crossover_idx = 0
         logger.info(f"Prepared {len(self._crossover_groups)} crossover groups from {len(candidates)} candidates")
     
+    def _admissible_parents(
+        self,
+        trajectories: list[StrategyTrajectory],
+        minimum: int,
+        what: str,
+    ) -> list[StrategyTrajectory]:
+        """Restrict breeding stock to factors that passed F_Theta.
+
+        The objective is `argmax U(m(f))` over `f in F_Theta`, so an inadmissible
+        factor should not seed the next generation. Without this the gates are
+        purely decorative: a rejected factor remains a fully eligible crossover
+        and mutation parent, and the search happily breeds from it.
+
+        Only active under the treatment arm (`QA_REQUIRE_FEASIBLE=true`); the
+        control arm keeps today's unfiltered behaviour exactly.
+
+        Falls back to the unfiltered set when filtering would leave too few
+        parents to continue. Feasibility can legitimately be rare early in a run,
+        and stalling the search is a worse failure than breeding from a rejected
+        factor -- but the fallback is logged loudly, because a run that never
+        recovers is telling you the gates are mis-calibrated.
+        """
+        if not _REQUIRE_FEASIBLE or not trajectories:
+            return trajectories
+
+        admissible = [t for t in trajectories if is_admissible(t)]
+        if len(admissible) < minimum:
+            logger.warning(
+                f"F_theta: only {len(admissible)}/{len(trajectories)} {what} are admissible "
+                f"(need {minimum}); falling back to the unfiltered set. If this persists, "
+                f"the gates are too tight for this run."
+            )
+            return trajectories
+
+        if len(admissible) < len(trajectories):
+            logger.info(
+                f"F_theta: {len(admissible)}/{len(trajectories)} {what} admissible; "
+                f"{len(trajectories) - len(admissible)} rejected factor(s) excluded from breeding"
+            )
+        return admissible
+
     def _get_crossover_candidates(self) -> list[StrategyTrajectory]:
         """
         Get candidates for crossover from the two most recent relevant rounds.

@@ -26,6 +26,73 @@ from quantaalpha.log import logger
 _PRIMARY_METRIC = os.environ.get("QA_PRIMARY_METRIC", "RankIC")
 _REQUIRE_FEASIBLE = os.environ.get("QA_REQUIRE_FEASIBLE", "false").lower() in ("1", "true", "yes")
 
+# Metric keys that are strings/flags rather than numbers. The evolution
+# operators format metrics with `{v:.4f}`, which raises on a str -- so anything
+# non-numeric has to be rendered separately.
+_NON_NUMERIC_METRICS = ("theta_hash", "zoo_hash", "failed_gates", "feasible")
+
+
+def format_metric(value) -> str:
+    """Render one metric for a prompt without assuming it is a float."""
+    if value is None:
+        return "N/A"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+    return str(value)
+
+
+def is_admissible(traj) -> bool:
+    """Did this trajectory's factor pass F_Theta?
+
+    Defaults to True when the key is absent, so control-arm trajectories (whose
+    Qlib results carry no feasibility flag) are never filtered out.
+    """
+    return bool((traj.backtest_metrics or {}).get("feasible", True))
+
+
+def format_objective_note(traj) -> str:
+    """Admissibility line for the evolution prompts, or "" under the control arm.
+
+    Gated on the *presence* of `U` rather than on an env var: a control-arm
+    trajectory carries Qlib metrics with no `U`, so its prompts render exactly
+    as they do today and the A/B stays comparable.
+
+    The point is that a parent which was REJECTED must say so, and say why. A
+    bare `failed_gates: rank_icir` in a metric dump is not actionable; "RankICIR
+    0.0590 < gamma_ir 0.15" tells the generator what to actually change.
+    """
+    metrics = traj.backtest_metrics or {}
+    if "U" not in metrics:
+        return ""
+
+    parts = [f"Objective U = {format_metric(metrics.get('U'))}"]
+    if metrics.get("feasible", True):
+        parts.append("ADMITTED to the repository")
+    else:
+        failed = metrics.get("failed_gates") or ""
+        names = [n.strip() for n in (failed.split(",") if isinstance(failed, str) else failed) if str(n).strip()]
+        reasons = _describe_gate_failures(metrics, names)
+        parts.append("REJECTED by the feasibility gates" + (f" ({'; '.join(reasons)})" if reasons else ""))
+    return " | ".join(parts)
+
+
+def _describe_gate_failures(metrics: dict, names: list) -> list:
+    """"value vs threshold" for each failed gate, if the protocol is loadable."""
+    if not names:
+        return []
+    try:
+        from quantaalpha.eval.gates import describe_failures
+        from quantaalpha.eval.protocol import default_protocol_path, load_protocol
+
+        return describe_failures(metrics, load_protocol(default_protocol_path()), names)
+    except Exception:  # protocol unavailable -> bare names still beat nothing
+        return names
+
 
 class RoundPhase(str, Enum):
     """Phase/type of a round in the evolutionary process."""
@@ -129,11 +196,14 @@ class StrategyTrajectory:
         # Metrics
         if self.backtest_metrics:
             metrics_str = ", ".join(
-                f"{k}={v:.4f}" for k, v in self.backtest_metrics.items()
+                f"{k}={format_metric(v)}" for k, v in self.backtest_metrics.items()
                 if v is not None
             )
             if metrics_str:
                 parts.append(f"Metrics: {metrics_str}")
+            note = format_objective_note(self)
+            if note:
+                parts.append(note)
 
         # Feedback
         if self.feedback:
