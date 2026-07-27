@@ -19,6 +19,21 @@ from quantaalpha.utils import convert2bool
 # Max retries for JSON parsing
 MAX_JSON_PARSE_RETRIES = 3
 
+# The metrics the generator is shown under the control-arm objective.
+#
+# Note what these are: Qlib computes `excess_return_with_cost.*` alongside
+# these, and they are discarded here before reaching the prompt. The feedback
+# that shapes the next hypothesis therefore never mentions transaction cost --
+# the frictionless/tradeable gap of the formulation, reduced to four string
+# literals. The treatment arm replaces this selection wholesale
+# (see net_cost_feedback.NetCostFactorFeedback).
+FRICTIONLESS_METRICS = [
+    "1day.excess_return_without_cost.max_drawdown",
+    "1day.excess_return_without_cost.information_ratio",
+    "1day.excess_return_without_cost.annualized_return",
+    "IC",
+]
+
 base_feedback_prompts = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
 DIRNAME = Path(__file__).absolute().resolve().parent
 
@@ -39,13 +54,8 @@ def process_results(current_result, sota_result):
             current_df.rename(columns={first_col: "Current Result"}, inplace=True)
         
         # Select important metrics for comparison
-        important_metrics = [
-            "1day.excess_return_without_cost.max_drawdown",
-            "1day.excess_return_without_cost.information_ratio",
-            "1day.excess_return_without_cost.annualized_return",
-            "IC",
-        ]
-        
+        important_metrics = FRICTIONLESS_METRICS
+
         # Filter the DataFrame to retain only the important metrics that exist
         available_metrics = [m for m in important_metrics if m in current_df.index]
         if available_metrics:
@@ -85,12 +95,7 @@ def process_results(current_result, sota_result):
     combined_df = pd.concat([current_df, sota_df], axis=1)
 
     # Select important metrics for comparison
-    important_metrics = [
-        "1day.excess_return_without_cost.max_drawdown",
-        "1day.excess_return_without_cost.information_ratio",
-        "1day.excess_return_without_cost.annualized_return",
-        "IC",
-    ]
+    important_metrics = FRICTIONLESS_METRICS
 
     # Filter the combined DataFrame to retain only the important metrics that exist
     available_metrics = [m for m in important_metrics if m in combined_df.index]
@@ -213,6 +218,10 @@ class QlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
 
 qa_feedback_prompts = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
 class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
+    def _build_combined_result(self, current_result, sota_result) -> str:
+        """The metric block the LLM sees. Overridden by the treatment arm."""
+        return process_results(current_result, sota_result)
+
     def generate_feedback(self, exp: Experiment, hypothesis: Hypothesis, trace: Trace) -> HypothesisFeedback:
         """
         Generate feedback for the given experiment and hypothesis.
@@ -272,7 +281,10 @@ class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Fee
             logger.warning(f"Failed to calculate complexity info: {e}")
 
         # Process the results to filter important metrics
-        combined_result = process_results(current_result, sota_result)
+        # Extracted as a hook so the treatment arm can substitute a
+        # net-of-cost, dimension-targeted payload without duplicating this
+        # entire method.
+        combined_result = self._build_combined_result(current_result, sota_result)
 
         # Generate the system prompt
         sys_prompt = (

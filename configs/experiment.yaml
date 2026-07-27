@@ -4,6 +4,15 @@
 # ============================================================
 
 # ============================================================
+# REPRODUCIBILITY
+# Seeds Python + NumPy global RNG at the CLI entry point (cli.py:app).
+# The evolution operators use unseeded random.shuffle/sample/choices; this
+# makes them reproducible so the control and treatment arms explore
+# identically and differ only in the objective. Override with QA_SEED.
+# ============================================================
+seed: 42
+
+# ============================================================
 # PLANNING CONFIGURATION
 # Controls parallel exploration direction generation
 # ============================================================

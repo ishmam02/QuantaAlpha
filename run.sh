@@ -54,6 +54,11 @@ export FACTOR_CoSTEER_PYTHON_BIN="$(command -v python)"
 # (maintenance mode). Allow it so the in-loop backtest (qrun) can create experiments/recorders.
 export MLFLOW_ALLOW_FILE_STORE=true
 
+# Determinism. PYTHONHASHSEED must be set BEFORE the interpreter starts to have
+# any effect -- setting it inside Python is too late. cli.py:app() seeds the
+# Python and NumPy RNGs from `seed:` in the run config (or QA_SEED).
+export PYTHONHASHSEED="${QA_SEED:-42}"
+
 echo "Python: $(python --version)"
 echo "QuantaAlpha: $(which quantaalpha)"
 echo ""

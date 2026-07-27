@@ -31,6 +31,9 @@ from quantaalpha.pipeline.evolution import (
     StrategyTrajectory,
     RoundPhase,
 )
+# Name of the scalar being optimized, so Arm B's logs do not claim to show
+# RankIC while actually showing U.
+from quantaalpha.pipeline.evolution.trajectory import _PRIMARY_METRIC
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.log import logger
 from quantaalpha.log.time import measure_time
@@ -205,10 +208,11 @@ def _parallel_task_worker(
     log_root: str,
     result_queue: Queue,
     task_idx: int,
+    quality_gate_cfg: dict[str, Any] | None = None,
 ):
     """
     Worker for parallel evolution tasks. Runs one evolution task in a separate process and puts result in queue.
-    Args: task, directions, step_n, use_local, user_direction, log_root, result_queue, task_idx.
+    Args: task, directions, step_n, use_local, user_direction, log_root, result_queue, task_idx, quality_gate_cfg.
     """
     try:
         from quantaalpha.core.conf import RD_AGENT_SETTINGS
@@ -226,6 +230,7 @@ def _parallel_task_worker(
             user_direction=user_direction,
             log_root=log_root,
             stop_event=None,
+            quality_gate_cfg=quality_gate_cfg,
         )
         result_queue.put(
             {
@@ -275,10 +280,17 @@ def _run_tasks_parallel(
     use_local: bool,
     user_direction: str | None,
     log_root: str,
+    quality_gate_cfg: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run multiple evolution tasks in parallel.
     Returns list of results, each with task and traj_data.
+
+    `quality_gate_cfg` must be forwarded here: the serial path passes it, and
+    without it the parallel path silently runs with the fallback defaults at
+    loop.py:95. That was harmless only while `consistency_enabled` happened to
+    be false in YAML; flipping it on would have disabled the check with no
+    warning now that `parallel_enabled` defaults to true.
     """
     if not tasks:
         return []
@@ -302,6 +314,7 @@ def _run_tasks_parallel(
                 log_root,
                 result_queue,
                 idx,
+                quality_gate_cfg,
             ),
         )
         p.start()
@@ -473,6 +486,7 @@ def run_evolution_loop(
                 use_local=use_local,
                 user_direction=initial_direction,
                 log_root=log_root,
+                quality_gate_cfg=quality_gate_cfg,
             )
 
             completed_tasks = []
@@ -489,7 +503,7 @@ def run_evolution_loop(
                     controller.report_task_complete(task, trajectory)
                     completed_tasks.append(task)
                     logger.info(
-                        f"Trajectory done: {trajectory.trajectory_id}, RankIC={trajectory.get_primary_metric()}"
+                        f"Trajectory done: {trajectory.trajectory_id}, {_PRIMARY_METRIC}={trajectory.get_primary_metric()}"
                     )
 
             controller.advance_phase_after_parallel_completion(completed_tasks)
@@ -528,7 +542,7 @@ def run_evolution_loop(
                 )
                 controller.report_task_complete(task, trajectory)
                 logger.info(
-                    f"Task done: trajectory_id={trajectory.trajectory_id}, RankIC={trajectory.get_primary_metric()}"
+                    f"Task done: trajectory_id={trajectory.trajectory_id}, {_PRIMARY_METRIC}={trajectory.get_primary_metric()}"
                 )
             except Exception as e:
                 logger.error(f"Task failed: {e}")
@@ -546,7 +560,7 @@ def run_evolution_loop(
         metric = t.get_primary_metric()
         metric_str = f"{metric:.4f}" if metric is not None else "N/A"
         logger.info(
-            f"  {i + 1}. {t.trajectory_id}: phase={t.phase.value}, RankIC={metric_str}"
+            f"  {i + 1}. {t.trajectory_id}: phase={t.phase.value}, {_PRIMARY_METRIC}={metric_str}"
         )
     logger.info(f"Pool stats: {controller.pool.get_statistics()}")
     logger.info("=" * 60)

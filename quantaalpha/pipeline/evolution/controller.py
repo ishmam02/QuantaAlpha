@@ -853,10 +853,52 @@ class EvolutionController:
                             if pd.notna(val):
                                 metrics[target] = float(val)
                                 break
+
+            # Net-of-cost engine extras (E_theta / NetCostFactorRunner). Purely
+            # additive: the control arm's Qlib result carries none of these
+            # keys, so its behaviour is unchanged.
+            metrics.update(self._extract_net_cost_metrics(result))
         except Exception as e:
             logger.warning(f"Failed to extract metrics: {e}")
-        
+
         return metrics
+
+    # Keys emitted by NetCostFactorRunner._to_series, by coercion type.
+    _NET_COST_FLOAT_KEYS = (
+        "U", "rho_max", "turnover_book", "turnover_solo", "cx", "cost_bps", "zoo_size",
+        "e_effectiveness", "e_arr", "e_stability", "e_turnover", "e_diversity",
+        "e_overfit", "e_decay",
+    )
+    _NET_COST_STR_KEYS = ("theta_hash", "zoo_hash", "failed_gates")
+
+    def _extract_net_cost_metrics(self, result: Any) -> dict[str, Any]:
+        """Pull the E_theta metric vector off a result, when present."""
+        import pandas as pd
+
+        if isinstance(result, pd.DataFrame):
+            if result.empty or len(result.columns) == 0:
+                return {}
+            series = result.iloc[:, 0]
+        elif isinstance(result, pd.Series):
+            series = result
+        else:
+            return {}
+
+        extras: dict[str, Any] = {}
+        for key in self._NET_COST_FLOAT_KEYS:
+            if key in series.index:
+                val = series[key]
+                if pd.notna(val):
+                    try:
+                        extras[key] = float(val)
+                    except (TypeError, ValueError):
+                        pass
+        for key in self._NET_COST_STR_KEYS:
+            if key in series.index and pd.notna(series[key]):
+                extras[key] = str(series[key])
+        if "feasible" in series.index and pd.notna(series["feasible"]):
+            extras["feasible"] = bool(series["feasible"])
+        return extras
     
     def is_complete(self) -> bool:
         """Check if evolution is complete."""

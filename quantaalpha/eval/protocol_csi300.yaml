@@ -1,0 +1,101 @@
+# =====================================================================
+# Θ — the frozen evaluation protocol (problem_formulation.tex, Eq. 13)
+#
+# Every value here was read off the existing configs so that E_Θ *nests*
+# the published baseline:
+#   - splits          <- factor_template/conf_combined_factors.yaml:107-109
+#   - final_test      <- configs/backtest.yaml:85
+#   - combiner params <- conf_combined_factors.yaml:86-96 (post Task 1)
+#   - topk / n_drop   <- conf_combined_factors.yaml:66-67, backtest.yaml:120-121
+#   - kappa0          <- open_cost 0.0005 + close_cost 0.0015
+#
+# Property 1 (Immutability): this file is loaded ONCE per run and hashed.
+# Editing it mid-run has no effect on a resumed session (LoopBase.run pickles
+# the whole loop). The logged theta_hash is what makes that visible.
+# =====================================================================
+
+protocol_id: csi300_v1
+market: csi300
+benchmark: SH000300 # conf_combined_factors.yaml:14, backtest.yaml:127
+periods_per_year: 252
+
+splits: # frozen; the engine never reads a window a caller hands it
+  train: ["2016-01-01", "2019-12-31"] # conf_combined_factors.yaml:107
+  valid: ["2020-01-01", "2020-12-31"] # :108
+  inloop_test: ["2021-01-01", "2021-12-31"] # :109  — NEVER widen
+  final_test: ["2022-01-01", "2025-12-26"] # backtest.yaml:85
+  search_is: train # IS during search
+  search_oos: valid # OOS proxy during search; final_test only in the end report
+
+execution: # Eq. 4-5
+  delta: 1
+  fill_rule: open_next # Φ = open(t+1); matches deal_price:open everywhere
+  label_expr: "Ref($close, -2) / Ref($close, -1) - 1" # backtest.yaml:55 — used for IC only
+
+combiner: # procedure A — Eq. 2; FROZEN, seed included
+  model: lightgbm
+  seed: 42
+  params:
+    loss: mse
+    learning_rate: 0.05 # ← unified in Task 1
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 20
+    early_stopping_round: 50
+    num_boost_round: 500
+  base_features: # conf_combined_factors.yaml:28-29
+    - "($close-$open)/$open"
+    - "$volume/Mean($volume, 20)"
+    - "($high-$low)/Ref($close, 1)"
+    - "$close/Ref($close, 1)-1"
+  fit_split: train
+
+portfolio: # g — Eq. 6; the baseline's construction
+  construction: topk_dropout
+  topk: 50 # conf_combined_factors.yaml:66, backtest.yaml:120
+  n_drop: 5 # :67, :121
+  signed: false # long-only + benchmark excess (baseline-comparable)
+  gross_leverage: 1.0 # Σ|w| ≤ 1
+
+costs: # Eq. 7
+  kappa0: 0.0020 # = open_cost 0.0005 + close_cost 0.0015 → nests Qlib's flat fee
+  kappa1: 0.10 # slippage ≈ 10% of daily vol per unit traded weight
+  kappa2: 0.01 # calibrated: 1% of ADV ⇒ 10 bps of traded notional (see costs.py)
+  impact_exponent: 1.5 # φ ∝ |Δw|^{3/2}/√ADV
+  beta_per_day: 0.0004 # ≈10%/yr borrow; inert while signed:false
+  beta_offlist: .inf # unshortable names
+  vol_window: 20
+  adv_window: 20
+  nav: 100000000.0 # `account:` in all three Qlib configs; normalizes ADV → adv_w
+  adv_scale: 1000.0 # Qlib cn_data `$amount` → CNY: true_CNY = $amount*1000/$factor
+
+
+gates: # F_Θ — Eq. 9; absolute floors, train+valid only
+  gamma_ic: 0.02
+  gamma_ir: 0.20
+  tau_max: 0.30
+  rho_bar: 0.70
+  gamma_cx: 250 # matches FACTOR_CoSTEER_SYMBOL_LENGTH_THRESHOLD in .env
+  turnover_basis: book # book | solo — book is structurally capped at n_drop/topk
+
+decay: # §3.4 item 7
+  K: 4
+  lambda_d: 0.5
+
+overfit:
+  delta_ref: 0.02 # reference IS→OOS RankIC gap for normalizing e_overfit
+
+utility:
+  mode: weighted_rank # net_ir | net_arr | weighted_rank
+  omega: # must sum to 1
+    effectiveness: 0.30
+    arr: 0.20
+    stability: 0.15
+    turnover: 0.10
+    diversity: 0.15
+    overfit: 0.10
+    decay: 0.00 # optional diagnostic (Remark 1); off by default

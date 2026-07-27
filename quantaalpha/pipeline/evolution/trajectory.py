@@ -8,6 +8,7 @@ hypothesis → factor expressions → code → backtest results → feedback.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum
@@ -16,6 +17,14 @@ from typing import Any, Optional
 import hashlib
 
 from quantaalpha.log import logger
+
+# Which scalar the evolutionary search maximizes, and whether hard feasibility
+# is required. Arm A (control) sets neither and reproduces today's behaviour
+# exactly; Arm B (treatment) sets QA_PRIMARY_METRIC=U and
+# QA_REQUIRE_FEASIBLE=true. RankIC stays in backtest_metrics either way, so the
+# two arms remain mutually reportable.
+_PRIMARY_METRIC = os.environ.get("QA_PRIMARY_METRIC", "RankIC")
+_REQUIRE_FEASIBLE = os.environ.get("QA_REQUIRE_FEASIBLE", "false").lower() in ("1", "true", "yes")
 
 
 class RoundPhase(str, Enum):
@@ -88,13 +97,17 @@ class StrategyTrajectory:
         return hashlib.md5(content.encode()).hexdigest()[:12]
     
     def get_primary_metric(self) -> Optional[float]:
-        """Get the primary metric (RankIC) for comparison."""
-        return self.backtest_metrics.get("RankIC")
-    
+        """Get the primary metric for comparison (RankIC, or U under Arm B)."""
+        return self.backtest_metrics.get(_PRIMARY_METRIC)
+
     def is_successful(self) -> bool:
         """Check if this trajectory produced valid results."""
-        rank_ic = self.get_primary_metric()
-        return rank_ic is not None and rank_ic > 0
+        primary = self.get_primary_metric()
+        if primary is None or not primary > 0:
+            return False
+        if _REQUIRE_FEASIBLE and not bool(self.backtest_metrics.get("feasible", True)):
+            return False
+        return True
     
     def to_summary_text(self) -> str:
         """Generate a concise summary for use in prompts."""
