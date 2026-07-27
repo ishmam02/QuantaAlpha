@@ -38,6 +38,45 @@ from quantaalpha.llm.client import md5_hash
 
 logger = logging.getLogger(__name__)
 
+
+def _bridge_eval_logging() -> None:
+    """Route ``quantaalpha.eval.*`` stdlib records into the repo's loguru sink.
+
+    The eval package uses stdlib ``logging`` so it stays independent of
+    QuantaAlpha, but nothing in this repo ever configures stdlib logging -- the
+    root logger has no handlers and defaults to WARNING. Every ``logger.info``
+    in the engine was therefore discarded, including the per-evaluation
+    "E_theta eval:" line that is supposed to be the primary signal that the new
+    objective is live. Without this bridge the only evidence a run produces is
+    the ledger file.
+    """
+    from quantaalpha.log import logger as qa_logger
+
+    # RDAgentLog exposes only info/warning/error, each taking a single message.
+    class _ToLoguru(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                sink = {
+                    "WARNING": qa_logger.warning,
+                    "ERROR": qa_logger.error,
+                    "CRITICAL": qa_logger.error,
+                }.get(record.levelname, qa_logger.info)
+                sink(self.format(record))
+            except Exception:
+                pass
+
+    eval_logger = logging.getLogger("quantaalpha.eval")
+    if not any(isinstance(h, _ToLoguru) for h in eval_logger.handlers):
+        eval_logger.addHandler(_ToLoguru())
+        eval_logger.setLevel(logging.INFO)
+        eval_logger.propagate = False
+
+    own = logging.getLogger(__name__)
+    if not any(isinstance(h, _ToLoguru) for h in own.handlers):
+        own.addHandler(_ToLoguru())
+        own.setLevel(logging.INFO)
+        own.propagate = False
+
 # Canonical names `controller._extract_metrics` already knows how to read, so
 # the control and treatment arms stay mutually reportable.
 _CANONICAL = ("IC", "ICIR", "RankIC", "RankICIR", "annualized_return", "information_ratio", "max_drawdown")
@@ -53,6 +92,7 @@ class NetCostFactorRunner(QlibFactorRunner):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        _bridge_eval_logging()
         self.theta = load_protocol(default_protocol_path())
         self.op = EvaluationOperator(self.theta)
         self.ledger = Ledger(os.environ.get("QA_LEDGER", DEFAULT_LEDGER_PATH))
@@ -83,7 +123,11 @@ class NetCostFactorRunner(QlibFactorRunner):
         if exp.based_experiments and exp.based_experiments[-1].result is None:
             exp.based_experiments[-1] = self.develop(exp.based_experiments[-1], use_local=use_local)
 
-        new_factors = self.process_factor_data(exp)
+        # Shares the control arm's recovery path: a missing result.h5 is re-run
+        # rather than treated as a dead loop. Calling process_factor_data
+        # directly here made a single missing output skip the whole loop before
+        # E_theta was ever reached.
+        new_factors = self.acquire_new_factors(exp)
         if new_factors is None or new_factors.empty:
             # Preserve the skip-loop semantics at workflow.py:116.
             raise FactorEmptyError("No valid factor data found to merge.")

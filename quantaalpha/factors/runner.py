@@ -72,6 +72,75 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         IC_max = IC_max.unstack().max(axis=0)
         return new_feature.iloc[:, IC_max[IC_max < 0.99].index]
 
+    def acquire_new_factors(self, exp: QlibFactorExperiment) -> pd.DataFrame:
+        """Load this experiment's factor signals, recovering from a failed run.
+
+        `process_factor_data` returns nothing when a factor's `result.h5` is
+        missing -- which happens routinely, because CoSTEER can mark an
+        implementation correct without its subprocess having produced output.
+        The recovery path re-runs `factor.py` directly for any workspace lacking
+        a result and retries.
+
+        Extracted so both the control runner and NetCostFactorRunner share it.
+        Without it the treatment arm raises FactorEmptyError the moment a single
+        factor is missing its output, skips the loop, and never reaches
+        `E_theta.evaluate()` at all -- producing a full run with no metrics.
+        """
+        try:
+            return self.process_factor_data(exp)
+        except FactorEmptyError as e:
+            logger.error(f"Failed to process new factors: {e}")
+            logger.info("Attempting to manually execute factors...")
+
+        for ws in exp.sub_workspace_list:
+            if (ws.workspace_path / "result.h5").exists():
+                continue
+            if not (ws.workspace_path / "factor.py").exists():
+                logger.warning(f"No factor.py to execute in {ws.workspace_path}; skipping")
+                continue
+            try:
+                # Ensure symlink exists
+                data_source = Path(FACTOR_COSTEER_SETTINGS.data_folder).absolute()
+                if not data_source.is_absolute():
+                    data_source = Path(__file__).parent.parent.parent.parent.parent / FACTOR_COSTEER_SETTINGS.data_folder
+                daily_pv_link = ws.workspace_path / "daily_pv.h5"
+                if not daily_pv_link.exists() and (data_source / "daily_pv.h5").exists():
+                    os.symlink(str(data_source / "daily_pv.h5"), str(daily_pv_link))
+
+                # Execute factor
+                import subprocess
+                env = os.environ.copy()
+                project_root = Path(__file__).parent.parent.parent.parent.parent
+                env['PYTHONPATH'] = str(project_root) + os.pathsep + env.get('PYTHONPATH', '')
+                # Strip IDE/debug/Python-injection env vars that can break the conda
+                # interpreter in child processes (e.g. launched from the VSCode terminal).
+                for _k in [k for k in env if k.startswith(("PYTHON", "VSCODE_", "DEBUGPY", "COPILOT", "BUNDLED_DEBUGPY")) and k != "PYTHONPATH"]:
+                    del env[_k]
+                subprocess.check_output(
+                    [sys.executable, str((ws.workspace_path / 'factor.py').resolve())],
+                    cwd=str(ws.workspace_path),
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    timeout=1200,
+                )
+            except Exception as exec_e:
+                _out = getattr(exec_e, "output", b"")
+                if isinstance(_out, bytes):
+                    try:
+                        _out = _out.decode()
+                    except Exception:
+                        _out = repr(_out)
+                logger.warning(
+                    f"Failed to manually execute factor {ws.workspace_path}: {exec_e}\n"
+                    f"--- factor.py output ---\n{str(_out)[-2000:]}"
+                )
+
+        # Retry processing factor data
+        try:
+            return self.process_factor_data(exp)
+        except FactorEmptyError:
+            raise FactorEmptyError("No valid factor data found to merge after manual execution attempt.")
+
     @cache_with_pickle(CachedRunner.get_cache_key, CachedRunner.assign_cached_result)
     def develop(self, exp: QlibFactorExperiment, use_local: bool = True) -> QlibFactorExperiment:
         
@@ -93,57 +162,8 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                     SOTA_factor = None
 
             # Process the new factors data
-            try:
-                new_factors = self.process_factor_data(exp)
-            except FactorEmptyError as e:
-                logger.error(f"Failed to process new factors: {e}")
-                # Try manual factor execution
-                logger.info("Attempting to manually execute factors...")
-                for ws in exp.sub_workspace_list:
-                    if not (ws.workspace_path / "result.h5").exists():
-                        try:
-                            # Ensure symlink exists
-                            data_source = Path(FACTOR_COSTEER_SETTINGS.data_folder).absolute()
-                            if not data_source.is_absolute():
-                                data_source = Path(__file__).parent.parent.parent.parent.parent / FACTOR_COSTEER_SETTINGS.data_folder
-                            daily_pv_link = ws.workspace_path / "daily_pv.h5"
-                            if not daily_pv_link.exists() and (data_source / "daily_pv.h5").exists():
-                                os.symlink(str(data_source / "daily_pv.h5"), str(daily_pv_link))
-                            
-                            # Execute factor
-                            import subprocess
-                            env = os.environ.copy()
-                            project_root = Path(__file__).parent.parent.parent.parent.parent
-                            env['PYTHONPATH'] = str(project_root) + os.pathsep + env.get('PYTHONPATH', '')
-                            # Strip IDE/debug/Python-injection env vars that can break the conda
-                            # interpreter in child processes (e.g. launched from the VSCode terminal).
-                            for _k in [k for k in env if k.startswith(("PYTHON", "VSCODE_", "DEBUGPY", "COPILOT", "BUNDLED_DEBUGPY")) and k != "PYTHONPATH"]:
-                                del env[_k]
-                            subprocess.check_output(
-                                [sys.executable, str((ws.workspace_path / 'factor.py').resolve())],
-                                cwd=str(ws.workspace_path),
-                                stderr=subprocess.STDOUT,
-                                env=env,
-                                timeout=1200,
-                            )
-                        except Exception as exec_e:
-                            _out = getattr(exec_e, "output", b"")
-                            if isinstance(_out, bytes):
-                                try:
-                                    _out = _out.decode()
-                                except Exception:
-                                    _out = repr(_out)
-                            logger.warning(
-                                f"Failed to manually execute factor {ws.workspace_path}: {exec_e}\n"
-                                f"--- factor.py output ---\n{str(_out)[-2000:]}"
-                            )
-                
-                # Retry processing factor data
-                try:
-                    new_factors = self.process_factor_data(exp)
-                except FactorEmptyError:
-                    raise FactorEmptyError("No valid factor data found to merge after manual execution attempt.")
-            
+            new_factors = self.acquire_new_factors(exp)
+
             if new_factors.empty:
                 raise FactorEmptyError("No valid factor data found to merge.")
 
