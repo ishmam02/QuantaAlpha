@@ -626,6 +626,22 @@ class APIBackend:
         response, finish_reason = self._create_chat_completion_inner_function(messages=messages, **kwargs)
 
         if finish_reason == "length":
+            # An EMPTY response with finish_reason="length" means the prompt itself
+            # consumed the budget -- the model produced nothing. Continuing from it
+            # appends a blank assistant turn and asks the model to "continue" that
+            # blank, which yields another empty response. Observed live: 125
+            # JSON-fix failures and 66 such continuations in a single run, all
+            # unrecoverable, because no amount of continuing fixes a zero-token
+            # generation. Fail fast instead so the caller's retry can act on it.
+            if not (response or "").strip():
+                logger.warning(
+                    "LLM returned an empty response with finish_reason='length': the prompt "
+                    "likely exhausted the context/token budget. Not attempting continuation "
+                    "(continuing from empty output cannot recover). Consider raising "
+                    "CHAT_MAX_TOKENS or shortening the prompt."
+                )
+                return response
+
             new_message = deepcopy(messages)
             new_message.append({"role": "assistant", "content": response})
             new_message.append(
