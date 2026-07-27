@@ -44,6 +44,16 @@ if ! command -v quantaalpha &> /dev/null; then
     exit 1
 fi
 
+# Pin the factor-execution interpreter to the activated conda python.
+# FACTOR_COSTEER_SETTINGS.python_bin defaults to bare "python"; factor.py:execute runs it
+# via /bin/sh (shell=True), where "python" resolves to a non-conda interpreter missing
+# quantaalpha's deps → ImportError → "No valid factor data found to merge". Pin the absolute path.
+export FACTOR_CoSTEER_PYTHON_BIN="$(command -v python)"
+
+# Qlib's qrun uses mlflow's filesystem tracking backend (./mlruns); newer mlflow disables it
+# (maintenance mode). Allow it so the in-loop backtest (qrun) can create experiments/recorders.
+export MLFLOW_ALLOW_FILE_STORE=true
+
 echo "Python: $(python --version)"
 echo "QuantaAlpha: $(which quantaalpha)"
 echo ""
@@ -95,9 +105,13 @@ echo "Qlib data validated: ${QLIB_DATA}"
 # Ensure Qlib data symlink
 if [ -n "${QLIB_DATA}" ]; then
     QLIB_SYMLINK_DIR="$HOME/.qlib/qlib_data"
-    if [ ! -L "${QLIB_SYMLINK_DIR}/cn_data" ] || [ "$(readlink -f ${QLIB_SYMLINK_DIR}/cn_data 2>/dev/null)" != "$(readlink -f ${QLIB_DATA})" ]; then
-        mkdir -p "${QLIB_SYMLINK_DIR}"
-        ln -sfn "${QLIB_DATA}" "${QLIB_SYMLINK_DIR}/cn_data"
+    # Resolve to an ABSOLUTE path. A relative symlink target resolves relative to
+    # ~/.qlib/qlib_data/ (doubled/broken), which makes the in-loop qrun backtest load
+    # a non-existent data dir (data_path=~/.qlib/qlib_data/data/qlib/cn_data).
+    QLIB_DATA_ABS="$(cd "${QLIB_DATA}" && pwd)"
+    mkdir -p "${QLIB_SYMLINK_DIR}"
+    if [ ! -L "${QLIB_SYMLINK_DIR}/cn_data" ] || [ "$(readlink "${QLIB_SYMLINK_DIR}/cn_data")" != "${QLIB_DATA_ABS}" ]; then
+        ln -sfn "${QLIB_DATA_ABS}" "${QLIB_SYMLINK_DIR}/cn_data"
     fi
 fi
 

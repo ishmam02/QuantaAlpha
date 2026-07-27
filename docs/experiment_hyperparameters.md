@@ -1,194 +1,194 @@
-# AlphaAgent 实验超参数配置文档
+# AlphaAgent Experiment Hyperparameter Configuration Documentation
 
-> 本文档详细整理了 `运行实验.sh` 及其相关配置文件中的所有超参数设置。
-
----
-
-## 目录
-
-1. [模型配置](#1-模型配置)
-2. [规划配置](#2-规划配置-planning)
-3. [执行配置](#3-执行配置-execution)
-4. [进化配置](#4-进化配置-evolution)
-5. [因子生成配置](#5-因子生成配置-factor)
-6. [回测配置](#6-回测配置-backtest)
-7. [数据配置](#7-数据配置-data)
-8. [模型训练配置](#8-模型训练配置-lgbmodel)
-9. [交易策略配置](#9-交易策略配置-strategy)
-10. [LLM配置](#10-llm配置)
-11. [日志配置](#11-日志配置-logging)
-12. [路径配置](#12-路径配置)
+> This document details all hyperparameter settings in `run_experiment.sh` and its related configuration files.
 
 ---
 
-## 1. 模型配置
+## Table of Contents
 
-### 1.1 LLM 模型预设
+1. [Model Configuration](#1-model-configuration)
+2. [Planning Configuration](#2-planning-configuration-planning)
+3. [Execution Configuration](#3-execution-configuration-execution)
+4. [Evolution Configuration](#4-evolution-configuration-evolution)
+5. [Factor Generation Configuration](#5-factor-generation-configuration-factor)
+6. [Backtest Configuration](#6-backtest-configuration-backtest)
+7. [Data Configuration](#7-data-configuration-data)
+8. [Model Training Configuration](#8-model-training-configuration-lgbmodel)
+9. [Trading Strategy Configuration](#9-trading-strategy-configuration-strategy)
+10. [LLM Configuration](#10-llm-configuration)
+11. [Logging Configuration](#11-logging-configuration-logging)
+12. [Path Configuration](#12-path-configuration)
 
-通过 `MODEL_PRESET` 环境变量快速切换模型：
+---
 
-| 预设名称 | 推理模型 | 对话模型 | API 端点 |
+## 1. Model Configuration
+
+### 1.1 LLM Model Presets
+
+Quickly switch models via the `MODEL_PRESET` environment variable:
+
+| Preset name | Reasoning model | Chat model | API endpoint |
 |---------|---------|---------|----------|
 | `gemini` | `google/gemini-3-pro-preview` | `google/gemini-3-pro-preview` | OpenRouter |
 | `deepseek` | `deepseek/deepseek-v3.2` | `deepseek/deepseek-v3.2` | OpenRouter |
-| `deepseek_aliyun` | `deepseek-v3.2` | `deepseek-v3.2` | 阿里云 DashScope |
+| `deepseek_aliyun` | `deepseek-v3.2` | `deepseek-v3.2` | Alibaba Cloud DashScope |
 | `claude` | `anthropic/claude-sonnet-4.5` | `anthropic/claude-sonnet-4.5` | OpenRouter |
 | `gpt` | `openai/gpt-5.2` | `openai/gpt-5.2` | OpenRouter |
-| `qwen` | `qwen3-235b-a22b-instruct-2507` | `qwen3-235b-a22b-instruct-2507` | 阿里云 DashScope |
+| `qwen` | `qwen3-235b-a22b-instruct-2507` | `qwen3-235b-a22b-instruct-2507` | Alibaba Cloud DashScope |
 
-### 1.2 环境变量覆盖
+### 1.2 Environment Variable Overrides
 
 ```bash
-REASONING_MODEL=<model_name>   # 推理模型
-CHAT_MODEL=<model_name>        # 对话模型
-OPENAI_API_KEY=<api_key>       # API 密钥
-OPENAI_BASE_URL=<base_url>     # API 端点
+REASONING_MODEL=<model_name>   # Reasoning model
+CHAT_MODEL=<model_name>        # Chat model
+OPENAI_API_KEY=<api_key>       # API key
+OPENAI_BASE_URL=<base_url>     # API endpoint
 ```
 
 ---
 
-## 2. 规划配置 (Planning)
+## 2. Planning Configuration (Planning)
 
-> 配置文件: `alphaagent/app/qlib_rd_loop/run_config.yaml`
+> Config file: `alphaagent/app/qlib_rd_loop/run_config.yaml`
 
-| 参数名 | 默认值 | 类型 | 说明 |
+| Parameter | Default | Type | Description |
 |--------|--------|------|------|
-| `enabled` | `true` | bool | 启用并行规划功能 |
-| `num_directions` | **10** | int | 🔥**超参** 并行探索方向数量 |
-| `max_attempts` | `5` | int | 规划最大重试次数 |
-| `use_llm` | `true` | bool | 是否使用 LLM 生成方向 |
-| `allow_fallback` | `true` | bool | LLM 失败时是否使用内置模板回退 |
-| `prompt_file` | `planning_prompts.yaml` | str | 规划提示词文件路径 |
+| `enabled` | `true` | bool | Enable parallel planning |
+| `num_directions` | **10** | int | 🔥**Hyperparam** Number of parallel exploration directions |
+| `max_attempts` | `5` | int | Maximum planning retries |
+| `use_llm` | `true` | bool | Whether to use the LLM to generate directions |
+| `allow_fallback` | `true` | bool | Whether to fall back to built-in templates if the LLM fails |
+| `prompt_file` | `planning_prompts.yaml` | str | Planning prompt file path |
 
 ---
 
-## 3. 执行配置 (Execution)
+## 3. Execution Configuration (Execution)
 
-| 参数名 | 默认值 | 类型 | 说明 |
+| Parameter | Default | Type | Description |
 |--------|--------|------|------|
-| `max_loops` | `11` | int | 最大循环迭代次数 |
-| `steps_per_loop` | `5` | int | 每循环步数 (固定: 提出假设/构建因子/计算/回测/反馈) |
-| `step_n` | `null` | int | 总步数 (最高优先级，覆盖 max_loops × steps_per_loop) |
-| `use_local` | `true` | bool | 使用本地环境回测 (vs Docker) |
-| `parallel_execution` | `false` | bool | 是否使用多进程并行运行分支 |
-| `branch_log_root` | `/mnt/DATA/quantagent/AlphaAgent/log` | str | 分支日志根目录 |
-| `branch_log_prefix` | `branch` | str | 分支日志前缀 |
+| `max_loops` | `11` | int | Maximum number of loop iterations |
+| `steps_per_loop` | `5` | int | Steps per loop (fixed: propose hypothesis / build factor / calculate / backtest / feedback) |
+| `step_n` | `null` | int | Total number of steps (highest priority; overrides max_loops × steps_per_loop) |
+| `use_local` | `true` | bool | Use the local environment for backtesting (vs Docker) |
+| `parallel_execution` | `false` | bool | Whether to run branches in parallel using multiprocessing |
+| `branch_log_root` | `/mnt/DATA/quantagent/AlphaAgent/log` | str | Branch log root directory |
+| `branch_log_prefix` | `branch` | str | Branch log prefix |
 
 ---
 
-## 4. 进化配置 (Evolution)
+## 4. Evolution Configuration (Evolution)
 
-> 🔥 核心超参数区域
+> 🔥 Core hyperparameter section
 
-| 参数名 | 默认值 | 类型 | 说明 |
+| Parameter | Default | Type | Description |
 |--------|--------|------|------|
-| `enabled` | `true` | bool | 启用进化模式 |
-| `mutation_enabled` | `true` | bool | 启用变异阶段 |
-| `crossover_enabled` | `true` | bool | 启用交叉阶段 |
-| `max_rounds` | **11** | int | 🔥**超参** 最大进化轮数 (包括原始轮) |
-| `crossover_size` | **2** | int | 🔥**超参** 每次交叉选择的父代数量 (可选 2 或 3) |
-| `crossover_n` | **10** | int | 🔥**超参** 每轮交叉生成的组合数量 |
-| `parallel_enabled` | `false` | bool | 进化阶段内并行执行 |
-| `prefer_diverse_crossover` | `true` | bool | 偏好多样化的交叉组合 |
-| `parent_selection_strategy` | `best` | str | 父代选择策略 |
-| `top_percent_threshold` | `0.3` | float | Top 百分比阈值 (配合 `top_percent_plus_random` 策略) |
-| `fresh_start` | `true` | bool | 是否从空轨迹池开始 |
-| `cleanup_on_finish` | `false` | bool | 实验结束后是否清理轨迹池 |
-| `prompt_file` | `evolution_prompts.yaml` | str | 进化提示词文件路径 |
+| `enabled` | `true` | bool | Enable evolution mode |
+| `mutation_enabled` | `true` | bool | Enable the mutation phase |
+| `crossover_enabled` | `true` | bool | Enable the crossover phase |
+| `max_rounds` | **11** | int | 🔥**Hyperparam** Maximum number of evolution rounds (including the original round) |
+| `crossover_size` | **2** | int | 🔥**Hyperparam** Number of parents selected for each crossover (2 or 3) |
+| `crossover_n` | **10** | int | 🔥**Hyperparam** Number of combinations generated per crossover round |
+| `parallel_enabled` | `false` | bool | Parallel execution within the evolution phase |
+| `prefer_diverse_crossover` | `true` | bool | Prefer diverse crossover combinations |
+| `parent_selection_strategy` | `best` | str | Parent selection strategy |
+| `top_percent_threshold` | `0.3` | float | Top-percent threshold (used with the `top_percent_plus_random` strategy) |
+| `fresh_start` | `true` | bool | Whether to start from an empty trajectory pool |
+| `cleanup_on_finish` | `false` | bool | Whether to clean up the trajectory pool after the experiment |
+| `prompt_file` | `evolution_prompts.yaml` | str | Evolution prompt file path |
 
-### 4.1 父代选择策略
+### 4.1 Parent Selection Strategies
 
-| 策略名 | 说明 |
+| Strategy | Description |
 |--------|------|
-| `best` | 优先选择表现最好的轨迹 |
-| `random` | 随机选择 |
-| `weighted` | 性能加权采样 (性能越高权重越高) |
-| `weighted_inverse` | 逆性能加权采样 (鼓励探索差轨迹) |
-| `top_percent_plus_random` | 前 30% 保证选中 + 剩余随机填充 |
+| `best` | Prefer the best-performing trajectories |
+| `random` | Random selection |
+| `weighted` | Performance-weighted sampling (higher performance → higher weight) |
+| `weighted_inverse` | Inverse-performance-weighted sampling (encourages exploring poor trajectories) |
+| `top_percent_plus_random` | Top 30% guaranteed + remaining filled randomly |
 
-### 4.2 进化流程
+### 4.2 Evolution Workflow
 
 ```
-Round 0: 原始轮 (Original) → 生成初始因子
-Round 1: 变异轮 (Mutation) → 对现有因子变异
-Round 2: 交叉轮 (Crossover) → 组合不同因子
-Round 3: 变异轮 (Mutation)
-Round 4: 交叉轮 (Crossover)
+Round 0: Original round  → generate initial factors
+Round 1: Mutation round   → mutate existing factors
+Round 2: Crossover round  → combine different factors
+Round 3: Mutation round
+Round 4: Crossover round
 ...
 ```
 
 ---
 
-## 5. 因子生成配置 (Factor)
+## 5. Factor Generation Configuration (Factor)
 
-| 参数名 | 默认值 | 类型 | 说明 |
+| Parameter | Default | Type | Description |
 |--------|--------|------|------|
-| `factors_per_hypothesis` | **3** | int | 🔥 每个假设生成的因子数量 |
+| `factors_per_hypothesis` | **3** | int | 🔥 Number of factors generated per hypothesis |
 
-### 5.1 复杂度约束
+### 5.1 Complexity Constraints
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `symbol_length_threshold` | **250** | 🔥 因子表达式最大字符长度 (防止过拟合关键参数) |
-| `base_features_threshold` | `6` | 不同基础特征最大数量 ($close, $open 等) |
-| `free_args_ratio_threshold` | `0.5` | 最大自由参数比例 (数值常量/总节点数) |
+| `symbol_length_threshold` | **250** | 🔥 Maximum character length of a factor expression (key parameter to prevent overfitting) |
+| `base_features_threshold` | `6` | Maximum number of distinct base features ($close, $open, etc.) |
+| `free_args_ratio_threshold` | `0.5` | Maximum ratio of free parameters (numeric constants / total nodes) |
 
-### 5.2 重复性检查
+### 5.2 Duplication Check
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `duplication.enabled` | `true` | 启用重复性检查 |
-| `duplication.threshold` | `5` | 重复子树大小阈值 |
-| `duplication.factor_zoo_path` | `null` | 因子库文件路径 |
+| `duplication.enabled` | `true` | Enable the duplication check |
+| `duplication.threshold` | `5` | Duplicate subtree size threshold |
+| `duplication.factor_zoo_path` | `null` | Factor library file path |
 
 ---
 
-## 6. 回测配置 (Backtest)
+## 6. Backtest Configuration (Backtest)
 
-| 参数名 | 默认值 | 类型 | 说明 |
+| Parameter | Default | Type | Description |
 |--------|--------|------|------|
-| `use_docker` | `false` | bool | 使用 Docker 环境回测 |
-| `timeout` | **800** | int | 🔥 每次回测超时时间 (秒) |
-| `qlib.config_name` | `conf.yaml` | str | Qlib 配置文件名 |
+| `use_docker` | `false` | bool | Use a Docker environment for backtesting |
+| `timeout` | **800** | int | 🔥 Timeout per backtest (seconds) |
+| `qlib.config_name` | `conf.yaml` | str | Qlib configuration file name |
 
 ---
 
-## 7. 数据配置 (Data)
+## 7. Data Configuration (Data)
 
-> 配置文件: `alphaagent/scenarios/qlib/experiment/factor_template/conf.yaml`
+> Config file: `alphaagent/scenarios/qlib/experiment/factor_template/conf.yaml`
 
-### 7.1 Qlib 初始化
+### 7.1 Qlib Initialization
 
-| 参数名 | 值 | 说明 |
+| Parameter | Value | Description |
 |--------|-----|------|
-| `provider_uri` | `~/.qlib/qlib_data/cn_data` | Qlib 数据路径 |
-| `region` | `cn` | 市场区域 (cn/us) |
+| `provider_uri` | `~/.qlib/qlib_data/cn_data` | Qlib data path |
+| `region` | `cn` | Market region (cn/us) |
 
-### 7.2 市场配置
+### 7.2 Market Configuration
 
-| 参数名 | 值 | 说明 |
+| Parameter | Value | Description |
 |--------|-----|------|
-| `market` | **csi300** | 🔥 股票池 (沪深300) |
-| `benchmark` | **SH000300** | 🔥 基准指数 (沪深300指数) |
+| `market` | **csi300** | 🔥 Stock pool (CSI 300) |
+| `benchmark` | **SH000300** | 🔥 Benchmark index (CSI 300 index) |
 
-### 7.3 时间范围
+### 7.3 Time Range
 
-| 数据集 | 时间范围 | 说明 |
+| Dataset | Time range | Description |
 |--------|----------|------|
-| **整体数据** | 2016-01-01 ~ 2025-12-26 | 全部数据范围 |
-| **训练集** | 2016-01-01 ~ 2020-12-31 | 模型训练 (5年) |
-| **验证集** | 2021-01-01 ~ 2021-12-31 | 模型验证 (1年) |
-| **测试集** | 2022-01-01 ~ 2025-12-26 | 回测评估 (约4年) |
+| **Overall data** | 2016-01-01 ~ 2025-12-26 | Full data range |
+| **Training set** | 2016-01-01 ~ 2020-12-31 | Model training (5 years) |
+| **Validation set** | 2021-01-01 ~ 2021-12-31 | Model validation (1 year) |
+| **Test set** | 2022-01-01 ~ 2025-12-26 | Backtest evaluation (~4 years) |
 
-### 7.4 数据处理器
+### 7.4 Data Processors
 
 ```yaml
 learn_processors:
-  - Fillna (feature)      # 填充缺失值
-  - ProcessInf            # 处理无穷值
-  - DropnaLabel           # 删除空标签
-  - CSRankNorm (feature)  # 截面排名标准化 (特征)
-  - CSRankNorm (label)    # 截面排名标准化 (标签)
+  - Fillna (feature)      # Fill missing values
+  - ProcessInf            # Handle infinite values
+  - DropnaLabel           # Drop empty labels
+  - CSRankNorm (feature)  # Cross-sectional rank normalization (features)
+  - CSRankNorm (label)    # Cross-sectional rank normalization (label)
 
 infer_processors:
   - Fillna (feature)
@@ -197,123 +197,122 @@ infer_processors:
   - CSRankNorm (label)
 ```
 
-### 7.5 标签定义
+### 7.5 Label Definition
 
 ```python
-label = "Ref($close, -2) / Ref($close, -1) - 1"  # T+2 日收益率
+label = "Ref($close, -2) / Ref($close, -1) - 1"  # T+2 daily return
 ```
 
 ---
 
-## 8. 模型训练配置 (LGBModel)
+## 8. Model Training Configuration (LGBModel)
 
-> LightGBM 模型超参数
+> LightGBM model hyperparameters
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `loss` | `mse` | 损失函数 |
-| `learning_rate` | **0.05** | 🔥 学习率 |
-| `max_depth` | **8** | 🔥 树最大深度 |
-| `num_leaves` | **210** | 🔥 叶节点数量 |
-| `colsample_bytree` | `0.8879` | 列采样比例 |
-| `subsample` | `0.8789` | 行采样比例 |
-| `lambda_l1` | `205.6999` | L1 正则化 |
-| `lambda_l2` | `580.9768` | L2 正则化 |
-| `num_threads` | `20` | 并行线程数 |
-| `early_stopping_round` | **50** | 🔥 早停轮数 |
-| `num_boost_round` | **500** | 🔥 最大迭代轮数 |
+| `loss` | `mse` | Loss function |
+| `learning_rate` | **0.05** | 🔥 Learning rate |
+| `max_depth` | **8** | 🔥 Maximum tree depth |
+| `num_leaves` | **210** | 🔥 Number of leaves |
+| `colsample_bytree` | `0.8879` | Column sampling ratio |
+| `subsample` | `0.8789` | Row sampling ratio |
+| `lambda_l1` | `205.6999` | L1 regularization |
+| `lambda_l2` | `580.9768` | L2 regularization |
+| `num_threads` | `20` | Number of parallel threads |
+| `early_stopping_round` | **50** | 🔥 Early-stopping rounds |
+| `num_boost_round` | **500** | 🔥 Maximum number of boosting iterations |
 
 ---
 
-## 9. 交易策略配置 (Strategy)
+## 9. Trading Strategy Configuration (Strategy)
 
-### 9.1 TopkDropout 策略
+### 9.1 TopkDropout Strategy
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `topk` | **50** | 🔥 持仓股票数量 |
-| `n_drop` | **5** | 🔥 每日淘汰股票数量 |
+| `topk` | **50** | 🔥 Number of held stocks |
+| `n_drop` | **5** | 🔥 Number of stocks dropped per rebalance |
 
-### 9.2 交易成本
+### 9.2 Transaction Costs
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `account` | `100000000` | 初始资金 (1亿) |
-| `limit_threshold` | `0.095` | 涨跌停阈值 (9.5%) |
-| `deal_price` | `open` | 成交价格 (开盘价) |
-| `open_cost` | **0.0005** | 🔥 买入成本 (0.05%) |
-| `close_cost` | **0.0015** | 🔥 卖出成本 (0.15%) |
-| `min_cost` | `5` | 最小交易成本 (元) |
+| `account` | `100000000` | Initial capital (100 million) |
+| `limit_threshold` | `0.095` | Price-limit threshold (9.5%) |
+| `deal_price` | `open` | Execution price (open price) |
+| `open_cost` | **0.0005** | 🔥 Buy cost (0.05%) |
+| `close_cost` | **0.0015** | 🔥 Sell cost (0.15%) |
+| `min_cost` | `5` | Minimum transaction cost (yuan) |
 
 ---
 
-## 10. LLM 配置
+## 10. LLM Configuration
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `factor_mining_timeout` | `999999` | 因子挖掘总超时 (秒) |
-| `max_retries` | `3` | API 调用最大重试次数 |
-| `retry_delay` | `1.0` | 重试间隔 (秒) |
-| `json_mode_strict` | `true` | JSON 模式严格性 |
+| `factor_mining_timeout` | `999999` | Total factor-mining timeout (seconds) |
+| `max_retries` | `3` | Maximum API call retries |
+| `retry_delay` | `1.0` | Retry interval (seconds) |
+| `json_mode_strict` | `true` | JSON-mode strictness |
 
 ---
 
-## 11. 日志配置 (Logging)
+## 11. Logging Configuration (Logging)
 
-| 参数名 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |--------|--------|------|
-| `level` | `INFO` | 日志级别 (DEBUG/INFO/WARNING/ERROR) |
-| `save_snapshots` | `true` | 保存中间会话快照 |
-| `save_trajectory_pool` | `true` | 保存轨迹池到 JSON |
+| `level` | `INFO` | Log level (DEBUG/INFO/WARNING/ERROR) |
+| `save_snapshots` | `true` | Save intermediate session snapshots |
+| `save_trajectory_pool` | `true` | Save the trajectory pool to JSON |
 
 ---
 
-## 12. 路径配置
+## 12. Path Configuration
 
-### 12.1 工作空间路径
+### 12.1 Workspace Paths
 
 ```bash
-# 自动生成 (默认)
+# Auto-generated (default)
 WORKSPACE_PATH=/mnt/DATA/quantagent/QuantaAlpha/QuantaAlpha_workspace_exp_YYYYMMDD_HHMMSS
 PICKLE_CACHE_FOLDER_PATH=/mnt/DATA/quantagent/AlphaAgent/pickle_cache_exp_YYYYMMDD_HHMMSS
 
-# 手动指定
-EXPERIMENT_ID=my_exp bash 运行实验.sh "方向"
+# Manual specification
+EXPERIMENT_ID=my_exp bash run_experiment.sh "direction"
 
-# 共享目录模式
-EXPERIMENT_ID=shared bash 运行实验.sh "方向"
+# Shared-directory mode
+EXPERIMENT_ID=shared bash run_experiment.sh "direction"
 ```
 
-### 12.2 输出文件
+### 12.2 Output Files
 
-| 文件 | 路径 | 说明 |
+| File | Path | Description |
 |------|------|------|
-| 因子库 | `all_factors_library.json` | 默认输出 |
-| 因子库 (带后缀) | `all_factors_library_{suffix}.json` | 指定后缀输出 |
-| 配置文件 | `alphaagent/app/qlib_rd_loop/run_config.yaml` | 主配置文件 |
-| 回测配置 | `alphaagent/scenarios/qlib/experiment/factor_template/conf.yaml` | Qlib 配置 |
+| Factor library | `all_factors_library.json` | Default output |
+| Factor library (with suffix) | `all_factors_library_{suffix}.json` | Suffix-specified output |
+| Config file | `alphaagent/app/qlib_rd_loop/run_config.yaml` | Main config file |
+| Backtest config | `alphaagent/scenarios/qlib/experiment/factor_template/conf.yaml` | Qlib config |
 
 ---
 
-## 附录: 关键超参数汇总
+## Appendix: Key Hyperparameter Summary
 
-| 类别 | 参数 | 默认值 | 影响 |
+| Category | Parameter | Default | Impact |
 |------|------|--------|------|
-| **规划** | `num_directions` | 10 | 初始探索方向数量 |
-| **进化** | `max_rounds` | 11 | 总进化轮数 |
-| **进化** | `crossover_size` | 2 | 交叉父代数量 |
-| **进化** | `crossover_n` | 10 | 每轮交叉组合数 |
-| **因子** | `factors_per_hypothesis` | 3 | 每假设因子数 |
-| **因子** | `symbol_length_threshold` | 250 | 表达式长度上限 |
-| **模型** | `learning_rate` | 0.05 | LGB 学习率 |
-| **模型** | `num_boost_round` | 500 | LGB 迭代次数 |
-| **策略** | `topk` | 50 | 持仓股票数 |
-| **策略** | `n_drop` | 5 | 每日调仓数 |
-| **数据** | `market` | csi300 | 股票池 |
-| **数据** | `train` | 2016-2020 | 训练集范围 |
-| **数据** | `test` | 2022-2025 | 测试集范围 |
+| **Planning** | `num_directions` | 10 | Number of initial exploration directions |
+| **Evolution** | `max_rounds` | 11 | Total evolution rounds |
+| **Evolution** | `crossover_size` | 2 | Number of crossover parents |
+| **Evolution** | `crossover_n` | 10 | Number of crossover combinations per round |
+| **Factor** | `factors_per_hypothesis` | 3 | Number of factors per hypothesis |
+| **Factor** | `symbol_length_threshold` | 250 | Maximum expression length |
+| **Model** | `learning_rate` | 0.05 | LGB learning rate |
+| **Model** | `num_boost_round` | 500 | LGB iterations |
+| **Strategy** | `topk` | 50 | Number of held stocks |
+| **Strategy** | `n_drop` | 5 | Number of rebalanced stocks per day |
+| **Data** | `market` | csi300 | Stock pool |
+| **Data** | `train` | 2016-2020 | Training set range |
+| **Data** | `test` | 2022-2025 | Test set range |
 
 ---
 
-*文档生成时间: 2026-01-24*
-
+*Document generated: 2026-01-24*

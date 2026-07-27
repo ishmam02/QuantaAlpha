@@ -174,9 +174,14 @@ class FactorFBWorkspace(FBWorkspace):
                     env['PYTHONPATH'] = pythonpath + ':' + env['PYTHONPATH']
                 else:
                     env['PYTHONPATH'] = pythonpath
-                
+                # Strip IDE/debug/Python-injection env vars that can break the conda
+                # interpreter in child processes (e.g. when launched from the VSCode
+                # integrated terminal, which injects VSCODE_*/DEBUGPY*/PYTHONSTARTUP).
+                for _k in [k for k in env if k.startswith(("PYTHON", "VSCODE_", "DEBUGPY", "COPILOT", "BUNDLED_DEBUGPY")) and k != "PYTHONPATH"]:
+                    del env[_k]
+
                 subprocess.check_output(
-                    f"{FACTOR_COSTEER_SETTINGS.python_bin} {execution_code_path}",
+                    f"{FACTOR_COSTEER_SETTINGS.python_bin} {execution_code_path.resolve()}",
                     shell=True,
                     cwd=self.workspace_path,
                     stderr=subprocess.STDOUT,

@@ -574,7 +574,13 @@ class FactorFinalDecisionEvaluator(FactorEvaluator):
                 return final_decision, final_feedback
 
             except json.JSONDecodeError as e:
-                raise ValueError("Failed to decode JSON response from API.") from e
+                # Retry with a fresh (uncached, reseeded) response rather than failing on
+                # the first malformed JSON. Models such as minimax often emit non-strict
+                # JSON (e.g. trailing commas) that a re-roll fixes; the loop above is
+                # already set up for retries (fresh APIBackend + seed=attempts).
+                attempts += 1
+                if attempts >= max_attempts:
+                    raise ValueError("Failed to decode JSON response from API.") from e
             except KeyError as e:
                 attempts += 1
                 if attempts >= max_attempts:

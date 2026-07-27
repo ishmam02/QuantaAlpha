@@ -115,15 +115,28 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                             env = os.environ.copy()
                             project_root = Path(__file__).parent.parent.parent.parent.parent
                             env['PYTHONPATH'] = str(project_root) + os.pathsep + env.get('PYTHONPATH', '')
+                            # Strip IDE/debug/Python-injection env vars that can break the conda
+                            # interpreter in child processes (e.g. launched from the VSCode terminal).
+                            for _k in [k for k in env if k.startswith(("PYTHON", "VSCODE_", "DEBUGPY", "COPILOT", "BUNDLED_DEBUGPY")) and k != "PYTHONPATH"]:
+                                del env[_k]
                             subprocess.check_output(
-                                [sys.executable, str(ws.workspace_path / 'factor.py')],
+                                [sys.executable, str((ws.workspace_path / 'factor.py').resolve())],
                                 cwd=str(ws.workspace_path),
                                 stderr=subprocess.STDOUT,
                                 env=env,
                                 timeout=1200,
                             )
                         except Exception as exec_e:
-                            logger.warning(f"Failed to manually execute factor {ws.workspace_path}: {exec_e}")
+                            _out = getattr(exec_e, "output", b"")
+                            if isinstance(_out, bytes):
+                                try:
+                                    _out = _out.decode()
+                                except Exception:
+                                    _out = repr(_out)
+                            logger.warning(
+                                f"Failed to manually execute factor {ws.workspace_path}: {exec_e}\n"
+                                f"--- factor.py output ---\n{str(_out)[-2000:]}"
+                            )
                 
                 # Retry processing factor data
                 try:

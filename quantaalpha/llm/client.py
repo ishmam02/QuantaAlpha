@@ -916,6 +916,10 @@ class APIBackend:
                     
                     # Fix other invalid escapes: \_ \{ \} etc.
                     fixed_resp = re.sub(r'(?<!\\)\\([_\{\}\[\]])', r'\\\\\1', fixed_resp)
+
+                    # Fix trailing commas before a closing bracket, e.g. {"a": 1,} or [1, 2,].
+                    # Some chat models (e.g. minimax via Ollama) emit these even in json_mode.
+                    fixed_resp = re.sub(r',(\s*[}\]])', r'\1', fixed_resp)
                     
                     try:
                         json.loads(fixed_resp)
