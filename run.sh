@@ -154,11 +154,21 @@ fi
 DIRECTION="$1"
 LIBRARY_SUFFIX="$2"
 
+# Factor library filename: data/factorlib/all_factors_library[_<suffix>].json
+# (loop.py:224-232). The library is upserted, never truncated -- library.py
+# loads the existing file, mutates the dict, and rewrites it -- so a shared
+# filename ACCUMULATES factors across runs.
+#
+# Default to a per-run suffix: the two arms must not pool their factors, the
+# Task 19 head-to-head needs both libraries side by side, and it leaves an
+# existing all_factors_library.json untouched.
+#
+# Precedence: positional $2 > a pre-set FACTOR_LIBRARY_SUFFIX > EXPERIMENT_ID.
+# Exporting FACTOR_LIBRARY_SUFFIX="" selects the bare all_factors_library.json
+# and accumulates into it, which is the pre-arm behaviour.
 if [ -n "${LIBRARY_SUFFIX}" ]; then
     export FACTOR_LIBRARY_SUFFIX="${LIBRARY_SUFFIX}"
-else
-    # Keep the two arms' factor libraries apart by default; the head-to-head in
-    # scripts/qa_compare_arms.py needs both, and a shared filename loses one.
+elif [ -z "${FACTOR_LIBRARY_SUFFIX+x}" ]; then
     export FACTOR_LIBRARY_SUFFIX="${EXPERIMENT_ID}"
 fi
 
