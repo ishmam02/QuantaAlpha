@@ -63,7 +63,14 @@ portfolio: # g — Eq. 6; the baseline's construction
 
 costs: # Eq. 7
   kappa0: 0.0020 # = open_cost 0.0005 + close_cost 0.0015 → nests Qlib's flat fee
-  kappa1: 0.10 # slippage ≈ 10% of daily vol per unit traded weight
+  # Slippage as a fraction of daily volatility per unit traded weight.
+  # 0.10 implied 19.7bps one-way (kappa1 * median sigma 1.97%/day), ~3-5x too
+  # high for CSI 300 large caps at this book's 0.167% participation of ADV,
+  # where cost is spread-dominated. 0.03 implies ~5.9bps, in the credible range.
+  # Cuts modelled cost 18.0%/yr -> ~10.6%/yr. Ranking is barely affected: under
+  # top-k dropout turnover is structurally pinned, so cost_bps spans only
+  # 0.45bps across factors while net_arr spans ~9pp.
+  kappa1: 0.03
   kappa2: 0.01 # calibrated: 1% of ADV ⇒ 10 bps of traded notional (see costs.py)
   impact_exponent: 1.5 # φ ∝ |Δw|^{3/2}/√ADV
   beta_per_day: 0.0004 # ≈10%/yr borrow; inert while signed:false
