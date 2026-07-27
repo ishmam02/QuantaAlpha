@@ -268,7 +268,23 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         Returns:
             pd.DataFrame: Combined factor data without NaN values.
         """
-        if isinstance(exp_or_list, QlibFactorExperiment):
+        # Wrap a single experiment. The isinstance check alone is not enough:
+        # under `spawn`, a module can be loaded under two identities (e.g. via a
+        # PYTHONPATH entry as well as site-packages), so an experiment created in
+        # one context can fail isinstance against the class object imported in
+        # another. When that happens this function used to iterate the experiment
+        # itself, yield nothing, and raise FactorEmptyError in microseconds --
+        # with no factor ever executed and nothing logged. Fall back on the
+        # duck-typed check so a class-identity mismatch cannot silently look like
+        # "no factor data".
+        if isinstance(exp_or_list, QlibFactorExperiment) or hasattr(exp_or_list, "sub_workspace_list"):
+            if not isinstance(exp_or_list, QlibFactorExperiment):
+                logger.warning(
+                    f"process_factor_data received {type(exp_or_list).__module__}."
+                    f"{type(exp_or_list).__name__}, which failed isinstance against "
+                    f"{QlibFactorExperiment.__module__}.{QlibFactorExperiment.__name__} "
+                    "(duplicate module identity); wrapping it by duck-typing instead."
+                )
             exp_or_list = [exp_or_list]
         factor_dfs = []
 
