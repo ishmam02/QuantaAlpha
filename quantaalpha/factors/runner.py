@@ -72,6 +72,41 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         IC_max = IC_max.unstack().max(axis=0)
         return new_feature.iloc[:, IC_max[IC_max < 0.99].index]
 
+    @staticmethod
+    def rehydrate_code_dict(exp: QlibFactorExperiment) -> int:
+        """Reload `factor.py` into `code_dict` when it is on disk but not in memory.
+
+        `FactorFBWorkspace.execute` returns `(FB_CODE_NOT_SET, None)` the instant
+        `"factor.py" not in self.code_dict` -- and `hash_func` returns None in the
+        same case, so `cache_with_pickle` passes straight through to that early
+        return. `process_factor_data` only inspects the DataFrame, discarding the
+        message, so this failure is completely silent: every workspace yields
+        None, factor_dfs is empty, and the caller sees "No valid factor data
+        found to merge" ~10ms after the backtest step begins.
+
+        The code is on disk (CoSTEER wrote it during factor_calculate); only the
+        in-memory dict is empty. Restoring it lets `execute("All")` run properly
+        against the full panel.
+
+        Returns the number of workspaces restored.
+        """
+        restored = 0
+        for ws in getattr(exp, "sub_workspace_list", None) or []:
+            code = getattr(ws, "code_dict", None)
+            if code and "factor.py" in code:
+                continue
+            path = Path(ws.workspace_path) / "factor.py"
+            if not path.exists():
+                continue
+            try:
+                ws.inject_code(**{"factor.py": path.read_text(encoding="utf-8")})
+                restored += 1
+            except Exception as exc:
+                logger.warning(f"Could not restore factor.py for {ws.workspace_path}: {exc}")
+        if restored:
+            logger.info(f"Restored factor.py into code_dict for {restored} workspace(s)")
+        return restored
+
     def acquire_new_factors(self, exp: QlibFactorExperiment) -> pd.DataFrame:
         """Load this experiment's factor signals, recovering from a failed run.
 
@@ -86,6 +121,8 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         factor is missing its output, skips the loop, and never reaches
         `E_theta.evaluate()` at all -- producing a full run with no metrics.
         """
+        self.rehydrate_code_dict(exp)
+
         try:
             return self.process_factor_data(exp)
         except FactorEmptyError as e:
