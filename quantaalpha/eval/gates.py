@@ -54,6 +54,14 @@ def feasible(m: dict, theta: Protocol) -> tuple[bool, list[str]]:
     failed: list[str] = []
 
     checks = (
+        # PRIMARY admissibility: does f improve the book it joins? Stand-alone
+        # RankIC is an average over the whole cross-section, but the top-k book
+        # is a bet on its extreme tail, so the two come apart -- the pilot's 18
+        # factors all failed the RankIC gate yet were worth +7pp of annual
+        # return over the base-features-only null model.
+        ("delta_net_ir", m.get("delta_net_ir"), theta.gates.gamma_delta, "min"),
+        # Liveness floors: is the signal predictive at all? Deliberately low --
+        # these catch dead or inverted signals, they do not judge quality.
         ("rank_ic", m.get("rank_ic"), theta.gates.gamma_ic, "min"),
         ("rank_icir", m.get("rank_icir"), theta.gates.gamma_ir, "min"),
         ("turnover", turnover_value(m, theta), theta.gates.tau_max, "max"),
@@ -62,7 +70,14 @@ def feasible(m: dict, theta: Protocol) -> tuple[bool, list[str]]:
     )
 
     for name, value, threshold, direction in checks:
-        if _missing(value):
+        # A null threshold disables the gate. Used for the stand-alone IC floors,
+        # which measurement showed to be anti-correlated with what they were
+        # meant to proxy: on the pilot's 18 factors the best contributor
+        # (+0.1893 net IR) had rank_ic +0.0004, several strong contributors had
+        # NEGATIVE rank_ic, and the best-IC factor (+0.0237) was the worst
+        # contributor (-0.0833). Keeping them as a "liveness" floor rejected all
+        # nine factors that actually improved the book.
+        if threshold is None or _missing(value):
             continue
         if direction == "min" and float(value) < float(threshold):
             failed.append(name)
@@ -75,6 +90,8 @@ def feasible(m: dict, theta: Protocol) -> tuple[bool, list[str]]:
 def describe_failures(m: dict, theta: Protocol, failed: list[str]) -> list[str]:
     """Human-readable "value vs threshold" lines, for the LLM feedback."""
     thresholds = {
+        "delta_net_ir": ("Marginal net IR vs the book without it",
+                         m.get("delta_net_ir"), theta.gates.gamma_delta, "<", "gamma_delta"),
         "rank_ic": ("RankIC", m.get("rank_ic"), theta.gates.gamma_ic, "<", "gamma_ic"),
         "rank_icir": ("RankICIR", m.get("rank_icir"), theta.gates.gamma_ir, "<", "gamma_ir"),
         "turnover": ("Turnover", turnover_value(m, theta), theta.gates.tau_max, ">", "tau_max"),

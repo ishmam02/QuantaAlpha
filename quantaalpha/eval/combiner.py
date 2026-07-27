@@ -122,7 +122,7 @@ _PREDICTION_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
 
 def fit_predict(
     zoo_signals: dict[str, pd.DataFrame],
-    candidate_signal: pd.DataFrame,
+    candidate_signal: pd.DataFrame | None,
     panel: PanelBundle,
     theta: Protocol,
     candidate_expr: str = "CANDIDATE",
@@ -131,8 +131,16 @@ def fit_predict(
 
     Fits on ``Θ.combiner.fit_split`` (train) only and predicts across the whole
     panel window. Returns a wide ``(T × N)`` frame aligned to ``panel``.
+
+    ``candidate_signal=None`` fits the **baseline** book on ``zoo`` alone, which
+    is what marginal contribution is measured against. With an empty zoo that
+    baseline is the null model: the four base features and nothing else.
     """
-    key = (zoo_hash(zoo_signals), signal_hash(candidate_expr), theta.hash)
+    key = (
+        zoo_hash(zoo_signals),
+        "baseline" if candidate_signal is None else signal_hash(candidate_expr),
+        theta.hash,
+    )
     cached = _PREDICTION_CACHE.get(key)
     if cached is not None:
         return cached.reindex(index=panel.dates, columns=panel.instruments)
@@ -146,9 +154,10 @@ def fit_predict(
         columns[col] = base[col]
     for i, (expr, sig) in enumerate(sorted(zoo_signals.items())):
         columns[f"ZOO{i}"] = _wide_to_long(sig.reindex(index=panel.dates, columns=panel.instruments), f"ZOO{i}")
-    columns["CAND"] = _wide_to_long(
-        candidate_signal.reindex(index=panel.dates, columns=panel.instruments), "CAND"
-    )
+    if candidate_signal is not None:
+        columns["CAND"] = _wide_to_long(
+            candidate_signal.reindex(index=panel.dates, columns=panel.instruments), "CAND"
+        )
 
     features = pd.DataFrame(columns)
     label = _label(panel, theta).reindex(features.index)

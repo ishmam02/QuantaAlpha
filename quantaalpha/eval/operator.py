@@ -52,6 +52,9 @@ class EvaluationOperator:
         self.theta = theta
         self._panels: dict[tuple[str, str], PanelBundle] = {}
         self._benchmarks: dict[tuple[str, str], pd.Series] = {}
+        # Baseline books keyed by (zoo_hash, window) -- one fit per repository
+        # state, not per candidate.
+        self._baselines: dict[tuple, dict] = {}
 
     # ------------------------------------------------------------------
     def _panel(self, start: str, end: str) -> PanelBundle:
@@ -144,11 +147,64 @@ class EvaluationOperator:
         panel: PanelBundle,
         eval_window: tuple[str, str],
     ) -> dict:
-        """Combiner refit → g → Eq. 7 → Eq. 8 → book metrics."""
+        """Combiner refit → g → Eq. 7 → Eq. 8 → book metrics, plus Δ vs baseline.
+
+        The absolute figures describe the book *containing* f. What actually
+        determines whether f is worth having is its **marginal contribution**:
+        the same book built from ``zoo`` alone, subtracted off. Measured on the
+        pilot's factors, stand-alone RankIC and marginal contribution came apart
+        badly -- all 18 failed the RankIC gate, yet collectively they were worth
+        +7pp of annual return over the base-features-only null model.
+        """
         prediction = combiner_mod.fit_predict(
             aligned_zoo, candidate, panel, self.theta, candidate_expr=candidate_expr
         )
+        metrics = self._book(prediction, panel, eval_window)
 
+        baseline = self._baseline(aligned_zoo, panel, eval_window)
+        for key in ("net_ir", "net_arr"):
+            base_v, full_v = baseline.get(key), metrics.get(key)
+            metrics[f"base_{key}"] = base_v
+            metrics[f"delta_{key}"] = (
+                full_v - base_v
+                if base_v is not None and full_v is not None
+                and base_v == base_v and full_v == full_v
+                else np.nan
+            )
+        return metrics
+
+    def _baseline(
+        self,
+        aligned_zoo: dict[str, pd.DataFrame],
+        panel: PanelBundle,
+        eval_window: tuple[str, str],
+    ) -> dict:
+        """The book built from ``zoo`` alone -- what f's contribution is measured against.
+
+        Depends on ``(zoo, Θ, window)`` but **not** on the candidate, and the
+        runner holds the zoo fixed across every candidate in an experiment, so
+        this costs one extra combiner fit per experiment rather than per factor.
+        With an empty zoo it is the null model: base features only.
+        """
+        key = (combiner_mod.zoo_hash(aligned_zoo), eval_window)
+        if key not in self._baselines:
+            pred = combiner_mod.fit_predict(aligned_zoo, None, panel, self.theta)
+            self._baselines[key] = self._book(pred, panel, eval_window)
+            logger.info(
+                "baseline book for zoo=%s (|zoo|=%d): net_ir=%.4f net_arr=%.4f",
+                key[0], len(aligned_zoo),
+                self._baselines[key].get("net_ir", float("nan")),
+                self._baselines[key].get("net_arr", float("nan")),
+            )
+        return self._baselines[key]
+
+    def _book(
+        self,
+        prediction: pd.DataFrame,
+        panel: PanelBundle,
+        eval_window: tuple[str, str],
+    ) -> dict:
+        """Price one composite prediction through g and the cost model."""
         start, end = eval_window
         window_pred = prediction.loc[str(start) : str(end)]
         if window_pred.empty:

@@ -136,8 +136,14 @@ class Gates:
     *scoring* in ``scoring.py`` is repository-relative.
     """
 
-    gamma_ic: float = 0.02
-    gamma_ir: float = 0.20
+    # Primary admissibility: minimum marginal contribution to the book's net IR.
+    # 0.0 = "must not make the book worse", which needs no tuning and stays
+    # robust as |zoo| grows and the per-factor delta shrinks.
+    gamma_delta: float = 0.0
+    # None disables the gate. Stand-alone IC proved anti-correlated with
+    # marginal contribution, so it is off by default; set a float to re-enable.
+    gamma_ic: float | None = None
+    gamma_ir: float | None = None
     tau_max: float = 0.30
     rho_bar: float = 0.70
     gamma_cx: float = 250

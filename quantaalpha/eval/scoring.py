@@ -31,7 +31,10 @@ from quantaalpha.eval.protocol import Protocol
 
 # dimension -> (metric key, higher_is_better)
 RANKED_DIMENSIONS: dict[str, tuple[str, bool]] = {
-    "effectiveness": ("net_ir", True),
+    # Rank on MARGINAL contribution, not the book's absolute performance:
+    # candidates sharing a zoo produce near-identical absolute net_ir, so
+    # ranking on it barely discriminates. Must match what the gate admits on.
+    "effectiveness": ("delta_net_ir", True),
     "arr": ("net_arr", True),
     "stability": ("rank_icir", True),
     "turnover": ("turnover_book", False),
