@@ -155,73 +155,60 @@ class NetCostFactorRunner(QlibFactorRunner):
         zoo_signals, zoo_metrics = self._zoo(exp)
         expressions = self._expressions(exp, new_factors.columns)
 
-        results: list[dict] = []
-        admitted: list[tuple[str, Any, dict]] = []
+        # ONE evaluation of the whole batch, matching how the control arm's qrun
+        # scores a round: all of the round's factors enter the combined model
+        # together and the book is measured once. Evaluating them individually
+        # made the arms structurally incomparable.
+        candidates = {}
         for column in new_factors.columns:
             expr = expressions.get(column, str(column))
             signal = new_factors[column].dropna()
             if signal.empty:
                 logger.warning("candidate %s produced an empty signal; skipping", column)
                 continue
-            try:
-                res = self.op.evaluate(signal, expr, zoo_signals, zoo_metrics)
-            except Exception:
-                logger.exception("E_theta evaluation failed for %s", column)
-                continue
-            res["factor_name"] = str(column)
-            results.append(res)
-            if res.get("feasible"):
-                admitted.append((expr, signal, {k[2:]: v for k, v in res.items() if k.startswith("m_")}))
-            self.ledger.append(
-                {
-                    "factor_id": md5_hash(f"{column}_{expr}")[:16],
-                    "factor_name": str(column),
-                    "factor_expr": expr,
-                    "theta_hash": res["theta_hash"],
-                    "zoo_hash": res["zoo_hash"],
-                    "zoo_size": res["zoo_size"],
-                    "metrics": {k[2:]: v for k, v in res.items() if k.startswith("m_")},
-                    "e": {k[2:]: v for k, v in res.items() if k.startswith("e_")},
-                    "U": res["U"],
-                    "feasible": res["feasible"],
-                    "failed_gates": res["failed_gates"],
-                }
-            )
+            candidates[expr] = signal
 
-        if not results:
+        if not candidates:
             raise FactorEmptyError("E_theta produced no evaluable factors.")
 
-        best = self._best(results)
+        try:
+            res = self.op.evaluate(candidates, zoo_signals=zoo_signals, zoo_metrics=zoo_metrics)
+        except Exception:
+            logger.exception("E_theta evaluation failed for this experiment")
+            raise FactorEmptyError("E_theta evaluation failed.")
 
-        # Only ADMISSIBLE factors join the repository. F_Theta is what decides
-        # whether a factor enters the feasible set at all; letting a rejected
-        # factor become an incumbent would pollute the combiner's inputs, lower
-        # the bar every later candidate is ranked against, and inflate rho_max
-        # against signals that were never supposed to be in the book.
-        for expr, signal, metrics in admitted:
-            self._repository[expr] = (signal, metrics)
-        if admitted:
-            logger.info(
-                "repository: admitted %d/%d candidate(s); |zoo| = %d",
-                len(admitted), len(results), len(self._repository),
-            )
-        else:
-            logger.info(
-                "repository: admitted 0/%d candidate(s) (all infeasible); |zoo| = %d",
-                len(results), len(self._repository),
-            )
+        names = [str(c) for c in new_factors.columns]
+        res["factor_name"] = ", ".join(names)
+        self.ledger.append(
+            {
+                "factor_ids": [md5_hash(f"{n}_{e}")[:16] for n, e in zip(names, candidates)],
+                "factor_names": names,
+                "factor_exprs": list(candidates),
+                "n_factors": len(candidates),
+                "theta_hash": res["theta_hash"],
+                "zoo_hash": res["zoo_hash"],
+                "zoo_size": res["zoo_size"],
+                "metrics": {k[2:]: v for k, v in res.items() if k.startswith("m_")},
+                "e": {k[2:]: v for k, v in res.items() if k.startswith("e_")},
+                "U": res["U"],
+            }
+        )
 
-        exp.result = self._to_series(best)
+        # Every mined factor joins the repository -- there is no admission step.
+        # U differentiates experiments by SCORE, dynamically, against the
+        # repository as it stands.
+        batch_metrics = {k[2:]: v for k, v in res.items() if k.startswith("m_")}
+        for expr, signal in candidates.items():
+            self._repository[expr] = (signal, batch_metrics)
+        logger.info(
+            "repository: +%d factor(s) from this experiment; |zoo| = %d",
+            len(candidates), len(self._repository),
+        )
+
+        exp.result = self._to_series(res)
         return exp
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _best(results: list[dict]) -> dict:
-        """The trajectory's fitness is its best factor, feasible ones first."""
-        feasible = [r for r in results if r.get("feasible")]
-        pool = feasible or results
-        return max(pool, key=lambda r: (r.get("U") if r.get("U") == r.get("U") else float("-inf")))
-
     def _zoo(self, exp: QlibFactorExperiment) -> tuple[dict[str, Any], list[dict]]:
         """The effective-alpha repository: admissible factors only.
 
@@ -287,7 +274,7 @@ class NetCostFactorRunner(QlibFactorRunner):
             "net_arr": res.get("m_net_arr"),
             "mdd": res.get("m_mdd"),
             "U": res.get("U"),
-            "feasible": res.get("feasible"),
+            "n_factors": res.get("n_factors"),
             "theta_hash": res.get("theta_hash"),
             "zoo_hash": res.get("zoo_hash"),
             "zoo_size": res.get("zoo_size"),
@@ -296,7 +283,6 @@ class NetCostFactorRunner(QlibFactorRunner):
             "turnover_solo": res.get("m_turnover_solo"),
             "cx": res.get("m_cx"),
             "cost_bps": res.get("m_cost_bps"),
-            "failed_gates": ",".join(res.get("failed_gates") or []),
         }
         payload.update({k: v for k, v in res.items() if k.startswith("e_")})
         return pd.Series(payload)

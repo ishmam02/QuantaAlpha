@@ -4,15 +4,22 @@ The entry point the rest of the system talks to. A pure function of
 ``(f, zoo, Θ)``: identical inputs give byte-identical output, which is
 Property 2 and is what the ledger's reproducibility claim rests on.
 
-Pipeline, in order:
+A whole factor SET is evaluated at once, exactly as the control arm's ``qrun``
+evaluates a round's factors together. Pipeline, in order:
 
 1. hash the repository state (``zoo_hash``);
-2. per-factor metrics on the IS window and the OOS proxy, both from Θ;
-3. ``ρ_max`` against every incumbent signal;
-4. refit the combiner on ``zoo ∪ {f}``, map the composite prediction through
-   ``g``, price Eq. 7, and measure the resulting book;
-5. apply ``F_Θ``;
-6. score each dimension against the repository and scalarize to ``U``.
+2. refit the combiner on ``zoo ∪ candidates``, map the composite prediction
+   through ``g``, price Eq. 7, and measure the resulting book;
+3. IC statistics **of that combined prediction** -- the same quantity Arm A's
+   SigAnaRecord reports, which is what makes the arms comparable;
+4. ``ρ_max`` and ``cx`` of the new batch against the repository;
+5. score each dimension by relative rank within the repository and scalarize
+   to ``U``.
+
+There are no absolute floors: admissibility gates were removed after
+measurement showed the criteria were either anti-correlated with contribution
+or irreproducible across combiner seeds. Selection is by ``U`` -- a *dynamic*,
+repository-relative criterion whose bar rises as the repository improves.
 
 Strategy-level metrics are measured on the **OOS proxy window**, never on the
 window the combiner was fitted to — an in-sample net IR would be meaningless.
@@ -31,11 +38,10 @@ from quantaalpha.eval import combiner as combiner_mod
 from quantaalpha.eval import costs as costs_mod
 from quantaalpha.eval.data import PanelBundle, align_signal, load_benchmark, load_panel
 from quantaalpha.eval.execution import fill_prices, realized_return
-from quantaalpha.eval.gates import feasible
 from quantaalpha.eval.metrics import (
-    per_factor_metrics,
+    cx,
+    prediction_metrics,
     rho_max,
-    solo_turnover,
     strategy_metrics,
 )
 from quantaalpha.eval.portfolio import topk_dropout
@@ -87,34 +93,57 @@ class EvaluationOperator:
     # ------------------------------------------------------------------
     def evaluate(
         self,
-        candidate_signal,
-        candidate_expr: str,
+        candidates,
+        candidate_expr: str | None = None,
         zoo_signals: dict[str, object] | None = None,
         zoo_metrics: list[dict] | None = None,
         *,
         report: bool = False,
     ) -> dict:
-        """Score one candidate against the current repository."""
+        """Score a factor SET as one book, the way the baseline's qrun does.
+
+        ``candidates`` is ``{expression: signal}`` -- every factor the experiment
+        produced, evaluated **together**, not one at a time. This mirrors the
+        control arm: Qlib fits the combined model on all of the round's factors
+        and reports one set of metrics for the resulting book. The only
+        differences here are the cost model (kappa0+kappa1+kappa2 instead of a
+        flat fee) and the repository-relative scoring layered on top.
+
+        Evaluating factors one at a time, as this used to, made the two arms
+        structurally incomparable and forced a per-factor admissibility verdict
+        that measurement showed was not reproducible across combiner seeds.
+
+        A bare signal is still accepted, for probes and ad-hoc scoring.
+        """
+        if not isinstance(candidates, dict):
+            candidates = {candidate_expr or "CANDIDATE": candidates}
         zoo_signals = dict(zoo_signals or {})
         zoo_metrics = list(zoo_metrics or [])
 
         panel_start, panel_end, eval_window = self._windows(report)
         panel = self._panel(panel_start, panel_end)
 
-        candidate = align_signal(candidate_signal, panel)
+        aligned_cands = {e: align_signal(s, panel) for e, s in candidates.items()}
         aligned_zoo = {expr: align_signal(sig, panel) for expr, sig in zoo_signals.items()}
         zoo_hash = combiner_mod.zoo_hash(zoo_signals)
 
-        # --- per-factor (independent of the cost model and of the zoo) ---
-        metrics = per_factor_metrics(candidate, candidate_expr, panel, self.theta)
-        metrics["turnover_solo"] = solo_turnover(candidate, panel, self.theta)
-        metrics["rho_max"] = rho_max(candidate, aligned_zoo)
+        # --- the book: zoo + ALL new factors, one combiner refit ---
+        book = self._strategy_batch(aligned_cands, aligned_zoo, panel, eval_window)
+        metrics = dict(book["metrics"])
 
-        # --- strategy level (one combiner refit) ---
-        metrics.update(self._strategy(candidate, candidate_expr, aligned_zoo, panel, eval_window))
+        # --- predictive quality OF THE COMBINED PREDICTION ---
+        # Arm A's SigAnaRecord reports IC of the combined model's output, not of
+        # any single factor, so this is the directly comparable quantity.
+        metrics.update(prediction_metrics(book["prediction"], panel, self.theta, eval_window))
 
-        # --- admissibility, then scoring ---
-        is_feasible, failed_gates = feasible(metrics, self.theta)
+        # --- properties of the new batch itself ---
+        metrics["rho_max"] = max(
+            (rho_max(sig, aligned_zoo) for sig in aligned_cands.values()), default=0.0
+        )
+        metrics["cx"] = max((cx(e) for e in aligned_cands), default=0)
+        metrics["n_factors"] = len(aligned_cands)
+
+        # --- dynamic (repository-relative) scoring only; no absolute floors ---
         scores = dimension_scores(metrics, zoo_metrics, self.theta)
         u = utility(metrics, zoo_metrics, self.theta)
 
@@ -122,45 +151,36 @@ class EvaluationOperator:
         result.update({f"e_{k}": v for k, v in scores.items()})
         result.update(
             U=float(u),
-            feasible=bool(is_feasible),
-            failed_gates=failed_gates,
             theta_hash=self.theta.hash,
             zoo_hash=zoo_hash,
             zoo_size=len(zoo_signals),
+            n_factors=len(aligned_cands),
             eval_window=f"{eval_window[0]}..{eval_window[1]}",
         )
 
         # The primary whole-system signal: if this line is absent from a run's
         # logs, the new engine is not being called at all.
         logger.info(
-            "E_theta eval: factor=%s theta=%s zoo=%s U=%.4f feasible=%s",
-            candidate_expr[:40], self.theta.hash, zoo_hash, float(u), is_feasible,
+            "E_theta eval: %d factor(s) theta=%s zoo=%s U=%.4f net_ir=%.4f net_arr=%.2f%%",
+            len(aligned_cands), self.theta.hash, zoo_hash, float(u),
+            metrics.get("net_ir", float("nan")), 100 * metrics.get("net_arr", float("nan")),
         )
         return result
 
     # ------------------------------------------------------------------
-    def _strategy(
+    def _strategy_batch(
         self,
-        candidate: pd.DataFrame,
-        candidate_expr: str,
+        aligned_cands: dict[str, pd.DataFrame],
         aligned_zoo: dict[str, pd.DataFrame],
         panel: PanelBundle,
         eval_window: tuple[str, str],
     ) -> dict:
-        """Combiner refit → g → Eq. 7 → Eq. 8 → book metrics, plus Δ vs baseline.
-
-        The absolute figures describe the book *containing* f. What actually
-        determines whether f is worth having is its **marginal contribution**:
-        the same book built from ``zoo`` alone, subtracted off. Measured on the
-        pilot's factors, stand-alone RankIC and marginal contribution came apart
-        badly -- all 18 failed the RankIC gate, yet collectively they were worth
-        +7pp of annual return over the base-features-only null model.
-        """
-        prediction = combiner_mod.fit_predict(
-            aligned_zoo, candidate, panel, self.theta, candidate_expr=candidate_expr
-        )
+        """One combiner refit on ``zoo ∪ candidates`` → one priced book."""
+        combined = {**aligned_zoo, **aligned_cands}
+        prediction = combiner_mod.fit_predict(combined, None, panel, self.theta)
         metrics = self._book(prediction, panel, eval_window)
 
+        # Marginal contribution of the whole batch over the repository alone.
         baseline = self._baseline(aligned_zoo, panel, eval_window)
         for key in ("net_ir", "net_arr"):
             base_v, full_v = baseline.get(key), metrics.get(key)
@@ -171,8 +191,9 @@ class EvaluationOperator:
                 and base_v == base_v and full_v == full_v
                 else np.nan
             )
-        return metrics
+        return {"metrics": metrics, "prediction": prediction}
 
+    # ------------------------------------------------------------------
     def _baseline(
         self,
         aligned_zoo: dict[str, pd.DataFrame],

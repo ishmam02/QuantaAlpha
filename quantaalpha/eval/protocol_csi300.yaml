@@ -19,19 +19,17 @@ market: csi300
 benchmark: SH000300 # conf_combined_factors.yaml:14, backtest.yaml:127
 periods_per_year: 252
 
-splits: # frozen; the engine never reads a window a caller hands it
-  train: ["2016-01-01", "2019-12-31"] # conf_combined_factors.yaml:107
-  valid: ["2020-01-01", "2020-12-31"] # :108
-  inloop_test: ["2021-01-01", "2021-12-31"] # :109  — NEVER widen
-  final_test: ["2022-01-01", "2025-12-26"] # backtest.yaml:85
-  # OOS proxy spanning BOTH held-out pre-test years. `valid` alone is 2020 --
-  # a single, highly atypical year (COVID crash then a ~27% CSI 300 rally), so
-  # admission verdicts were hostage to one regime. 2020+2021 doubles the
-  # evaluation sample and spans a rally and a drawdown. Still strictly before
-  # final_test, so Property 3 holds: the test window is untouched during search.
-  oos_proxy: ["2020-01-01", "2021-12-31"]
+splits:
+  # ALIGNED WITH configs/backtest.yaml:82-85 -- the backtest v2 run is the
+  # primary point of comparison between arms, so E_Theta's combiner must train
+  # on the same data its model does. Previously these mirrored the in-loop qlib
+  # template (2016-2019 / 2020 / 2021), which meant Arm B was fitted on a
+  # different window than the backtest that judges both arms.
+  train: ["2016-01-01", "2020-12-31"]
+  valid: ["2021-01-01", "2021-12-31"]
+  final_test: ["2022-01-01", "2025-12-26"]
   search_is: train # IS during search
-  search_oos: oos_proxy # final_test is reached only via the explicit report mode
+  search_oos: valid # 2021; final_test is reached only via the explicit report mode
 
 execution: # Eq. 4-5
   delta: 1
@@ -40,7 +38,14 @@ execution: # Eq. 4-5
 
 combiner: # procedure A — Eq. 2; FROZEN, seed included
   model: lightgbm
-  seed: 42
+  # Single seed, kept as a list so an ensemble can be enabled without a code
+  # change. A 5-seed ensemble at num_leaves 31 was tried and REVERTED: a 2x2
+  # over {1,5} seeds x {210,31} leaves gave effects that flipped sign depending
+  # on the other variable (ensembling 0.75x at 210 leaves but 1.36x at 31), i.e.
+  # the differences sat inside measurement error at n=5 perturbations per cell.
+  # It cost ~3x wall-clock for no demonstrable benefit, so the baseline's own
+  # single-seed procedure stands.
+  seeds: [42]
   params:
     loss: mse
     learning_rate: 0.05 # ← unified in Task 1
@@ -87,29 +92,26 @@ costs: # Eq. 7
   adv_scale: 1000.0 # Qlib cn_data `$amount` → CNY: true_CNY = $amount*1000/$factor
 
 
-gates: # F_Θ — Eq. 9; absolute floors, train+valid only
-  # PRIMARY gate: marginal contribution to the book's net IR, i.e.
-  # net_ir(zoo + {f}) - net_ir(zoo). 0.0 means "must not make the book worse".
-  #
-  # This replaces stand-alone RankIC as the admissibility criterion. Measured
-  # evidence: the pilot's 18 factors ALL failed the RankIC gates, yet an ablation
-  # showed they were collectively worth +7.05pp of annual return (-5.86% ->
-  # +1.18%) over the base-features-only null model. RankIC averages over the
-  # whole cross-section while the top-k book bets on its extreme tail, so the
-  # two measure different things.
-  gamma_delta: 0.0
-  # Stand-alone IC gates: DISABLED (null). Measured on the pilot's 18 factors,
-  # rank_ic is anti-correlated with marginal contribution -- the best contributor
-  # (+0.1893 net IR) had rank_ic +0.0004, several strong contributors had
-  # NEGATIVE rank_ic, and the best-IC factor (+0.0237) was the worst contributor
-  # (-0.0833). Keeping even a low floor rejected all nine factors that improved
-  # the book, taking admission from 9/18 to 0/18. Set a float to re-enable.
+gates: # F_Theta -- DISABLED
+  # Hard admissibility gates are removed. Two measured reasons:
+  #  1. Stand-alone IC was anti-correlated with marginal contribution (the best
+  #     contributor had rank_ic +0.0004; the best-IC factor was the worst).
+  #  2. The replacement, delta_net_ir >= 0, was not reproducible: 3 of 4 sampled
+  #     factors flipped their verdict across combiner seeds, because subtracting
+  #     two independently-noisy books compounds variance rather than cancelling
+  #     it (level sd 0.026-0.060 -> delta sd 0.038-0.071).
+  # A gate that returns a different answer for the same factor on the same data
+  # is sampling a decision, not computing one. Both arms now accumulate every
+  # mined factor, exactly as the published baseline does, and the objective U
+  # differentiates them by SCORE rather than by admission.
+  # Set any threshold to a float to re-enable that gate.
+  gamma_delta: null
   gamma_ic: null
   gamma_ir: null
-  tau_max: 0.30
-  rho_bar: 0.70
-  gamma_cx: 250 # matches FACTOR_CoSTEER_SYMBOL_LENGTH_THRESHOLD in .env
-  turnover_basis: book # book | solo — book is structurally capped at n_drop/topk
+  tau_max: null
+  rho_bar: null
+  gamma_cx: null
+  turnover_basis: book
 
 decay: # §3.4 item 7
   K: 4

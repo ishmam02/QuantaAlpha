@@ -53,10 +53,11 @@ class Splits:
 
     train: DateRange
     valid: DateRange
-    inloop_test: DateRange
     final_test: DateRange
-    # Optional wider OOS proxy (e.g. valid + inloop_test) so admission is not
-    # judged on a single year's regime. Must end before final_test.
+    # Optional extra windows (e.g. an in-loop test split). Unused by default:
+    # splits now mirror configs/backtest.yaml so E_Theta trains on the same data
+    # as the backtest that compares the arms.
+    inloop_test: DateRange | None = None
     oos_proxy: DateRange | None = None
     search_is: str = "train"
     search_oos: str = "valid"
@@ -96,7 +97,9 @@ class Combiner:
     """Procedure ``A`` (Eq. 2) — an element of Θ, seed included."""
 
     model: str = "lightgbm"
-    seed: int = 42
+    # Ensemble of seeds, averaged. A single seed left delta_net_ir with sd
+    # comparable to its own magnitude; averaging N cuts that by ~1/sqrt(N).
+    seeds: tuple[int, ...] = (42,)
     params: dict[str, Any] = field(default_factory=dict)
     base_features: tuple[str, ...] = ()
     fit_split: str = "train"
@@ -139,17 +142,16 @@ class Gates:
     *scoring* in ``scoring.py`` is repository-relative.
     """
 
-    # Primary admissibility: minimum marginal contribution to the book's net IR.
-    # 0.0 = "must not make the book worse", which needs no tuning and stays
-    # robust as |zoo| grows and the per-factor delta shrinks.
-    gamma_delta: float = 0.0
-    # None disables the gate. Stand-alone IC proved anti-correlated with
-    # marginal contribution, so it is off by default; set a float to re-enable.
+    # Every gate is nullable and every one is null by default: hard
+    # admissibility was removed after measurement showed the criteria were
+    # either anti-correlated with contribution (IC) or not reproducible across
+    # combiner seeds (delta_net_ir). Set a float to re-enable an individual gate.
+    gamma_delta: float | None = None
     gamma_ic: float | None = None
     gamma_ir: float | None = None
-    tau_max: float = 0.30
-    rho_bar: float = 0.70
-    gamma_cx: float = 250
+    tau_max: float | None = None
+    rho_bar: float | None = None
+    gamma_cx: float | None = None
     turnover_basis: str = "book"
 
 
@@ -273,6 +275,11 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
     combiner_raw = dict(raw["combiner"])
     combiner_raw["base_features"] = tuple(combiner_raw.get("base_features", ()))
     combiner_raw["params"] = dict(combiner_raw.get("params", {}))
+    if "seed" in combiner_raw:      # accept the old scalar form
+        combiner_raw.setdefault("seeds", [combiner_raw.pop("seed")])
+    combiner_raw["seeds"] = tuple(int(s) for s in combiner_raw.get("seeds", (42,)))
+    if not combiner_raw["seeds"]:
+        raise ValueError("combiner.seeds must contain at least one seed")
     combiner = _build(Combiner, combiner_raw)
     if combiner.fit_split not in ("train",):
         # Fitting anywhere but train would leak the evaluation window into the

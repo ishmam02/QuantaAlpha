@@ -129,19 +129,28 @@ class NetCostFactorFeedback(AlphaAgentQlibFactorHypothesisExperiment2Feedback):
         lines: list[str] = []
 
         u = self._fmt(m.get("U"), "{:.4f}")
-        feasible = bool(m.get("feasible", False))
         lines.append("=== NET-OF-COST EVALUATION (E_theta) ===")
-        lines.append(f"Utility U = {u}   (0 = worst in repository, 1 = best)")
-        lines.append(f"Admissible: {'YES' if feasible else 'NO'}")
+        lines.append(
+            f"Utility U = {u}   (0 = worst in the repository so far, 1 = best)"
+        )
+        n = m.get("n_factors")
+        if n:
+            lines.append(f"Factors evaluated together this round: {n}")
+        lines.append(
+            "There are no pass/fail thresholds. Every factor is kept; what varies "
+            "is how this round SCORES against the factors already in the "
+            "repository, and that bar rises as the repository improves."
+        )
 
-        if not feasible:
-            failed = m.get("failed_gates") or ""
-            names = [f.strip() for f in (failed.split(",") if isinstance(failed, str) else failed) if f and str(f).strip()]
-            if names:
-                lines.append("")
-                lines.append("REJECTED by hard feasibility gates -- fix these first:")
-                for line in self._gate_lines(m, names):
-                    lines.append(f"  - {line}")
+        d_ir, d_arr = m.get("delta_net_ir"), m.get("delta_net_arr")
+        if d_ir is not None and d_ir == d_ir:
+            verdict = "IMPROVED" if d_ir > 0 else "WEAKENED"
+            lines.append("")
+            lines.append(
+                f"This round {verdict} the book: net IR {self._fmt(d_ir, '{:+.4f}')} "
+                f"({self._fmt(d_arr, '{:+.2%}')} annualised) versus the same book "
+                f"without these factors."
+            )
 
         dims = sorted(
             ((k[2:], v) for k, v in m.items() if k.startswith("e_") and v is not None and v == v),
@@ -169,13 +178,14 @@ class NetCostFactorFeedback(AlphaAgentQlibFactorHypothesisExperiment2Feedback):
 
         lines.append("")
         lines.append(
-            "NOTE: performance above is NET of transaction cost (commission, "
-            "volatility-scaled slippage, and super-linear market impact) and is "
-            "measured on the book built from the combined model prediction, not "
-            "on this factor in isolation. A factor with a strong raw correlation "
-            "but heavy turnover or high correlation to existing factors will "
-            "score poorly here. Prefer signals that are cheap to trade and "
-            "orthogonal to the repository."
+            "NOTE: these figures are NET of transaction cost (commission, "
+            "volatility-scaled slippage, and super-linear market impact) and are "
+            "measured on the book built from the COMBINED model prediction over "
+            "all factors together -- not on any factor in isolation. A factor "
+            "with a strong raw correlation but heavy turnover, or one highly "
+            "correlated with what the repository already holds, adds little "
+            "here. Prefer signals that are cheap to trade and orthogonal to "
+            "existing factors."
         )
         return "\n".join(lines)
 

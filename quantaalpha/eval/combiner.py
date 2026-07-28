@@ -190,19 +190,31 @@ def fit_predict(
     params.pop("early_stopping_round", None)
     params.update(
         objective=params.pop("loss", "mse"),
-        seed=int(theta.combiner.seed),
-        bagging_seed=int(theta.combiner.seed),
-        feature_fraction_seed=int(theta.combiner.seed),
-        data_random_seed=int(theta.combiner.seed),
         deterministic=True,
         force_row_wise=True,
         verbosity=-1,
     )
 
-    model = lgb.train(params, lgb.Dataset(x_train, label=y_train), num_boost_round=num_boost_round)
+    # ---- fit one model per seed and AVERAGE the predictions ----
+    # LightGBM's row (`subsample`) and feature (`colsample_bytree`) sampling are
+    # both seeded, so a single seed carries real variance. Measured on this data:
+    # delta_net_ir had sd 0.016-0.071 against signal of 0.02-0.04, flipping the
+    # verdict for 3 of 4 sampled factors. Averaging N cuts that by ~1/sqrt(N),
+    # and the fixed seed list keeps the result exactly reproducible.
+    preds = []
+    for seed in theta.combiner.seeds:
+        p_seed = dict(params, seed=int(seed), bagging_seed=int(seed),
+                      feature_fraction_seed=int(seed), data_random_seed=int(seed))
+        # A fresh Dataset per seed: `data_random_seed` is a *Dataset* parameter
+        # baked in at construction, so reusing one handle across seeds raises
+        # "Cannot change data_random_seed after constructed Dataset handle".
+        # Re-binning costs far less than the 500 boosting rounds that follow.
+        model = lgb.train(p_seed, lgb.Dataset(x_train, label=y_train),
+                          num_boost_round=num_boost_round)
+        preds.append(model.predict(features))
 
     # ---- predict across the whole window ----
-    raw_pred = pd.Series(model.predict(features), index=features.index, name="score")
+    raw_pred = pd.Series(np.mean(preds, axis=0), index=features.index, name="score")
     wide = raw_pred.unstack(level="instrument")
     wide.index = pd.to_datetime(wide.index)
     prediction = wide.sort_index().reindex(index=panel.dates, columns=panel.instruments)
@@ -210,8 +222,8 @@ def fit_predict(
 
     _PREDICTION_CACHE[key] = prediction
     logger.debug(
-        "combiner refit: zoo=%s cand=%s theta=%s rows=%d feats=%d",
-        key[0], key[1][:8], key[2], len(x_train), features.shape[1],
+        "combiner refit: zoo=%s cand=%s theta=%s rows=%d feats=%d seeds=%d",
+        key[0], key[1][:8], key[2], len(x_train), features.shape[1], len(theta.combiner.seeds),
     )
     return prediction
 

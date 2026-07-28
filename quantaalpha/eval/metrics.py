@@ -216,6 +216,39 @@ def per_factor_metrics(
     return metrics
 
 
+def prediction_metrics(
+    prediction: pd.DataFrame,
+    panel: PanelBundle,
+    theta: Protocol,
+    eval_window: tuple[str, str],
+) -> dict:
+    """IC statistics of the COMBINED model prediction on the evaluation window.
+
+    This is the quantity Arm A reports: Qlib's ``SigAnaRecord`` computes IC and
+    Rank IC of the combined model's output, never of an individual factor. So
+    measuring the same thing here is what makes the two arms comparable.
+
+    Also reports the IS→OOS gap, using the training window as IS.
+    """
+    label = label_frame(panel, theta)
+    wide = _to_wide(prediction).reindex(index=panel.dates, columns=panel.instruments)
+    wide = wide.where(panel.universe)
+
+    out = {k: v for k, v in _ic_block(wide, label, eval_window).items()
+           if not k.startswith("_")}
+    ic_series = _ic_block(wide, label, eval_window)["_ic_series"]
+    out.update(_decay_block(ic_series, theta))
+
+    is_block = _ic_block(wide, label, theta.splits.is_window)
+    out["rank_ic_is"] = is_block["rank_ic"]
+    out["is_oos_gap"] = (
+        is_block["rank_ic"] - out["rank_ic"]
+        if not (np.isnan(is_block["rank_ic"]) or np.isnan(out["rank_ic"]))
+        else np.nan
+    )
+    return out
+
+
 def solo_turnover(signal, panel: PanelBundle, theta: Protocol) -> float:
     """Turnover of a book built from the candidate's own signal.
 

@@ -19,4 +19,3 @@ output_format: |-
   {"directions": ["direction 1", "direction 2", "..."]}
   ```
   The array must contain exactly {n} strings. No extra text.
-
