@@ -80,12 +80,26 @@ LIB_B="data/factorlib/all_factors_library_treatment_${STAMP}.json"
 
 echo ""
 echo "========================================================================"
-echo "  BOTH ARMS COMPLETE -- comparing"
+echo "  BOTH ARMS COMPLETE -- comparing under E_Theta (full cost model)"
 echo "========================================================================"
 PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_compare_arms.py \
     --arm-a "${LIB_A}" \
     --arm-b "${LIB_B}" \
     --out "data/results/arm_comparison_${STAMP}.md"
+
+# The second table. E_Theta charges slippage and impact; the published numbers
+# do not, so an arm can only be set against the paper through the flat-fee path.
+# Both references (alpha158_20, base features) are scored here too -- an arm that
+# does not clear four hand-written expressions has not earned its LLM spend.
+echo ""
+echo "========================================================================"
+echo "  BACKTEST V2 -- flat-fee cost model (paper-comparable)"
+echo "========================================================================"
+PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_backtest_all.py \
+    --arm-a "${LIB_A}" \
+    --arm-b "${LIB_B}" \
+    --seeds "${BT_SEEDS:-42,1,7}" \
+    --out "data/results/backtest_v2_comparison_${STAMP}.md"
 
 echo ""
 echo "Artefacts:"
@@ -93,4 +107,5 @@ echo "  logs      : /tmp/qa_control_${STAMP}.log , /tmp/qa_treatment_${STAMP}.lo
 echo "  libraries : ${LIB_A}"
 echo "              ${LIB_B}"
 echo "  ledger    : data/results/ledger_treatment_${STAMP}.jsonl  (Arm B only)"
-echo "  comparison: data/results/arm_comparison_${STAMP}.md"
+echo "  E_Theta   : data/results/arm_comparison_${STAMP}.md"
+echo "  flat-fee  : data/results/backtest_v2_comparison_${STAMP}.md"

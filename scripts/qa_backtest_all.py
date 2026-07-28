@@ -120,6 +120,27 @@ def seeded_config(config: str, seed: int, tmpdir: Path) -> str:
     return str(out)
 
 
+def fingerprint(factor_json: Path | None, config: str) -> str:
+    """Identify a (feature set, protocol) pair so cached results can't be stale.
+
+    Keyed on the factor library's *contents* rather than its path, because the
+    arm libraries are rewritten in place between runs under the same filename.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update((ROOT / config).read_bytes())
+    h.update(factor_json.read_bytes() if factor_json else b"alpha158_20")
+    return h.hexdigest()[:16]
+
+
+def load_cache(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def read_metrics(out_dir: Path, factor_json: Path | None, started: float) -> dict | None:
     """Locate the metrics file this run just wrote.
 
@@ -198,6 +219,8 @@ def main() -> int:
     ap.add_argument("--seeds", default="42",
                     help="comma-separated model seeds; >1 gives a noise band")
     ap.add_argument("--skip", nargs="*", default=[], help="labels to skip")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="recompute every (configuration, seed) even if cached")
     args = ap.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -210,6 +233,9 @@ def main() -> int:
     if args.arm_b:
         plan.append(("Arm B (mined)", "custom", Path(args.arm_b)))
 
+    cache_path = ROOT / "data/results/backtest_v2_raw.json"
+    cache = {} if args.no_cache else load_cache(cache_path)
+
     results: dict[str, list[dict]] = {}
     with tempfile.TemporaryDirectory(prefix="qa_bt_") as td:
         tmpdir = Path(td)
@@ -220,11 +246,20 @@ def main() -> int:
             if fj and not Path(fj).exists():
                 logger.warning("%s: %s not found, skipping", label, fj)
                 continue
+            fp = fingerprint(fj, args.config)
             rows = []
             for seed in seeds:
+                key = f"{fp}:{seed}"
+                if key in cache:
+                    logger.info("[%-14s seed=%-3s] cached", label, seed)
+                    rows.append(cache[key])
+                    continue
                 m = run_backtest(label, source, fj, args.config, seed, tmpdir)
                 if m:
+                    cache[key] = m
                     rows.append(m)
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_text(json.dumps(cache, indent=2))
             results[label] = rows
 
     n_ok = sum(1 for r in results.values() if r)
@@ -261,33 +296,53 @@ def main() -> int:
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
     lines.append("| " + " | ".join(PAPER_ROW) + " |")
 
-    # --- resolvability -------------------------------------------------
-    lines += ["", "## Is anything here resolvable?", ""]
-    arr = {k: agg(v, "annualized_return") for k, v in results.items() if v}
-    if len(arr) < 2:
-        lines.append("- Not enough configurations completed to compare.")
+    # --- resolvability, per metric --------------------------------------
+    # Not every metric is equally noisy, and the difference is the single most
+    # useful thing a seed sweep tells you. Measured here: the base features
+    # return IC = +0.0389 on all three seeds while their annualised return
+    # ranges 3.68%-4.95%. Identical signal, 1.27pp of return spread -- that
+    # spread is the top-k dropout construction's path dependence through a
+    # 50-name book, not model quality. So a metric-by-metric verdict decides
+    # which column an arm comparison is allowed to be settled on.
+    lines += ["", "## Which metrics can actually separate these?", "",
+              "Span = best minus worst across configurations. Noise = the largest "
+              "seed sd within any one configuration. A span under 2x the noise "
+              "cannot support a ranking.", "",
+              "| Metric | Span | Seed noise | Verdict |", "| :--- | ---: | ---: | :--- |"]
+    if len(results) < 2 or not any(results.values()):
+        lines.append("| — | — | — | not enough configurations completed |")
+    elif len(seeds) < 2:
+        lines.append("| — | — | — | single seed; noise not measured |")
+        lines += ["", "Re-run with `--seeds 42,1,7`. For reference the combiner seed sd "
+                  "measured under `E_Θ` is ~1.2pp on annualised return, larger than the "
+                  "whole span of this table."]
     else:
-        spread = max(m for m, _ in arr.values()) - min(m for m, _ in arr.values())
-        noise = max((s or 0.0) for _, s in arr.values())
-        lines.append(f"- Span across configurations (annualised return): **{spread:.2%}**")
-        if len(seeds) > 1:
-            lines.append(f"- Largest seed sd within a configuration: **{noise:.2%}**")
-            if noise and spread < 2 * noise:
-                lines.append(
-                    f"- **{spread / noise:.1f}× the noise — NOT resolvable.** Every "
-                    "configuration in this table, including the published number, sits "
-                    "inside the band a different random seed would move it by. No "
-                    "ordering here should be reported as one approach beating another."
-                )
-            elif noise:
-                lines.append(f"- **{spread / noise:.1f}× the noise** — the ordering "
-                             "survives seed variance at this sample size.")
-        else:
-            lines.append(
-                "- Seed sd not measured (single seed). For reference, the combiner "
-                "seed sd measured under `E_Θ` is ~1.2pp on annualised return — larger "
-                "than the span above, which is why the sweep matters."
-            )
+        for label, key, spec in (("IC", "IC", "{:.4f}"),
+                                 ("Rank IC", "Rank IC", "{:.4f}"),
+                                 ("ICIR", "ICIR", "{:.4f}"),
+                                 ("Ann. return", "annualized_return", "{:.2%}"),
+                                 ("Info ratio", "information_ratio", "{:.4f}")):
+            stats = [agg(v, key) for v in results.values() if v]
+            stats = [(m, s) for m, s in stats if m is not None]
+            if len(stats) < 2:
+                continue
+            span = max(m for m, _ in stats) - min(m for m, _ in stats)
+            noise = max((s or 0.0) for _, s in stats)
+            if not noise:
+                verdict = "seed-invariant — any gap is real"
+            elif span < 2 * noise:
+                verdict = f"**{span / noise:.1f}× noise — NOT resolvable**"
+            else:
+                verdict = f"{span / noise:.1f}× noise — resolvable"
+            lines.append(f"| {label} | {spec.format(span)} | {spec.format(noise)} | {verdict} |")
+        lines += [
+            "",
+            "Where annualised return is not resolvable but IC is, the two are "
+            "measuring different things: IC is an average over thousands of daily "
+            "cross-sections, while annualised return is one equity curve whose path "
+            "depends on which names the top-k dropout rule happens to hold. Report "
+            "the resolvable column.",
+        ]
 
     lines += [
         "",
