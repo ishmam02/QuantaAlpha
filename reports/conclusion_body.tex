@@ -1,0 +1,79 @@
+Four findings, in descending order of how well they are supported.
+
+\paragraph{1. Under the published cost model, both arms substantially exceed the
+published result.} Arm B reaches an annualised excess return of $+12.75\%$ with
+an information ratio of $1.71$ and a maximum drawdown of $-9.01\%$, against the
+published $+4.68\%$, $0.65$ and $-11.80\%$; Arm A reaches $+7.91\%$ and $1.15$.
+Both clear the four hand-written base features and Qlib's own factor subset on
+every axis. Arm B beats Arm A in all four calendar years, and turns 2025 --- the
+year in which the base features lose $12.38\%$ --- into a flat $-0.21\%$. These
+differences are far outside combiner-seed noise, resolvable at 17--20$\times$
+on return and over 100$\times$ on IC.
+
+\paragraph{2. The advantage of the net-of-cost objective is consistent, and its
+size is roughly five points of annualised return.} The paired difference
+reproduced across two independent runs at $+5.23$pp and $+4.84$pp on return, and
+$+0.0120$ and $+0.0123$ on IC. That consistency is more informative than either
+run alone, because the individual arms moved by four points and $0.013$
+respectively between the same two runs. The pairing removes a common-mode
+run-to-run shift that is an order of magnitude larger than anything the seed
+error bars capture (\S\ref{sec:pairing}).
+
+\paragraph{3. The utility's selection mechanism contributed nothing detectable.}
+This is the sharpest negative result here, and it was only measurable because the
+first run's utility was inert. Repairing it changed the mechanism unambiguously
+--- the repository now accumulates across process boundaries and $\util$ takes
+distinct values per batch instead of a constant $0.9500$ --- yet the paired
+effect was essentially unchanged: $+5.23$pp before the fix, $+4.84$pp after.
+Whatever advantage the treatment has, it was already fully present when the
+objective was ranking nothing at all.
+
+The mechanism that remains is the feedback channel. Net-of-cost metrics reach the
+generator as text regardless of whether $\util$ ranks anything, and the arms
+diverge in exactly the way that channel would predict: Arm A mines one- to
+five-day microstructure, Arm B mines three- to twelve-month horizons with
+explicit liquidity and crowding terms. On the evidence here, telling the model
+about costs is doing the work; ranking candidates by a cost-aware utility is not
+adding to it.
+
+\paragraph{4. Under a realistic cost model, none of this is tradeable.} Every
+configuration loses money: $-6.51\%$ (Arm A), $-7.12\%$ (Arm B) and $-6.92\%$
+(no mining at all), at roughly $4.2$ basis points per day, or about $10\%$
+annually. The arms are indistinguishable from each other and from the baseline
+--- the Arm B minus Arm A difference is $1.0\times$ the seed noise --- and both
+mined libraries score \emph{below} the no-mining baseline on Rank IC. The
+$+12.75\%$ headline and the $-7.12\%$ net figure are the same factors under two
+different assumptions about friction, and the distance between them is the whole
+of the slippage and impact the published methodology does not charge.
+
+Two structural reasons explain why the capacity-aware objective cannot rescue
+this. Book turnover is pinned near $\NDrop/\TopK$ by the portfolio construction,
+so both arms trade the same amount and the objective has almost no room to
+express itself by trading less; measured cost differs between them by $0.04$
+basis points per day. And the mined libraries carry an in-sample to
+out-of-sample gap around $0.15$, against $0.03$ for the hand-written baseline ---
+roughly five times the overfitting, which is what searching a large expression
+space against a fixed evaluation buys.
+
+\subsection*{What would settle the open questions}
+
+The effect estimate is well behaved but rests on two pairs. Replicating across
+generation seeds --- \texttt{QA\_SEED} varies the trajectory, and the driver
+already runs both arms from one invocation --- would convert a consistent point
+estimate into a tested one. Three to five paired invocations would give a
+standard deviation on the paired difference; the measurements here suggest that
+difference is stable enough for a small number of replicates to be informative.
+
+Separating the feedback channel from the selection channel deserves a direct
+test rather than an accident. An arm that receives net-of-cost feedback but
+selects by RankIC would isolate the contribution that finding~3 attributes to
+feedback, and it costs one additional arm rather than a redesign.
+
+Finally, the tradeability result is a statement about this portfolio
+construction as much as about these factors. Turnover is structurally capped, so
+a construction with a genuine turnover budget --- the mean--variance member of
+the admissible family, with an explicit cap --- is the only way to discover
+whether a capacity-aware objective can produce a book that survives its own
+trading costs. Until then, the honest summary is that the net-of-cost objective
+produces measurably better signal under the published accounting, and that no
+configuration tested here is tradeable under a realistic one.

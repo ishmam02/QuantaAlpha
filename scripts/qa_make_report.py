@@ -243,6 +243,55 @@ def tbl_runcompare(flat: dict, etheta: dict, run1: dict) -> str:
     return "\n".join(L)
 
 
+def tbl_pairing(flat: dict, run1: dict) -> str:
+    """Generation noise, measured from the Arm A replicate, against the effect.
+
+    Arm A's code path was untouched by the repository fix, so running it twice
+    under identical configuration and seed yields an accidental replicate --- the
+    only direct measurement of run-to-run generation variance available here.
+    That variance turns out to be large, and largely COMMON to both arms, so it
+    cancels in the paired difference. Reporting the effect against unpaired noise
+    would understate the design; reporting it against the paired spread is what
+    the back-to-back construction was for.
+    """
+    rows = [("Ann.\\ return", "annualized_return", "arr", True),
+            ("Test-split IC", "ic_oos", "ic_oos", False)]
+    L = [r"\begin{tabular}{lrrr}", r"\toprule",
+         r"& Ann.\ return & Test-split IC \\", r"\midrule"]
+
+    def num(v, pct):
+        return f"${100*v:+.2f}\\%$" if pct else f"${v:+.4f}$"
+
+    vals = {}
+    for label, k2, k1, pct in rows:
+        vals[label] = {
+            "a1": run1["flat_fee"]["Arm A (mined)"][k1],
+            "a2": agg(flat["Arm A (mined)"], k2)[0],
+            "b1": run1["flat_fee"]["Arm B (mined)"][k1],
+            "b2": agg(flat["Arm B (mined)"], k2)[0],
+            "sd": agg(flat["Arm A (mined)"], k2)[1], "pct": pct}
+
+    def row(name, fn):
+        cells = []
+        for label in vals:
+            v = vals[label]
+            cells.append(num(fn(v), v["pct"]))
+        L.append(name + " & " + " & ".join(cells) + r" \\")
+
+    row(r"Arm A, run 1", lambda v: v["a1"])
+    row(r"Arm A, run 2 \emph{(code unchanged)}", lambda v: v["a2"])
+    row(r"\quad $\Rightarrow$ generation noise", lambda v: abs(v["a2"] - v["a1"]))
+    L.append(r"\midrule")
+    row(r"Combiner-seed noise (sd)", lambda v: v["sd"])
+    L.append(r"\midrule")
+    row(r"Arm B $-$ Arm A, run 1", lambda v: v["b1"] - v["a1"])
+    row(r"Arm B $-$ Arm A, run 2", lambda v: v["b2"] - v["a2"])
+    row(r"\quad $\Rightarrow$ spread of the paired effect",
+        lambda v: abs((v["b2"] - v["a2"]) - (v["b1"] - v["a1"])))
+    L += [r"\bottomrule", r"\end{tabular}"]
+    return "\n".join(L)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -288,7 +337,8 @@ def main() -> int:
                        ("TblYearlyARR", tbl_yearly(flat, "xarr", True)),
                        ("TblEtheta", tbl_etheta(etheta)),
                        ("TblResolvability", tbl_resolvability(flat, etheta)),
-                       ("TblRunCompare", tbl_runcompare(flat, etheta, run1))):
+                       ("TblRunCompare", tbl_runcompare(flat, etheta, run1)),
+                       ("TblPairing", tbl_pairing(flat, run1))):
         out += [f"\\newcommand{{\\{name}}}{{%", body, "}", ""]
 
     path = ROOT / args.out

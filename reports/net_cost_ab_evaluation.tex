@@ -12,8 +12,10 @@
 \usepackage{graphicx}
 \usepackage{xcolor}
 \usepackage[colorlinks=true,linkcolor=black,urlcolor=blue,citecolor=black]{hyperref}
+\usepackage{adjustbox}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
+\setlength{\tabcolsep}{5pt}
 
 \newcommand{\Etheta}{E_{\Theta}}
 \newcommand{\zoo}{\mathcal{Z}}
@@ -109,7 +111,7 @@ test split alone.
 \caption{The reported IC against the test-split IC. Rows scored over the full
 span were blended with training data.}
 \label{tab:contamination}
-\small\TblContamination
+\small\begin{adjustbox}{max width=\textwidth}\TblContamination\end{adjustbox}
 \end{table}
 
 \subsection{The utility was inert: the repository never accumulated}
@@ -185,7 +187,7 @@ and does not add the base features, so all four configurations are
 \caption{Out-of-sample performance under the flat-fee cost model, CSI~300,
 \EvalWindow. Mean $\pm$ sd over seeds \Seeds.}
 \label{tab:headline}
-\small\TblHeadline
+\small\begin{adjustbox}{max width=\textwidth}\TblHeadline\end{adjustbox}
 \end{table}
 
 \subsection{Year by year}
@@ -199,20 +201,20 @@ consistently with the full-period column.
 \begin{table}[htbp]\centering
 \caption{Annual IC (mean daily cross-sectional correlation within each year).}
 \label{tab:yic}
-\small\TblYearlyIC
+\small\begin{adjustbox}{max width=\textwidth}\TblYearlyIC\end{adjustbox}
 \end{table}
 
 \begin{table}[htbp]\centering
 \caption{Annual Rank IC.}
 \label{tab:yric}
-\small\TblYearlyRankIC
+\small\begin{adjustbox}{max width=\textwidth}\TblYearlyRankIC\end{adjustbox}
 \end{table}
 
 \begin{table}[htbp]\centering
 \caption{Annual excess return over the CSI~300 benchmark, net of the flat
 commission.}
 \label{tab:yarr}
-\small\TblYearlyARR
+\small\begin{adjustbox}{max width=\textwidth}\TblYearlyARR\end{adjustbox}
 \end{table}
 
 \subsection{Full cost model ($\Etheta$)}
@@ -228,7 +230,7 @@ combiner on the base features with no mining at all.
 \caption{Performance under the full cost model. Mined factors only; base
 features excluded from both arms.}
 \label{tab:etheta}
-\small\TblEtheta
+\small\begin{adjustbox}{max width=\textwidth}\TblEtheta\end{adjustbox}
 \end{table}
 
 \subsection{What can actually be resolved}
@@ -248,7 +250,7 @@ resolvable and IC is, the resolvable column is the one to report.
 \begin{table}[htbp]\centering
 \caption{Resolvability by metric and cost model.}
 \label{tab:resolve}
-\small\TblResolvability
+\small\begin{adjustbox}{max width=\textwidth}\TblResolvability\end{adjustbox}
 \end{table}
 
 \section{What the two runs isolate}
@@ -282,15 +284,55 @@ was already cost-aware.
 \caption{Run 1 (utility inert) against run 2 (utility active). Run 1 figures are
 transcribed from its committed artifacts and verified verbatim against them.}
 \label{tab:runcompare}
-\small\TblRunCompare
+\small\begin{adjustbox}{max width=\textwidth}\TblRunCompare\end{adjustbox}
 \end{table}
 
-\paragraph{A caution on reading the change column.} Two runs is not a sample. The
-repository fix is not the only thing that differs between them in practice ---
-the generator is not bit-reproducible across runs even at temperature zero, and
-parallel merge order varies --- so part of any change is ordinary
-run-to-run variation whose magnitude is unmeasured. The column is informative
-about direction and rough scale, not a treatment effect estimate.
+\subsection{Generation noise is large, and the pairing removes it}
+\label{sec:pairing}
+
+The repository fix touches only Arm B. Arm A's code path is identical between the
+two runs, and it was run again under the same configuration, the same generation
+seed and the same protocol. It therefore constitutes an \emph{accidental
+replicate} --- the only direct measurement of run-to-run generation variance
+available in this study, and one that no single run could have produced.
+
+That variance is large. Arm A's annualised return moved by \textbf{4.05
+percentage points} between runs with nothing changed, roughly nine times the
+combiner-seed standard deviation of $0.47$pp that the seed sweep reports. Its
+test-split IC moved by $0.0128$, against a combiner-seed sd of $0.0001$. Any
+single-arm figure in this report should be read with that instability in mind:
+the seed error bars quantify only the combiner, and they are two orders of
+magnitude too small to represent the uncertainty in \emph{which factors got
+mined}.
+
+The decisive observation is that this variance is largely \emph{common} to both
+arms. Between runs Arm A's IC fell by $0.0128$ and Arm B's by $0.0125$; both
+annualised returns rose by close to four points. The shift is a property of the
+run, not of the objective, and it cancels when the arms are differenced. The
+paired effect is correspondingly stable: $+5.23$pp and $+4.84$pp on annualised
+return, $+0.0120$ and $+0.0123$ on IC.
+
+\begin{table}[htbp]\centering
+\caption{Generation noise measured from the Arm A replicate, against the paired
+effect. The individual arms move by far more than the difference between them
+does.}
+\label{tab:pairing}
+\small\begin{adjustbox}{max width=\textwidth}\TblPairing\end{adjustbox}
+\end{table}
+
+This is precisely what the back-to-back design was built for, and it changes how
+the effect should be assessed. Comparing the effect to \emph{unpaired} noise
+gives a ratio near one and suggests nothing is resolvable. Comparing it to the
+\emph{paired} spread --- the quantity the design actually controls --- gives a
+difference that reproduced across two independent runs to within $0.39$pp on
+return and $0.0003$ on IC.
+
+\paragraph{What this still does not establish.} Two pairs is not a sample. Both
+pairs favouring Arm B is what one coin flip in four would produce by chance, so
+the sign alone carries little weight; the informative part is the consistency of
+the \emph{magnitude}, which chance does not explain as easily. Proper inference
+needs replication across generation seeds, and the effect estimate here should be
+treated as a well-behaved point estimate rather than a tested hypothesis.
 
 \section{Limitations}
 
