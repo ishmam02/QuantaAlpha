@@ -23,9 +23,26 @@ DIRECTION="${1:?usage: $0 \"<research direction>\"}"
 CONFIG_PATH="${CONFIG_PATH:-configs/experiment.yaml}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
+# run.sh activates conda inside its own subshell, which does nothing for the
+# comparison steps we run here. Without this, bare `python` resolves to the base
+# interpreter and the post-run comparison dies on `No module named 'qlib'` --
+# after both arms have already spent their LLM budget.
+[ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
+eval "$(conda shell.bash hook)" 2>/dev/null || true
+conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || \
+    source activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || true
+PY="$(command -v python)"
+if ! "${PY}" -c "import qlib" 2>/dev/null; then
+    echo "Error: ${PY} cannot import qlib. Activate the quantaalpha environment"
+    echo "       (or set CONDA_ENV_NAME) before running -- the comparison step"
+    echo "       would otherwise fail only after both arms have finished."
+    exit 1
+fi
+export MLFLOW_ALLOW_FILE_STORE=true
+
 # One protocol hash for both arms. Read it once and fail early if Theta is
 # broken, rather than discovering it half way through the first run.
-THETA=$(PYTHONPATH="${SCRIPT_DIR}" python -c "
+THETA=$(PYTHONPATH="${SCRIPT_DIR}" "${PY}" -c "
 from quantaalpha.eval.protocol import load_protocol, default_protocol_path
 print(load_protocol(default_protocol_path()).hash)" 2>/dev/null | tail -1)
 if [ -z "${THETA}" ]; then
@@ -74,15 +91,40 @@ run_arm treatment "ARM B -- treatment (net-of-cost U objective)"
 
 LIB_A="data/factorlib/all_factors_library_control_${STAMP}.json"
 LIB_B="data/factorlib/all_factors_library_treatment_${STAMP}.json"
-# Prefer the zoo subset (the effective-alpha repository) when it exists.
-[ -f "${LIB_A%.json}_zoo.json" ] && LIB_A="${LIB_A%.json}_zoo.json"
-[ -f "${LIB_B%.json}_zoo.json" ] && LIB_B="${LIB_B%.json}_zoo.json"
+
+# Prefer the zoo subset (the effective-alpha repository) only when it actually
+# holds factors. The control arm runs the stock runner, which never sets
+# `in_zoo`/`feasible`, so its _zoo.json is empty BY CONSTRUCTION -- not because
+# its factors were rejected. Preferring it unconditionally compared zero Arm A
+# factors against Arm B's full repository and handed Arm B a meaningless win.
+count_factors () {
+    "${PY}" - "$1" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get("factors", d) or {}))
+except Exception:
+    print(0)
+PY
+}
+pick_library () {
+    local full="$1" zoo="${1%.json}_zoo.json"
+    if [ -f "${zoo}" ] && [ "$(count_factors "${zoo}")" -gt 0 ]; then
+        echo "${zoo}"
+    else
+        echo "${full}"
+    fi
+}
+LIB_A="$(pick_library "${LIB_A}")"
+LIB_B="$(pick_library "${LIB_B}")"
+echo "  Arm A library: ${LIB_A}  ($(count_factors "${LIB_A}") factors)"
+echo "  Arm B library: ${LIB_B}  ($(count_factors "${LIB_B}") factors)"
 
 echo ""
 echo "========================================================================"
 echo "  BOTH ARMS COMPLETE -- comparing under E_Theta (full cost model)"
 echo "========================================================================"
-PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_compare_arms.py \
+PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_compare_arms.py \
     --arm-a "${LIB_A}" \
     --arm-b "${LIB_B}" \
     --out "data/results/arm_comparison_${STAMP}.md"
@@ -95,7 +137,7 @@ echo ""
 echo "========================================================================"
 echo "  BACKTEST V2 -- flat-fee cost model (paper-comparable)"
 echo "========================================================================"
-PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_backtest_all.py \
+PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_backtest_all.py \
     --arm-a "${LIB_A}" \
     --arm-b "${LIB_B}" \
     --seeds "${BT_SEEDS:-42,1,7}" \
