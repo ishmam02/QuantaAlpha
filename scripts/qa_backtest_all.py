@@ -71,6 +71,31 @@ BASE_FEATURES = {
 
 PAPER_ROW = ("*paper (GPT-5.2)*", "+0.0472", "+0.0459", "—", "—", "+4.68%", "0.6453", "-11.80%")
 
+# Bump when the per-run metric payload gains fields, so a stale cache written by
+# an older version is discarded rather than silently rendering blank columns.
+CACHE_SCHEMA = 2
+
+
+def test_window(config: str) -> tuple[str, str]:
+    """The test split from the config -- the only window an OOS figure may use."""
+    import yaml
+
+    cfg = yaml.safe_load((ROOT / config).read_text())
+
+    def find(node):
+        if isinstance(node, dict):
+            if "segments" in node and isinstance(node["segments"], dict):
+                seg = node["segments"].get("test")
+                if seg:
+                    return str(seg[0]), str(seg[1])
+            for v in node.values():
+                got = find(v)
+                if got:
+                    return got
+        return None
+
+    return find(cfg) or ("2022-01-01", "2025-12-26")
+
 
 def write_base_library(path: Path) -> Path:
     """Emit the base-feature set as a factor library the backtest can consume."""
@@ -136,9 +161,18 @@ def fingerprint(factor_json: Path | None, config: str) -> str:
 
 def load_cache(path: Path) -> dict:
     try:
-        return json.loads(path.read_text())
+        payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
+    if payload.pop("__schema__", None) != CACHE_SCHEMA:
+        logger.info("cache written by an older version; recomputing")
+        return {}
+    return payload
+
+
+def save_cache(path: Path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"__schema__": CACHE_SCHEMA, **cache}, indent=2))
 
 
 def read_metrics(out_dir: Path, factor_json: Path | None, started: float) -> dict | None:
@@ -164,6 +198,75 @@ def read_metrics(out_dir: Path, factor_json: Path | None, started: float) -> dic
     return None
 
 
+def newest_since(paths, started: float):
+    """The most recent of `paths`, provided this run actually wrote it."""
+    fresh = [p for p in paths if p.exists() and p.stat().st_mtime >= started]
+    return max(fresh, key=lambda p: p.stat().st_mtime) if fresh else None
+
+
+def yearly_breakdown(factor_json: Path | None, config: str, started: float) -> dict:
+    """Per-year IC, Rank IC and excess annualised return over the test split.
+
+    Two things this repairs as a side effect.
+
+    **The reported IC is not always out-of-sample.** SigAnaRecord scores whatever
+    span the prediction covers. Under `--factor-source alpha158_20` that is the
+    966-day test window; under `--factor-source custom` it is the full 2427-day
+    2016-2025 span, so the headline IC is a blend of train, validation and test.
+    Measured here: the four base features report IC +0.0389 full-span but
+    +0.0481 on 2022-2025 alone. Slicing to the test window makes the two sources
+    comparable and is the only IC worth quoting.
+
+    **Annualisation.** Qlib's risk_analysis scales daily returns by 238, not 252,
+    and accumulates arithmetically. Rather than reimplement that, each year's
+    slice is handed to risk_analysis itself, so the yearly excess returns compose
+    consistently with the headline figure.
+    """
+    import pandas as pd
+    from qlib.contrib.evaluate import risk_analysis
+
+    lo, hi = test_window(config)
+    out: dict = {"test_window": f"{lo}..{hi}"}
+
+    ic_p = newest_since(list((ROOT / "mlruns").rglob("sig_analysis/ic.pkl")), started)
+    ric_p = newest_since(list((ROOT / "mlruns").rglob("sig_analysis/ric.pkl")), started)
+    for key, path in (("ic", ic_p), ("ric", ric_p)):
+        if path is None:
+            continue
+        s = pd.read_pickle(path)
+        if not isinstance(s, pd.Series) or s.empty:
+            continue
+        full = s
+        oos = s[(s.index >= lo) & (s.index <= hi)]
+        out[f"{key}_full_span_n"] = int(len(full))
+        out[f"{key}_oos_n"] = int(len(oos))
+        if len(oos):
+            out[f"{key}_oos"] = float(oos.mean())
+            out[f"{key}_oos_ir"] = float(oos.mean() / oos.std()) if oos.std() > 0 else 0.0
+            for year, v in oos.groupby(oos.index.year):
+                out[f"{key}_{year}"] = float(v.mean())
+
+    stem = factor_json.stem if factor_json else None
+    csv_dir = ROOT / "data/results/backtest_v2_results"
+    csv_p = newest_since(
+        [csv_dir / f"{stem}_cumulative_excess.csv"] if stem else list(
+            csv_dir.glob("*_cumulative_excess.csv")), started
+    ) or newest_since(list(csv_dir.glob("*_cumulative_excess.csv")), started)
+    if csv_p is not None:
+        df = pd.read_csv(csv_p, index_col=0, parse_dates=True)
+        r = df["daily_excess_return"].dropna()
+        r = r[(r.index >= lo) & (r.index <= hi)]
+        for year, v in r.groupby(r.index.year):
+            if len(v) < 20:      # a stub year cannot be annualised meaningfully
+                continue
+            a = risk_analysis(v)
+            a = a["risk"] if isinstance(a, pd.DataFrame) and "risk" in a.columns else (
+                a.iloc[:, 0] if isinstance(a, pd.DataFrame) else a)
+            out[f"xarr_{year}"] = float(a.get("annualized_return", float("nan")))
+            out[f"xir_{year}"] = float(a.get("information_ratio", float("nan")))
+    return out
+
+
 def run_backtest(label, source, factor_json, config, seed, tmpdir) -> dict | None:
     cfg = seeded_config(config, seed, tmpdir) if seed is not None else config
     cmd = [sys.executable, "-m", "quantaalpha.backtest.run_backtest",
@@ -181,9 +284,14 @@ def run_backtest(label, source, factor_json, config, seed, tmpdir) -> dict | Non
     if m is None:
         logger.error("[%s seed=%s] no fresh metrics file produced", label, seed)
         return None
-    logger.info("[%-14s seed=%-3s] %.0fs  IC=%+.4f  ARR=%+.2f%%  IR=%+.4f",
-                label, seed, time.time() - t0, _f(m, "IC"),
-                100 * _f(m, "annualized_return"), _f(m, "information_ratio"))
+    try:
+        m.update(yearly_breakdown(factor_json, config, t0))
+    except Exception as exc:                       # never lose a completed run
+        logger.warning("[%s seed=%s] yearly breakdown unavailable: %s", label, seed, exc)
+    logger.info("[%-14s seed=%-3s] %.0fs  IC=%+.4f (oos %+.4f, n=%s/%s)  ARR=%+.2f%%",
+                label, seed, time.time() - t0, _f(m, "IC"), _f(m, "ic_oos"),
+                m.get("ic_oos_n", "?"), m.get("ic_full_span_n", "?"),
+                100 * _f(m, "annualized_return"))
     return m
 
 
@@ -258,8 +366,7 @@ def main() -> int:
                 if m:
                     cache[key] = m
                     rows.append(m)
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    cache_path.write_text(json.dumps(cache, indent=2))
+                    save_cache(cache_path, cache)
             results[label] = rows
 
     n_ok = sum(1 for r in results.values() if r)
@@ -296,6 +403,77 @@ def main() -> int:
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
     lines.append("| " + " | ".join(PAPER_ROW) + " |")
 
+    # --- out-of-sample correction ---------------------------------------
+    # The IC column above is whatever SigAnaRecord scored, and that span is not
+    # the same for every factor source. Restate it on the test split alone.
+    win = next((r[0].get("test_window") for r in results.values() if r), None)
+    contaminated = [lab for lab, r in results.items()
+                    if r and r[0].get("ic_full_span_n", 0) > r[0].get("ic_oos_n", 0)]
+    if any(r and "ic_oos" in r[0] for r in results.values()):
+        lines += [
+            "", f"## Out-of-sample only ({win})", "",
+            "The IC column above is whatever `SigAnaRecord` happened to score, and "
+            "**that span differs by factor source**: `alpha158_20` is scored on the "
+            "966-day test window, while `--factor-source custom` is scored on the "
+            "full 2427-day 2016–2025 span — training data included. Those two "
+            "numbers were never comparable. Restated on the test split alone:",
+            "",
+            "| Config | IC (as reported) | IC (test split) | Rank IC (test split) | ICIR (test split) | Scored span |",
+            "| :--- | ---: | ---: | ---: | ---: | :--- |",
+        ]
+        for label, rows_ in results.items():
+            if not rows_:
+                continue
+            span = ("full 2016–2025 — **contaminated**"
+                    if label in contaminated else "test split only ✓")
+            lines.append(
+                f"| {label} | {fmt(*agg(rows_, 'IC'))} | {fmt(*agg(rows_, 'ic_oos'))} | "
+                f"{fmt(*agg(rows_, 'ric_oos'))} | {fmt(*agg(rows_, 'ic_oos_ir'))} | {span} |"
+            )
+        lines.append("| *paper (GPT-5.2)* | +0.0472 | — | — | — | not stated |")
+        if contaminated:
+            lines += [
+                "",
+                f"**{', '.join(contaminated)}** {'was' if len(contaminated) == 1 else 'were'} "
+                "scored over the training period as well. Here that *understates* the "
+                "out-of-sample IC, because 2016–2020 was a weaker IC regime than "
+                "2022–2025 — but the direction is incidental, and the blend is not a "
+                "quantity anyone should report. Use the test-split column.",
+                "",
+                "It is also worth knowing which convention the published +0.0472 "
+                "follows before setting anything against it.",
+            ]
+
+    # --- yearly breakdown ------------------------------------------------
+    years = sorted({int(k.split("_")[-1]) for r in results.values() if r
+                    for k in r[0] if k.startswith("ic_") and k.split("_")[-1].isdigit()})
+    if years:
+        lines += [
+            "", "## Year by year (CSI 300)", "",
+            "Annual IC and Rank IC are the mean daily cross-sectional correlation "
+            "within each calendar year. Excess ARR is annualised from that year's "
+            "daily excess-return series by Qlib's own `risk_analysis` — which scales "
+            "by **238**, not 252, and accumulates arithmetically — so the yearly "
+            "figures compose consistently with the headline. Excess is over the "
+            "CSI 300 benchmark and net of the flat commission.",
+            "",
+        ]
+        for metric_label, prefix, spec in (("Annual IC", "ic", "{:+.4f}"),
+                                           ("Annual Rank IC", "ric", "{:+.4f}"),
+                                           ("Excess ARR", "xarr", "{:+.2%}")):
+            lines += [f"### {metric_label}", "",
+                      "| Config | " + " | ".join(str(y) for y in years) + " | Full period |",
+                      "| :--- | " + " | ".join("---:" for _ in years) + " | ---: |"]
+            for label, rows_ in results.items():
+                if not rows_:
+                    continue
+                cells = [fmt(*agg(rows_, f"{prefix}_{y}"), spec) for y in years]
+                overall = ("ic_oos" if prefix == "ic" else
+                           "ric_oos" if prefix == "ric" else "annualized_return")
+                cells.append(fmt(*agg(rows_, overall), spec))
+                lines.append(f"| {label} | " + " | ".join(cells) + " |")
+            lines.append("")
+
     # --- resolvability, per metric --------------------------------------
     # Not every metric is equally noisy, and the difference is the single most
     # useful thing a seed sweep tells you. Measured here: the base features
@@ -317,9 +495,12 @@ def main() -> int:
                   "measured under `E_Θ` is ~1.2pp on annualised return, larger than the "
                   "whole span of this table."]
     else:
-        for label, key, spec in (("IC", "IC", "{:.4f}"),
-                                 ("Rank IC", "Rank IC", "{:.4f}"),
-                                 ("ICIR", "ICIR", "{:.4f}"),
+        # Use the test-split IC, not the reported one: the reported figure is
+        # scored over different spans by different factor sources, so its span
+        # would be measuring that inconsistency as much as any real difference.
+        for label, key, spec in (("IC (test split)", "ic_oos", "{:.4f}"),
+                                 ("Rank IC (test split)", "ric_oos", "{:.4f}"),
+                                 ("ICIR (test split)", "ic_oos_ir", "{:.4f}"),
                                  ("Ann. return", "annualized_return", "{:.2%}"),
                                  ("Info ratio", "information_ratio", "{:.4f}")):
             stats = [agg(v, key) for v in results.values() if v]
