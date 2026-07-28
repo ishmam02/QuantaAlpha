@@ -31,7 +31,12 @@ def _admitted_flag(backtest_results: Any):
     """
     if not isinstance(backtest_results, dict):
         return None
-    value = backtest_results.get("feasible")
+    # `in_zoo` is the current signal (set by NetCostFactorRunner for every
+    # factor that entered the repository). `feasible` is the older gated form,
+    # still read so pre-existing libraries keep working.
+    value = backtest_results.get("in_zoo")
+    if value is None:
+        value = backtest_results.get("feasible")
     if value is None:
         return None
     if isinstance(value, str):

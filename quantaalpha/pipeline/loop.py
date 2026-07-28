@@ -244,7 +244,19 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
                 trajectory_id=trajectory_id,
                 parent_trajectory_ids=parent_trajectory_ids,
             )
-            logger.info(f"Saved factors to library: {library_path} (phase={evolution_phase})")
+            # Two artefacts, deliberately distinct: the full library is the
+            # TRIAL RECORD (every factor mined, which the ledger and any later
+            # multiple-testing correction need), and the _zoo file is the
+            # effective-alpha repository F_zoo actually used for combination and
+            # relative ranking. With the absolute floors removed these coincide
+            # except for factors that failed to produce a signal, but they are
+            # different objects and the head-to-head consumes the zoo.
+            zoo_path = library_path.with_name(library_path.stem + "_zoo.json")
+            n_zoo = manager.write_admitted_subset(zoo_path)
+            logger.info(
+                f"Saved factors to library: {library_path} (phase={evolution_phase}); "
+                f"zoo subset: {zoo_path} ({n_zoo} factor(s))"
+            )
         except Exception as e:
             logger.warning(f"Failed to save factors to library: {e}")
     

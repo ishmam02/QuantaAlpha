@@ -275,6 +275,10 @@ class NetCostFactorRunner(QlibFactorRunner):
             "mdd": res.get("m_mdd"),
             "U": res.get("U"),
             "n_factors": res.get("n_factors"),
+            # Every evaluable factor enters the repository now that the absolute
+            # floors are gone; this flag is what the library uses to emit the
+            # zoo subset, and it stays meaningful if a gate is ever re-enabled.
+            "in_zoo": True,
             "theta_hash": res.get("theta_hash"),
             "zoo_hash": res.get("zoo_hash"),
             "zoo_size": res.get("zoo_size"),
