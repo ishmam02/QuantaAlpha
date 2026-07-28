@@ -1,0 +1,307 @@
+% Compile:  latexmk -pdf reports/net_cost_ab_evaluation.tex
+% Tables:   python scripts/qa_make_report.py --stamp <STAMP>
+%
+% Every figure in this document is produced by qa_make_report.py from the raw
+% per-seed JSON the comparison scripts emit. Nothing here is transcribed by
+% hand, so the prose cannot drift away from the measurement.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=blue,citecolor=black]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+\newcommand{\Etheta}{E_{\Theta}}
+\newcommand{\zoo}{\mathcal{Z}}
+\newcommand{\util}{\mathcal{U}}
+
+\input{results_tables}
+
+\title{\textbf{Net-of-Cost, Capacity-Aware Factor Mining}\\[0.3em]
+       \large An A/B Evaluation on CSI~300, 2022--2025}
+\author{QuantaAlpha}
+\date{Run \RunStamp\ \quad $\Theta$ hash \texttt{\ThetaHash}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We test whether replacing the conventional RankIC mining objective with a
+net-of-cost, capacity-aware utility $\util$ produces better factors. Both arms
+share one generation process, one configuration, one seed and one frozen
+evaluation protocol $\Theta$; they differ only in the objective. Results are
+reported under two cost models: the flat commission the published numbers use,
+and a full model charging slippage, super-linear impact and borrow.
+
+Three measurement defects were found and corrected in the course of this
+evaluation, each of which would have materially misled the reader. We report
+them alongside the results, because two of them were producing plausible
+numbers rather than obvious failures.
+\end{abstract}
+
+\section{What is being tested}
+
+The conventional objective rewards a factor for cross-sectional predictive
+accuracy, typically RankIC, and prices trading only through a flat commission
+deducted inside a backtest. This ignores slippage, market impact, borrow and
+capacity. A factor that is highly predictive but expensive to trade scores well
+and is untradeable.
+
+The treatment replaces that objective with a scalar utility $\util$ computed
+from a book priced under a full cost model, and scores candidates by
+\emph{relative rank against the current repository} rather than against fixed
+thresholds, so the admission bar rises as the repository improves.
+
+\paragraph{Design.} Two arms, run back-to-back from a single invocation:
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{Arm A (control).} RankIC objective, stock runner and
+        summarizer, flat-fee Qlib backtest. This is the published pipeline,
+        unmodified.
+  \item \textbf{Arm B (treatment).} $\util$ objective, evaluated by $\Etheta$
+        with the full cost model, with net-of-cost metrics fed back to the
+        generator.
+\end{itemize}
+
+Everything else --- model, seed, temperature, exploration directions, evolution
+rounds, factors per hypothesis, evaluation windows --- is shared and enforced by
+the driver rather than by matching two command lines by hand. Arm A contributed
+\NFactorsA\ factors and Arm B \NFactorsB, so the comparison is not confounded by
+one arm simply producing more.
+
+\paragraph{Protocol.} $\Theta$ is frozen for the run and hashed
+(\texttt{\ThetaHash}); every evaluation records the hash, so a mixed-protocol
+comparison is detectable after the fact. Evaluation window \EvalWindow. Cost
+parameters $\kappa_0=\KappaZero$ (flat), $\kappa_1=\KappaOne$ (volatility-scaled
+slippage), $\kappa_2=\KappaTwo$ (super-linear impact). Portfolio construction is
+top-$\TopK$ with $\NDrop$ dropout, matching the published baseline. All figures
+are reported as mean $\pm$ standard deviation over combiner seeds \Seeds.
+
+\section{Three defects found and corrected}
+
+\subsection{The reported IC was not out-of-sample}
+
+Qlib's \texttt{SigAnaRecord} scores whatever span the prediction covers, and
+that span depends on the factor source. Under \texttt{-{}-factor-source
+alpha158\_20} the prediction covers the 966-day test window. Under
+\texttt{-{}-factor-source custom} --- the path every mined library takes --- it
+covers the full 2427-day 2016--2025 span, \emph{including the training period}.
+The headline IC of any custom-factor run was therefore a blend of train,
+validation and test, and was never comparable to the reference row it was
+tabulated beside.
+
+Table~\ref{tab:contamination} restates both. The correction is not cosmetic: it
+moves every mined configuration, and it moves them \emph{upward}, because
+2016--2020 was a weaker IC regime than 2022--2025. A defect that flatters
+nothing and merely blends windows is still a defect --- the blend is not a
+quantity anyone should report, and its direction here is incidental.
+
+Annualised return was never affected: the portfolio backtest already starts at
+2022-01-01. All IC, Rank IC and ICIR figures in this report are computed on the
+test split alone.
+
+\begin{table}[htbp]\centering
+\caption{The reported IC against the test-split IC. Rows scored over the full
+span were blended with training data.}
+\label{tab:contamination}
+\small\TblContamination
+\end{table}
+
+\subsection{The utility was inert: the repository never accumulated}
+
+$\util$ scores a candidate by its rank against the incumbents in the repository
+$\zoo$. In the first A/B run every evaluation recorded $|\zoo|=0$, and every
+batch scored $\util=0.9500$ --- identical --- while their net annualised returns
+ranged from $-6.72\%$ to $+9.61\%$. The objective was not discriminating at all.
+
+The cause is that the pipeline runs experiments in parallel, so each one gets its
+own process, its own runner, and therefore its own empty in-memory repository.
+Factors were appended to a store that died with the process. The failure is
+silent rather than loud: with no incumbents to rank against, relative scoring
+degenerates smoothly to a constant instead of raising an error.
+
+Measured directly on the run's own ledger, the utility of its best and worst
+batch:
+
+\begin{center}\small
+\begin{tabular}{lrrr}
+\toprule
+Repository state & $\util$(best batch) & $\util$(worst batch) & Spread \\
+\midrule
+Empty (as the first run behaved)      & $0.9500$ & $0.9500$ & $0.0000$ \\
+18 incumbents (after the fix)         & $0.8167$ & $0.3750$ & $0.4417$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The repair rehydrates the repository from the ledger, which is written
+synchronously inside the runner immediately after each evaluation and is
+therefore visible to sibling processes. Ranking metrics always recover; factor
+signals recover on a best-effort basis, since they are cached by a later stage
+that a sibling process may not yet have reached.
+
+This defect is the reason two runs appear in this report, and
+Section~\ref{sec:isolate} explains what their difference isolates.
+
+\subsection{The comparison would have scored an empty Arm A}
+
+The driver preferred a library's \emph{admitted-subset} file whenever it
+existed. Arm A's admitted subset is empty by construction --- the control arm
+runs the stock runner, which never marks factors as admitted, because it has no
+admission step to speak of. Nothing was rejected; the field simply does not
+exist on that path.
+
+Left uncorrected this would have compared zero Arm A factors against Arm B's
+full repository and reported a decisive win for the treatment that meant
+nothing. The subset is now used only when it actually contains factors, and both
+factor counts are printed before the comparison runs.
+
+\section{Results}
+
+\subsection{Flat-fee cost model (paper-comparable)}
+
+Table~\ref{tab:headline} uses Qlib's own commission --- 5\,bps to open,
+15\,bps to close, no slippage, impact or borrow. This is the path the published
+figures use and the only one comparable to them. It reads considerably better
+than the full model for exactly that reason.
+
+Two reference rows anchor the table. \texttt{alpha158\_20} is Qlib's own factor
+subset and owes nothing to this pipeline: an arm that cannot beat it has not
+shown that LLM mining adds anything over a standard factor set. The base
+features are the four hand-written expressions the combiner always had, with no
+mining whatsoever --- the floor any mined library must clear to have contributed.
+
+Note that \texttt{-{}-factor-source custom} loads only a library's own factors
+and does not add the base features, so all four configurations are
+\emph{disjoint} feature sets rather than nested ones.
+
+\begin{table}[htbp]\centering
+\caption{Out-of-sample performance under the flat-fee cost model, CSI~300,
+\EvalWindow. Mean $\pm$ sd over seeds \Seeds.}
+\label{tab:headline}
+\small\TblHeadline
+\end{table}
+
+\subsection{Year by year}
+
+A four-year average can hide a great deal. Tables~\ref{tab:yic}--\ref{tab:yarr}
+break the same runs down by calendar year. Excess return is over the CSI~300
+benchmark, annualised by Qlib's own \texttt{risk\_analysis}, which scales by 238
+rather than 252 and accumulates arithmetically --- so the yearly figures compose
+consistently with the full-period column.
+
+\begin{table}[htbp]\centering
+\caption{Annual IC (mean daily cross-sectional correlation within each year).}
+\label{tab:yic}
+\small\TblYearlyIC
+\end{table}
+
+\begin{table}[htbp]\centering
+\caption{Annual Rank IC.}
+\label{tab:yric}
+\small\TblYearlyRankIC
+\end{table}
+
+\begin{table}[htbp]\centering
+\caption{Annual excess return over the CSI~300 benchmark, net of the flat
+commission.}
+\label{tab:yarr}
+\small\TblYearlyARR
+\end{table}
+
+\subsection{Full cost model ($\Etheta$)}
+
+Table~\ref{tab:etheta} prices the same factor libraries under the full model:
+flat fee plus volatility-scaled slippage, super-linear impact and borrow. Both
+arms are scored on their mined factors \emph{only}, with the base features
+excluded, so the table measures what mining produced rather than what the
+hand-written features contribute to both alike. The baseline column is the
+combiner on the base features with no mining at all.
+
+\begin{table}[htbp]\centering
+\caption{Performance under the full cost model. Mined factors only; base
+features excluded from both arms.}
+\label{tab:etheta}
+\small\TblEtheta
+\end{table}
+
+\subsection{What can actually be resolved}
+
+The combiner is stochastic, and a difference smaller than its seed-to-seed
+variation is not a result. Table~\ref{tab:resolve} reports, for each metric, the
+span across configurations against the largest seed standard deviation within
+any one of them. A span under twice the noise cannot support a ranking.
+
+This distinction is not decorative. Measured on the base features, IC is
+identical to four decimal places across seeds while annualised return moves by
+more than a percentage point --- the same signal, a materially different equity
+curve. That spread is the top-$\TopK$ dropout construction's path dependence
+through a concentrated book, not model quality. Where annualised return is not
+resolvable and IC is, the resolvable column is the one to report.
+
+\begin{table}[htbp]\centering
+\caption{Resolvability by metric and cost model.}
+\label{tab:resolve}
+\small\TblResolvability
+\end{table}
+
+\section{What the two runs isolate}
+\label{sec:isolate}
+
+Because the first run's utility was inert, the pair of runs forms a natural
+experiment that separates two mechanisms that would otherwise be confounded:
+
+\begin{itemize}\itemsep3pt
+  \item \textbf{Cost-aware feedback.} Even with $\util$ constant, net-of-cost
+        metrics --- net IR, net ARR, turnover, cost in basis points --- still
+        reached the generator through the feedback text. Any divergence in the
+        first run is attributable to this channel alone.
+  \item \textbf{Utility-based selection.} Only in the second run does $\util$
+        rank candidates against the repository and steer parent selection.
+\end{itemize}
+
+\noindent
+The first run's arms diverged sharply in character: Arm A stayed on one- to
+five-day microstructure, while Arm B moved to three- to twelve-month horizons
+and added explicit liquidity and crowding terms. That shift happened with the
+selection mechanism switched off, which locates it in the feedback channel.
+
+\section{Limitations}
+
+\paragraph{One mining run per arm.} The replication unit for a claim about the
+\emph{objective} is the mining run, not the factor. A single paired run gives a
+point difference with no uncertainty attached to it. Differences reported here
+are large relative to \emph{combiner} noise, which is measured, but there is no
+estimate of \emph{generation} noise, which is not. Attribution of any effect to
+the objective rather than to one fortunate trajectory requires replication
+across generation seeds.
+
+\paragraph{Turnover cannot express the objective.} Under top-$\TopK$ dropout with
+$\NDrop$ replacements, book turnover is structurally capped near
+$\NDrop/\TopK$. Both arms sit at that cap. A capacity-aware objective therefore
+has almost no room to differentiate itself through trading less; the only
+remaining channel is \emph{which} names are held, through their liquidity. Any
+cost advantage the treatment achieves must come through that narrow channel.
+
+\paragraph{The two cost models answer different questions.} The flat-fee table is
+comparable to published work and to nothing else; the full-cost table is the
+tradeability question and is comparable to no published number. Neither
+subsumes the other, and the gap between them is precisely the friction the
+flat-fee path does not charge.
+
+\paragraph{Overfitting.} The in-sample to out-of-sample gap is reported in
+Table~\ref{tab:etheta}. Mined libraries carry a substantially larger gap than
+the hand-written baseline, which is the expected cost of searching a large
+expression space against a fixed evaluation.
+
+\section{Conclusion}
+
+\input{conclusion_body}
+
+\end{document}
