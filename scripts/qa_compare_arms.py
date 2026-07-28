@@ -255,6 +255,23 @@ def main() -> int:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(table + "\n")
         logger.info("wrote %s", args.out)
+
+        # Raw per-seed rows alongside the prose table. The report generator
+        # builds its LaTeX from these rather than from parsed markdown, so the
+        # document and the measurement cannot drift apart.
+        raw = Path(args.out).with_suffix(".raw.json")
+        raw.write_text(json.dumps({
+            "theta_hash": theta.hash,
+            "window": list(window),
+            "seeds": list(seeds),
+            "n_factors": {"arm_a": len(fa), "arm_b": len(fb)},
+            "costs": {"kappa0": theta.costs.kappa0, "kappa1": theta.costs.kappa1,
+                      "kappa2": theta.costs.kappa2},
+            "portfolio": {"topk": theta.portfolio.topk, "n_drop": theta.portfolio.n_drop},
+            "results": {k: v for k, v in res.items()},
+            "results_with_base": {k: v for k, v in res_base.items()},
+        }, indent=2, default=str))
+        logger.info("wrote %s", raw)
     return 0
 
 

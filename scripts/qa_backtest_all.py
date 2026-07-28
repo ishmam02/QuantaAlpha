@@ -73,7 +73,7 @@ PAPER_ROW = ("*paper (GPT-5.2)*", "+0.0472", "+0.0459", "—", "—", "+4.68%", 
 
 # Bump when the per-run metric payload gains fields, so a stale cache written by
 # an older version is discarded rather than silently rendering blank columns.
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
 
 
 def test_window(config: str) -> tuple[str, str]:
@@ -284,6 +284,11 @@ def run_backtest(label, source, factor_json, config, seed, tmpdir) -> dict | Non
     if m is None:
         logger.error("[%s seed=%s] no fresh metrics file produced", label, seed)
         return None
+    # Label the cached row. The cache key is a content fingerprint, which says
+    # nothing about which configuration produced it, and a run that adds new arm
+    # libraries leaves the old ones cached beside them -- so anything grouping
+    # these rows later needs the label carried with the data.
+    m["__label__"] = label
     try:
         m.update(yearly_breakdown(factor_json, config, t0))
     except Exception as exc:                       # never lose a completed run
