@@ -24,8 +24,14 @@ splits: # frozen; the engine never reads a window a caller hands it
   valid: ["2020-01-01", "2020-12-31"] # :108
   inloop_test: ["2021-01-01", "2021-12-31"] # :109  — NEVER widen
   final_test: ["2022-01-01", "2025-12-26"] # backtest.yaml:85
+  # OOS proxy spanning BOTH held-out pre-test years. `valid` alone is 2020 --
+  # a single, highly atypical year (COVID crash then a ~27% CSI 300 rally), so
+  # admission verdicts were hostage to one regime. 2020+2021 doubles the
+  # evaluation sample and spans a rally and a drawdown. Still strictly before
+  # final_test, so Property 3 holds: the test window is untouched during search.
+  oos_proxy: ["2020-01-01", "2021-12-31"]
   search_is: train # IS during search
-  search_oos: valid # OOS proxy during search; final_test only in the end report
+  search_oos: oos_proxy # final_test is reached only via the explicit report mode
 
 execution: # Eq. 4-5
   delta: 1

@@ -22,6 +22,23 @@ DEFAULT_FACTOR_CACHE_DIR = os.environ.get(
 )
 
 
+def _admitted_flag(backtest_results: Any):
+    """Whether F_Theta admitted this factor, or None if the arm has no verdict.
+
+    The treatment runner emits `feasible`; the control arm's Qlib metrics carry
+    no such key, so control-arm libraries record None rather than a misleading
+    False.
+    """
+    if not isinstance(backtest_results, dict):
+        return None
+    value = backtest_results.get("feasible")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 class FactorLibraryManager:
     """Manage unified factor library (CRUD)."""
 
@@ -46,9 +63,42 @@ class FactorLibraryManager:
             "factors": {},
         }
 
+    def admitted_ids(self) -> list:
+        """Factor ids that passed F_Theta, in insertion order."""
+        return [
+            fid for fid, f in self.data.get("factors", {}).items()
+            if isinstance(f, dict) and f.get("admitted") is True
+        ]
+
+    def write_admitted_subset(self, path) -> int:
+        """Write a library JSON containing only the admitted factors.
+
+        The effective-alpha repository, in the same schema, so it can be fed
+        straight to `run_backtest --factor-json`. Returns the count written.
+        """
+        ids = self.admitted_ids()
+        subset = {
+            "metadata": {
+                **self.data.get("metadata", {}),
+                "derived_from": str(self.library_path),
+                "subset": "admitted_only",
+                "total_factors": len(ids),
+            },
+            "factors": {fid: self.data["factors"][fid] for fid in ids},
+        }
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(subset, f, ensure_ascii=False, indent=2, default=str)
+        logger.info(f"Wrote {len(ids)} admitted factor(s) to {out}")
+        return len(ids)
+
     def _save(self):
         self.data["metadata"]["last_updated"] = datetime.now().isoformat()
         self.data["metadata"]["total_factors"] = len(self.data["factors"])
+        admitted = self.admitted_ids()
+        self.data["metadata"]["admitted_factor_ids"] = admitted
+        self.data["metadata"]["admitted_count"] = len(admitted)
         self.library_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.library_path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2, default=str)
@@ -137,6 +187,12 @@ class FactorLibraryManager:
                 },
                 "backtest_results": backtest_results,
                 "feedback": feedback_dict,
+                # Did this factor pass F_Theta and enter the effective-alpha
+                # repository? The library records every trial (which the ledger
+                # needs), but `zoo` is only the admitted subset -- keep the two
+                # distinguishable without having to dig into backtest_results.
+                # None when the arm produced no feasibility verdict (control).
+                "admitted": _admitted_flag(backtest_results),
             }
 
             self.data["factors"][factor_id] = factor_entry

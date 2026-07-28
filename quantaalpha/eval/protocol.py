@@ -55,6 +55,9 @@ class Splits:
     valid: DateRange
     inloop_test: DateRange
     final_test: DateRange
+    # Optional wider OOS proxy (e.g. valid + inloop_test) so admission is not
+    # judged on a single year's regime. Must end before final_test.
+    oos_proxy: DateRange | None = None
     search_is: str = "train"
     search_oos: str = "valid"
 
@@ -258,6 +261,14 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
         if target not in windows:
             raise ValueError(f"{alias}: {target!r} is not one of {sorted(windows)}")
     splits = _build(Splits, {**windows, **aliases})
+
+    # Property 3: nothing the search reads may reach into the test window.
+    for name in (splits.search_is, splits.search_oos):
+        if splits.window(name)[1] >= splits.final_test[0]:
+            raise ValueError(
+                f"split {name!r} ends at {splits.window(name)[1]}, which is not before "
+                f"final_test start {splits.final_test[0]}; the search would see test data"
+            )
 
     combiner_raw = dict(raw["combiner"])
     combiner_raw["base_features"] = tuple(combiner_raw.get("base_features", ()))
