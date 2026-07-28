@@ -201,6 +201,48 @@ def tbl_resolvability(flat: dict, etheta: dict) -> str:
     return "\n".join(L)
 
 
+def tbl_runcompare(flat: dict, etheta: dict, run1: dict) -> str:
+    """Run 1 (utility inert) against run 2 (utility active), side by side.
+
+    This is the comparison the two runs exist to support. Run 1's repository
+    never accumulated, so its utility was constant and only the *feedback*
+    channel was live; run 2 has both. Holding the generation process fixed
+    across the pair, the difference isolates utility-based selection from
+    cost-aware feedback.
+    """
+    L = [r"\begin{tabular}{llrrr}", r"\toprule",
+         r"Cost model & Metric & Run 1 ($\util$ inert) & Run 2 ($\util$ active) & Change \\",
+         r"\midrule"]
+
+    def line(model, label, r1, r2, pct):
+        if r1 is None or r2 is None:
+            return
+        f = (lambda v: f"{100*v:+.2f}\\%") if pct else (lambda v: f"{v:+.4f}")
+        d = r2 - r1
+        L.append(f"{model} & {label} & ${f(r1)}$ & ${f(r2)}$ & ${f(d)}$ \\\\")
+
+    model = "Flat fee"
+    for arm in ("Arm A (mined)", "Arm B (mined)"):
+        if arm not in flat:
+            continue
+        short = "Arm A" if "A (" in arm else "Arm B"
+        for label, key, r1key, pct in (("IC", "ic_oos", "ic_oos", False),
+                                       ("Ann.\\ return", "annualized_return", "arr", True)):
+            line(model, f"{short} {label}", run1["flat_fee"][arm].get(r1key),
+                 agg(flat[arm], key)[0], pct)
+            model = ""
+    L.append(r"\midrule")
+    model = "Full ($E_\\Theta$)"
+    keys = list(etheta["results"])
+    for r1name, k in zip(("Arm A", "Arm B"), keys[1:]):
+        for label, key, pct in (("Rank IC", "rank_ic", False), ("Net ARR", "net_arr", True)):
+            line(model, f"{r1name} {label}", run1["etheta"][r1name].get(key),
+                 agg(etheta["results"][k], key)[0], pct)
+            model = ""
+    L += [r"\bottomrule", r"\end{tabular}"]
+    return "\n".join(L)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -210,6 +252,7 @@ def main() -> int:
     # fixtures without touching (or waiting on) a live run's artifacts.
     ap.add_argument("--flat-raw", default="data/results/backtest_v2_raw.json")
     ap.add_argument("--etheta-raw", default=None)
+    ap.add_argument("--run1", default="reports/run1_reference.json")
     args = ap.parse_args()
 
     flat_raw = json.loads((ROOT / args.flat_raw).read_text())
@@ -217,6 +260,7 @@ def main() -> int:
                       f"data/results/arm_comparison_{args.stamp}.raw.json")
     etheta = json.loads(et_path.read_text())
     flat = group_flat(flat_raw)
+    run1 = json.loads((ROOT / args.run1).read_text())
 
     macros = {
         "ThetaHash": etheta["theta_hash"],
@@ -243,7 +287,8 @@ def main() -> int:
                        ("TblYearlyRankIC", tbl_yearly(flat, "ric", False)),
                        ("TblYearlyARR", tbl_yearly(flat, "xarr", True)),
                        ("TblEtheta", tbl_etheta(etheta)),
-                       ("TblResolvability", tbl_resolvability(flat, etheta))):
+                       ("TblResolvability", tbl_resolvability(flat, etheta)),
+                       ("TblRunCompare", tbl_runcompare(flat, etheta, run1))):
         out += [f"\\newcommand{{\\{name}}}{{%", body, "}", ""]
 
     path = ROOT / args.out

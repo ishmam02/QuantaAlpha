@@ -272,6 +272,26 @@ five-day microstructure, while Arm B moved to three- to twelve-month horizons
 and added explicit liquidity and crowding terms. That shift happened with the
 selection mechanism switched off, which locates it in the feedback channel.
 
+Table~\ref{tab:runcompare} places the two runs side by side. Everything except
+the repository fix is held constant between them --- same configuration, same
+generation seed, same protocol hash, same evaluation window --- so the change
+column is the contribution of utility-based selection on top of feedback that
+was already cost-aware.
+
+\begin{table}[htbp]\centering
+\caption{Run 1 (utility inert) against run 2 (utility active). Run 1 figures are
+transcribed from its committed artifacts and verified verbatim against them.}
+\label{tab:runcompare}
+\small\TblRunCompare
+\end{table}
+
+\paragraph{A caution on reading the change column.} Two runs is not a sample. The
+repository fix is not the only thing that differs between them in practice ---
+the generator is not bit-reproducible across runs even at temperature zero, and
+parallel merge order varies --- so part of any change is ordinary
+run-to-run variation whose magnitude is unmeasured. The column is informative
+about direction and rough scale, not a treatment effect estimate.
+
 \section{Limitations}
 
 \paragraph{One mining run per arm.} The replication unit for a claim about the
