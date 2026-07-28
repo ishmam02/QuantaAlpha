@@ -44,10 +44,25 @@ class Ledger:
             logger.warning("ledger append failed (%s): %s", self.path, exc)
 
     def read(self) -> list[dict[str, Any]]:
+        """Every well-formed record, skipping any that are not.
+
+        The ledger is read while other processes are appending to it (the
+        repository is rehydrated from here), and a record can exceed the size
+        POSIX guarantees atomic for an append. A torn final line must cost one
+        row, not raise -- the same trade-off ``append`` already makes.
+        """
         if not self.path.exists():
             return []
+        rows: list[dict[str, Any]] = []
         with self.path.open(encoding="utf-8") as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("skipping malformed ledger line in %s", self.path)
+        return rows
 
     def __len__(self) -> int:
         return len(self.read())

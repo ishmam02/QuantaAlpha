@@ -29,6 +29,7 @@ import pandas as pd
 from quantaalpha.components.runner import CachedRunner
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.core.utils import cache_with_pickle
+from quantaalpha.eval.data import load_factor_signal
 from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger
 from quantaalpha.eval.operator import EvaluationOperator
 from quantaalpha.eval.protocol import default_protocol_path, load_protocol
@@ -221,21 +222,62 @@ class NetCostFactorRunner(QlibFactorRunner):
         the loop has produced, admissible or not; the repository is by
         definition the subset that passed evaluation.
 
-        Caveat for parallel mode: each worker process builds its own runner and
-        therefore its own repository, so rho_max is measured within a branch
-        rather than globally. The serial path sees the full accumulation.
-        """
-        if not self._repository:
-            if exp.based_experiments:
-                logger.info(
-                    "repository empty (%d based experiment(s) present but none admitted yet); "
-                    "scoring this candidate against an empty zoo",
-                    len(exp.based_experiments),
-                )
-            return {}, []
+        **Rehydrated from the ledger, because the in-memory store does not
+        survive.** Under ``parallel_execution``/``parallel_enabled`` every
+        experiment gets its own process, hence its own runner and its own empty
+        ``_repository``. Measured on the 20260728_103159 run: all six batches
+        evaluated against ``zoo_size=0`` and scored an identical ``U=0.9500``
+        despite net ARR spanning -6.72% to +9.61% -- with nothing to rank
+        against, the repository-relative scoring collapses and the objective
+        stops discriminating at all. The ledger is the fix because it is written
+        synchronously inside this runner, immediately after each evaluation, so
+        a sibling process can always see it.
 
+        Metrics and signals recover independently, and the distinction matters:
+
+        * **Metrics** drive Eq. 11's relative ranking and come straight from the
+          ledger, so they are always recoverable. This is what restores ``U``.
+        * **Signals** drive the combiner refit and ``rho_max``, and are loaded
+          from the md5 cache that ``library.py:232`` writes. That write happens
+          when the pipeline saves the library, which may lag a sibling process,
+          so signal recovery is best-effort and is logged.
+
+        A partially recovered zoo still ranks correctly; it just refits the
+        combiner on fewer incumbents.
+        """
         signals = {expr: signal for expr, (signal, _) in self._repository.items()}
         metrics = [m for _, (_, m) in self._repository.items()]
+
+        recovered_metrics = recovered_signals = 0
+        for record in self.ledger.read():
+            batch_metrics = record.get("metrics") or {}
+            for expr in record.get("factor_exprs") or []:
+                if not expr or expr in signals or expr in self._repository:
+                    continue
+                metrics.append(batch_metrics)
+                recovered_metrics += 1
+                try:
+                    signals[expr] = load_factor_signal(expr)
+                    recovered_signals += 1
+                except (FileNotFoundError, OSError, ValueError):
+                    # Not yet cached by a sibling process. The factor still
+                    # counts as a ranking incumbent; it just cannot join the
+                    # combiner refit this time round.
+                    continue
+
+        if recovered_metrics:
+            logger.info(
+                "repository rehydrated from ledger: +%d incumbent(s) for ranking, "
+                "%d with signals for the refit (in-process held %d)",
+                recovered_metrics, recovered_signals, len(self._repository),
+            )
+        if not metrics:
+            logger.info(
+                "repository empty (%d based experiment(s) present, ledger has no "
+                "prior records); scoring this batch against an empty zoo -- U "
+                "cannot discriminate until the repository has incumbents",
+                len(exp.based_experiments or []),
+            )
         return signals, metrics
 
     @staticmethod
