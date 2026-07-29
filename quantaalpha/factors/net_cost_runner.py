@@ -29,7 +29,7 @@ import pandas as pd
 from quantaalpha.components.runner import CachedRunner
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.core.utils import cache_with_pickle
-from quantaalpha.eval.data import load_factor_signal
+from quantaalpha.eval.data import align_signal, load_factor_signal
 from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger, replay_repository
 from quantaalpha.eval.operator import EvaluationOperator
 from quantaalpha.eval.protocol import default_protocol_path, load_protocol
@@ -249,10 +249,18 @@ class NetCostFactorRunner(QlibFactorRunner):
             return False
 
         for expr, signal in candidates.items():
-            self._repository[expr] = (signal, batch_metrics)
+            self._repository[expr] = (self._compact(signal), batch_metrics)
         logger.info("repository: +%d factor(s), U=%.4f >= tau_admit=%.2f; |zoo| = %d",
                     len(candidates), u, adm.tau_admit, len(self._repository))
         return True
+
+    def _compact(self, signal):
+        """Store a signal on the evaluation grid, not on the full raw cache."""
+        try:
+            start, end, _ = self.op._windows(False)
+            return align_signal(signal, self.op._panel(start, end))
+        except Exception:                       # never lose a factor to this
+            return signal
 
     @staticmethod
     def _weakest(res: dict, k: int = 2) -> str:
@@ -362,11 +370,23 @@ class NetCostFactorRunner(QlibFactorRunner):
         # process would rehydrate the dropped factor straight back from the
         # admission record that precedes it.
         recovered = signals_found = 0
+        # Align on load, and store the ALIGNED frame. A cached signal is a
+        # (datetime, instrument) Series over the full 2008-2026 x 5982-name
+        # cache -- 227 MB on disk and more in memory. Holding raw signals for a
+        # 150-factor repository is tens of gigabytes resident, which is fine at
+        # the 18 factors this ran at during development and fatal at paper
+        # scale. Aligned to the evaluation panel each one is a couple of
+        # megabytes. align_signal short-circuits on an already-wide frame, so
+        # the operator's own alignment stays correct and costs nothing.
+        panel = None
         for expr, batch_metrics in replay_repository(self.ledger.path).items():
             if expr in self._repository:
                 continue
             try:
-                signal = load_factor_signal(expr)
+                if panel is None:
+                    p_start, p_end, _ = self.op._windows(False)
+                    panel = self.op._panel(p_start, p_end)
+                signal = align_signal(load_factor_signal(expr), panel)
                 signals_found += 1
             except (FileNotFoundError, OSError, ValueError):
                 # Not yet cached by a sibling process. Still a ranking
