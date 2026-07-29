@@ -68,4 +68,28 @@ class Ledger:
         return len(self.read())
 
 
-__all__ = ["DEFAULT_LEDGER_PATH", "Ledger"]
+def replay_repository(path: str | os.PathLike[str] | None = None) -> dict[str, dict]:
+    """The repository as the ledger says it currently stands.
+
+    Replays records IN ORDER: an admitted batch adds its expressions, an
+    eviction record removes them. Order matters -- a factor admitted, evicted,
+    then re-admitted must end up present, and one admitted then evicted must
+    not. Rejected batches are recorded under ``rejected_exprs`` and contribute
+    nothing.
+
+    Shared by the runner (which rehydrates from it across process boundaries)
+    and the evolution controller (which sizes the repository to decide whether
+    to keep mining), so the two cannot disagree about what was admitted.
+    """
+    repo: dict[str, dict] = {}
+    for record in Ledger(path).read():
+        for expr in record.get("evicted_exprs") or []:
+            repo.pop(expr, None)
+        metrics = record.get("metrics") or {}
+        for expr in record.get("factor_exprs") or []:
+            if expr:
+                repo[expr] = metrics
+    return repo
+
+
+__all__ = ["DEFAULT_LEDGER_PATH", "Ledger", "replay_repository"]

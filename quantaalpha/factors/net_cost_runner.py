@@ -30,7 +30,7 @@ from quantaalpha.components.runner import CachedRunner
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.core.utils import cache_with_pickle
 from quantaalpha.eval.data import load_factor_signal
-from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger
+from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger, replay_repository
 from quantaalpha.eval.operator import EvaluationOperator
 from quantaalpha.eval.protocol import default_protocol_path, load_protocol
 from quantaalpha.eval.scoring import utility
@@ -362,16 +362,7 @@ class NetCostFactorRunner(QlibFactorRunner):
         # process would rehydrate the dropped factor straight back from the
         # admission record that precedes it.
         recovered = signals_found = 0
-        wanted: dict[str, dict] = {}
-        for record in self.ledger.read():
-            for expr in record.get("evicted_exprs") or []:
-                wanted.pop(expr, None)
-            batch_metrics = record.get("metrics") or {}
-            for expr in record.get("factor_exprs") or []:
-                if expr:
-                    wanted[expr] = batch_metrics
-
-        for expr, batch_metrics in wanted.items():
+        for expr, batch_metrics in replay_repository(self.ledger.path).items():
             if expr in self._repository:
                 continue
             try:

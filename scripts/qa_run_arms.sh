@@ -73,77 +73,23 @@ if ! grep -qE "^CHAT_SEED" .env 2>/dev/null; then
 fi
 
 # Arm B's admission gate rejects a fraction of what it mines, so at equal
-# generation budget it ends with fewer factors than Arm A -- and factor count
-# moves the combiner independently of factor quality, which confounds the
-# comparison. QA_TREATMENT_ROUND_MULTIPLIER scales the treatment arm's evolution
-# rounds so both arms finish with a similar ADMITTED count.
+# generation budget it finishes with fewer factors than Arm A -- and factor
+# count moves the combiner independently of factor quality. Measured: at 18 vs
+# 11 the arms' net-ARR gap read as 4.9x the seed noise and "resolvable"; at
+# 18 vs 17 the same libraries gave 1.9x and "not resolvable". Most of the
+# apparent deficit was the six missing factors, not their quality.
 #
-# This deliberately breaks budget parity: Arm B then searches more than Arm A.
-# Equalising output rather than input is a defensible choice -- the question is
-# "18 factors chosen by U vs 18 chosen by RankIC" -- but any Arm B advantage is
-# then partly bought with extra search, and the report must say so. Setting it
-# to 1.0 restores strict budget parity at the cost of unequal counts.
-treatment_config () {
-    local mult="${QA_TREATMENT_ROUND_MULTIPLIER:-1.0}"
-    if [ "${mult}" = "1.0" ] || [ "${mult}" = "1" ]; then
-        echo "${CONFIG_PATH}"; return
-    fi
-    local out="${SCRIPT_DIR}/data/results/experiment_treatment_${STAMP}.yaml"
-    mkdir -p "$(dirname "${out}")"
-    "${PY}" - "${CONFIG_PATH}" "${out}" "${mult}" <<'PYEOF'
-import math, sys, yaml
-src, dst, mult = sys.argv[1], sys.argv[2], float(sys.argv[3])
-cfg = yaml.safe_load(open(src))
-ev = cfg.setdefault("evolution", {})
-base = int(ev.get("max_rounds", 3))
-ev["max_rounds"] = max(base, math.ceil(base * mult))
-yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
-print(f"treatment rounds: {base} -> {ev['max_rounds']} (x{mult})", file=sys.stderr)
-PYEOF
-    echo "${out}"
-}
+# The budget therefore follows the OUTCOME, not an estimate: Arm A runs first,
+# we count what it produced, and Arm B keeps mining until its repository holds
+# that many ADMITTED factors (QA_MAX_ROUNDS_CAP bounds the cost). An assumed
+# multiplier cannot do this -- the admission rate is unknown before the run and
+# drifts as the repository improves, which is the point of an adaptive bar.
+#
+# This deliberately breaks budget parity: Arm B searches more than Arm A.
+# Equalising output rather than input is defensible -- the question is "N
+# factors chosen by U vs N chosen by RankIC" -- but any Arm B advantage is
+# then partly bought with extra search, and the report must state both budgets.
 
-run_arm () {
-    local arm="$1" label="$2"
-    local id="${arm}_${STAMP}"
-    local cfg="${CONFIG_PATH}"
-    if [ "${arm}" = "treatment" ]; then
-        cfg="$(treatment_config)"
-        if [ "${cfg}" != "${CONFIG_PATH}" ]; then
-            echo ""
-            echo "  !! BUDGET PARITY BROKEN: treatment arm uses ${cfg}"
-            echo "     (QA_TREATMENT_ROUND_MULTIPLIER=${QA_TREATMENT_ROUND_MULTIPLIER})"
-            echo "     Arm B searches more than Arm A; report both budgets."
-        fi
-    fi
-    echo ""
-    echo "########################################################################"
-    echo "#  ${label}   (EXPERIMENT_ID=${id})"
-    echo "########################################################################"
-    QA_ARM="${arm}" \
-    EXPERIMENT_ID="${id}" \
-    FACTOR_LIBRARY_SUFFIX="${id}" \
-    CONFIG_PATH="${cfg}" \
-    ./run.sh "${DIRECTION}" 2>&1 | tee "/tmp/qa_${id}.log"
-}
-
-# QA_ARMS selects which arms to mine; QA_REUSE_A/B supply an already-mined
-# library for an arm being skipped. Re-running one arm after a code change that
-# cannot affect the other is far cheaper than re-mining both -- but note the
-# pairing is then across runs, and run-to-run generation variance is large (it
-# only cancels for arms mined in the SAME run).
-QA_ARMS="${QA_ARMS:-control treatment}"
-case " ${QA_ARMS} " in *" control "*) run_arm control "ARM A -- control (RankIC objective)";; esac
-case " ${QA_ARMS} " in *" treatment "*) run_arm treatment "ARM B -- treatment (net-of-cost U objective)";; esac
-
-LIB_A="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
-LIB_B="${QA_REUSE_B:-data/factorlib/all_factors_library_treatment_${STAMP}.json}"
-
-# Prefer the zoo subset (the effective-alpha repository) only when it actually
-# holds factors. The control arm runs the stock runner, which never sets
-# `in_zoo`/`feasible`, so its _zoo.json is empty BY CONSTRUCTION -- not because
-# its factors were rejected. Preferring it unconditionally compared zero Arm A
-# factors against Arm B's full repository and handed Arm B a meaningless win.
 count_factors () {
     "${PY}" - "$1" <<'PY' 2>/dev/null || echo 0
 import json, sys
@@ -154,6 +100,59 @@ except Exception:
     print(0)
 PY
 }
+run_arm () {
+    local arm="$1" label="$2"
+    local id="${arm}_${STAMP}"
+    echo ""
+    echo "########################################################################"
+    echo "#  ${label}   (EXPERIMENT_ID=${id})"
+    echo "########################################################################"
+    QA_ARM="${arm}" \
+    EXPERIMENT_ID="${id}" \
+    FACTOR_LIBRARY_SUFFIX="${id}" \
+    CONFIG_PATH="${CONFIG_PATH}" \
+    ./run.sh "${DIRECTION}" 2>&1 | tee "/tmp/qa_${id}.log"
+}
+
+# QA_ARMS selects which arms to mine; QA_REUSE_A/B supply an already-mined
+# library for an arm being skipped. Re-running one arm after a code change that
+# cannot affect the other is far cheaper than re-mining both -- but note the
+# pairing is then across runs, and run-to-run generation variance is large (it
+# only cancels for arms mined in the SAME run).
+QA_ARMS="${QA_ARMS:-control treatment}"
+case " ${QA_ARMS} " in *" control "*) run_arm control "ARM A -- control (RankIC objective)";; esac
+case " ${QA_ARMS} " in
+    *" treatment "*)
+        # Target = what Arm A actually produced, unless pinned explicitly.
+        if [ -z "${QA_TARGET_ZOO:-}" ]; then
+            A_LIB="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
+            if [ -f "${A_LIB}" ]; then
+                N_A="$(count_factors "${A_LIB}")"
+                [ "${N_A}" -gt 0 ] && export QA_TARGET_ZOO="${N_A}"
+            fi
+        else
+            export QA_TARGET_ZOO
+        fi
+        if [ -n "${QA_TARGET_ZOO:-}" ]; then
+            export QA_MAX_ROUNDS_CAP="${QA_MAX_ROUNDS_CAP:-12}"
+            echo ""
+            echo "  !! BUDGET PARITY BROKEN BY DESIGN"
+            echo "     Arm B mines until |zoo| >= ${QA_TARGET_ZOO} admitted factors"
+            echo "     (Arm A's count), capped at ${QA_MAX_ROUNDS_CAP} rounds."
+            echo "     Arm B searches more than Arm A -- report both budgets."
+        fi
+        run_arm treatment "ARM B -- treatment (net-of-cost U objective)"
+        ;;
+esac
+
+LIB_A="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
+LIB_B="${QA_REUSE_B:-data/factorlib/all_factors_library_treatment_${STAMP}.json}"
+
+# Prefer the zoo subset (the effective-alpha repository) only when it actually
+# holds factors. The control arm runs the stock runner, which never sets
+# `in_zoo`/`feasible`, so its _zoo.json is empty BY CONSTRUCTION -- not because
+# its factors were rejected. Preferring it unconditionally compared zero Arm A
+# factors against Arm B's full repository and handed Arm B a meaningless win.
 pick_library () {
     local full="$1" zoo="${1%.json}_zoo.json"
     if [ -f "${zoo}" ] && [ "$(count_factors "${zoo}")" -gt 0 ]; then

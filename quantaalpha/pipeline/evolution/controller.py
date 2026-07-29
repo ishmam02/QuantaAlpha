@@ -10,6 +10,7 @@ The controller orchestrates the evolutionary process:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -151,9 +152,8 @@ class EvolutionController:
             
             Returns None if evolution is complete.
         """
-        # Check if we've reached max rounds
-        if self._current_round >= self.config.max_rounds:
-            logger.info(f"Evolution complete: reached max rounds ({self.config.max_rounds})")
+        # Round budget: max_rounds, or QA_TARGET_ZOO-driven (see _rounds_exhausted)
+        if self._rounds_exhausted():
             return None
         
         # Phase: ORIGINAL
@@ -180,8 +180,7 @@ class EvolutionController:
         Returns:
             List of task dictionaries, or empty list if phase is complete
         """
-        # Check if we've reached max rounds
-        if self._current_round >= self.config.max_rounds:
+        if self._rounds_exhausted():
             return []
         
         tasks = []
@@ -956,9 +955,69 @@ class EvolutionController:
             extras["feasible"] = bool(series["feasible"])
         return extras
     
+    def _rounds_exhausted(self) -> bool:
+        """Should evolution stop?
+
+        Normally ``max_rounds`` decides. But when the treatment arm gates
+        admission on ``U``, a fixed round count produces a repository whose size
+        depends on how many batches happened to clear the bar -- and factor
+        count moves the combiner independently of factor quality, so an arm that
+        mines the same amount but admits less is handicapped for a reason that
+        has nothing to do with its objective.
+
+        ``QA_TARGET_ZOO`` makes the budget follow the outcome instead of an
+        estimate: keep mining until the repository actually holds that many
+        admitted factors. A guessed multiplier cannot do this -- the admission
+        rate is not known before the run and drifts as the repository improves,
+        which is the whole point of an adaptive bar.
+
+        ``QA_MAX_ROUNDS_CAP`` bounds the cost. Hitting it means the arm could
+        not reach the target, which is itself a result and is logged as such
+        rather than being retried forever.
+        """
+        if self._current_round < self.config.max_rounds:
+            return False
+
+        target = os.environ.get("QA_TARGET_ZOO")
+        if not target:
+            return True
+        try:
+            target_n = int(target)
+        except ValueError:
+            logger.warning(f"QA_TARGET_ZOO={target!r} is not an integer; ignoring")
+            return True
+
+        cap = int(os.environ.get("QA_MAX_ROUNDS_CAP", self.config.max_rounds * 3))
+        try:
+            from quantaalpha.eval.ledger import replay_repository
+
+            admitted = len(replay_repository(os.environ.get("QA_LEDGER")))
+        except Exception as exc:
+            logger.warning(f"cannot size the repository ({exc}); stopping at max_rounds")
+            return True
+
+        if admitted >= target_n:
+            logger.info(
+                f"Evolution complete: repository holds {admitted} admitted factor(s) "
+                f">= QA_TARGET_ZOO={target_n} after round {self._current_round}"
+            )
+            return True
+        if self._current_round >= cap:
+            logger.warning(
+                f"Evolution stopping at the cap ({cap} rounds) with {admitted}/{target_n} "
+                f"admitted factors. The arm could not reach the target: its admission "
+                f"rate is too low for this budget, which is a result, not a retry condition."
+            )
+            return True
+        logger.info(
+            f"Extending evolution past max_rounds: {admitted}/{target_n} admitted "
+            f"factor(s) after round {self._current_round} (cap {cap})"
+        )
+        return False
+
     def is_complete(self) -> bool:
         """Check if evolution is complete."""
-        return self._current_round >= self.config.max_rounds
+        return self._rounds_exhausted()
     
     def get_best_trajectories(self, top_n: int = 5) -> list[StrategyTrajectory]:
         """Get the best performing trajectories."""
