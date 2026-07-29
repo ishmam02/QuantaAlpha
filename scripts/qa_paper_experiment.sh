@@ -4,6 +4,9 @@
 #   ./scripts/qa_paper_experiment.sh "price-volume factor mining"
 #   QA_SEEDS="42 7 13" ./scripts/qa_paper_experiment.sh "..."
 #
+# To survive a closed terminal (this runs for days):
+#   nohup ./scripts/qa_paper_experiment.sh "..." > /tmp/qa_paper.log 2>&1 &
+#
 # This runs for DAYS. Everything it depends on is checked first, because every
 # check in qa_preflight.py corresponds to something that has already cost a
 # full run in this project.
@@ -23,7 +26,7 @@
 # two runs -- but only for arms mined in the SAME run, which is why each seed
 # runs both arms together.
 
-set -euo pipefail
+set -uo pipefail   # NOT -e: a failed seed must not end a days-long run
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${SCRIPT_DIR}"
 
@@ -66,12 +69,22 @@ for SEED in ${QA_SEEDS}; do
     echo "########################################################################"
     # Both arms in ONE invocation: run-to-run variance is common-mode and only
     # cancels in the paired difference when the pair is mined together.
-    QA_SEED="${SEED}" \
-    CONFIG_PATH="${CONFIG_PATH}" \
-    ./scripts/qa_run_arms.sh "${DIRECTION}" 2>&1 | tee "${OUT}/seed_${SEED}.log"
+    # One seed failing must not end a multi-day run: record it and carry on,
+    # because the remaining seeds are still worth having and the paired summary
+    # reports on however many completed.
+    if QA_SEED="${SEED}" CONFIG_PATH="${CONFIG_PATH}" \
+       ./scripts/qa_run_arms.sh "${DIRECTION}" 2>&1 | tee "${OUT}/seed_${SEED}.log"; then
+        echo "seed ${SEED}: completed" >> "${OUT}/status.txt"
+    else
+        echo "seed ${SEED}: FAILED (rc=$?) -- continuing with the remaining seeds" \
+            | tee -a "${OUT}/status.txt"
+    fi
 
     STAMP="$(grep -oE 'stamp     : [0-9_]+' "${OUT}/seed_${SEED}.log" | tail -1 | awk '{print $3}')"
-    [ -z "${STAMP}" ] && { echo "could not determine stamp for seed ${SEED}"; continue; }
+    if [ -z "${STAMP}" ]; then
+        echo "seed ${SEED}: no stamp found, skipping its analysis" >> "${OUT}/status.txt"
+        continue
+    fi
     echo "${SEED} ${STAMP}" >> "${OUT}/stamps.txt"
 
     A="data/factorlib/all_factors_library_control_${STAMP}.json"
@@ -108,6 +121,9 @@ echo "========================================================================"
 PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_paired_summary.py \
     --stamps "${OUT}/stamps.txt" --out "${OUT}/paired_summary.md" || true
 
+echo ""
+echo "Run status:"
+[ -f "${OUT}/status.txt" ] && sed 's/^/  /' "${OUT}/status.txt"
 echo ""
 echo "Artefacts in ${OUT}:"
 ls -1 "${OUT}" | sed 's/^/  /'
