@@ -24,8 +24,23 @@ import pandas as pd
 
 from quantaalpha.eval.execution import drift
 from quantaalpha.eval.protocol import Protocol
+from quantaalpha.eval.tradability import TradeMask
 
 logger = logging.getLogger(__name__)
+
+
+def _swap_cost(theta: Protocol, w_each: float, sigma_i: float, sigma_j: float) -> float:
+    """Modelled round-trip cost of replacing one holding with another.
+
+    Both legs trade ``w_each`` of NAV, so the flat and volatility-scaled terms
+    (Eq. 7) apply twice. Impact is deliberately omitted here: it depends on ADV
+    at the traded name, which the selection step does not carry, and leaving it
+    out makes this hurdle a *lower* bound on the true cost -- so the rule never
+    talks itself into a trade by underestimating what it will pay.
+    """
+    c = theta.costs
+    per_leg = lambda vol: w_each * (c.kappa0 + c.kappa1 * float(vol))
+    return per_leg(sigma_i) + per_leg(sigma_j)
 
 
 def _select(
@@ -33,6 +48,14 @@ def _select(
     held: list[str],
     topk: int,
     n_drop: int,
+    *,
+    theta: Protocol | None = None,
+    can_buy: pd.Series | None = None,
+    can_sell: pd.Series | None = None,
+    sigma: pd.Series | None = None,
+    locked_until: dict[str, int] | None = None,
+    step: int = 0,
+    pred_scale: float = 1.0,
 ) -> list[str]:
     """One rebalance step of top-k dropout.
 
@@ -44,38 +67,88 @@ def _select(
     Dropping "at most" rather than "always" is what makes a constant
     prediction produce zero turnover, which is the behaviour the strategy
     should have: no new information, no trade.
+
+    Three feasibility limits narrow the choices when they are supplied:
+    ``can_buy``/``can_sell`` remove names locked at a price limit or suspended,
+    and ``locked_until`` holds T+1 -- a name bought at step ``s`` cannot be sold
+    before ``s+1``. A name that cannot be sold stays in the book even if its
+    score has collapsed, which is the whole point: that is what actually
+    happens.
+
+    With ``theta.portfolio.cost_aware_dropout``, the number of swaps stops being
+    a quota and becomes a decision. Candidates are considered best-first and a
+    swap is made only while the predicted-return gain clears the modelled
+    round-trip cost, so turnover responds to how much better the alternatives
+    actually are.
     """
     ranked = scores.sort_values(ascending=False)
     available = list(ranked.index)
     if not available:
         return held
 
-    target = available[: min(topk, len(available))]
-    target_set = set(target)
+    buyable = (lambda name: bool(can_buy.get(name, True))) if can_buy is not None else (lambda name: True)
+    sellable = (lambda name: bool(can_sell.get(name, True))) if can_sell is not None else (lambda name: True)
+
+    def can_release(name: str) -> bool:
+        if not sellable(name):
+            return False
+        if locked_until is not None and step < locked_until.get(name, -1):
+            return False
+        return True
 
     live_held = [name for name in held if name in scores.index]
-    if len(live_held) < len(held):
-        logger.debug("top-k dropout: %d held name(s) left the universe", len(held) - len(live_held))
+    dropped_from_universe = [name for name in held if name not in scores.index]
+    if dropped_from_universe:
+        logger.debug("top-k dropout: %d held name(s) left the universe", len(dropped_from_universe))
 
+    # Fresh book: take the best names we are actually allowed to buy.
     if not live_held:
-        return target
+        return [n for n in available if buyable(n)][:topk]
 
-    stale = [name for name in live_held if name not in target_set]
-    n = min(n_drop, len(stale))
+    target = [n for n in available[: min(topk, len(available))]]
+    target_set = set(target)
+    held_set = set(live_held)
 
-    if n:
-        # Drop the worst-ranked of the names that have fallen out of the top-k.
+    stale = [n for n in live_held if n not in target_set and can_release(n)]
+    incoming_pool = [n for n in available if n not in held_set and buyable(n)]
+
+    if not stale or not incoming_pool:
+        new_held = list(live_held)
+    elif theta is not None and theta.portfolio.cost_aware_dropout:
+        # Worst holdings out, best candidates in -- but only while it pays.
+        w_each = float(theta.portfolio.gross_leverage) / max(len(live_held), 1)
+        hurdle = float(theta.portfolio.swap_hurdle)
+        vol = (lambda n: float(sigma.get(n, 0.0)) if sigma is not None else 0.0)
+        worst_first = sorted(stale, key=lambda n: scores[n])
+        swaps: list[tuple[str, str]] = []
+        for out_name, in_name in zip(worst_first, incoming_pool):
+            if len(swaps) >= n_drop:
+                break
+            # pred_scale puts the score gap into expected-return units so it is
+            # comparable with a cost; see execution.prediction_scale.
+            gain = pred_scale * (float(scores[in_name]) - float(scores[out_name]))
+            cost = _swap_cost(theta, w_each, vol(out_name), vol(in_name))
+            if gain <= hurdle * cost:
+                # Candidates are ordered best-first and holdings worst-first, so
+                # once the best remaining swap fails to pay, no later one can.
+                break
+            swaps.append((out_name, in_name))
+        if swaps:
+            out_set = {o for o, _ in swaps}
+            new_held = [n for n in live_held if n not in out_set] + [i for _, i in swaps]
+        else:
+            new_held = list(live_held)
+    else:
+        n = min(n_drop, len(stale))
         worst_first = sorted(stale, key=lambda name: scores[name])
         dropped = set(worst_first[:n])
-        incoming = [name for name in target if name not in set(live_held)][:n]
+        incoming = incoming_pool[:n]
         new_held = [name for name in live_held if name not in dropped] + incoming
-    else:
-        new_held = list(live_held)
 
     # Top up if names were force-dropped for leaving the universe.
     if len(new_held) < topk:
         held_set = set(new_held)
-        new_held += [name for name in available if name not in held_set][: topk - len(new_held)]
+        new_held += [n for n in available if n not in held_set and buyable(n)][: topk - len(new_held)]
 
     return new_held[:topk]
 
@@ -86,6 +159,9 @@ def topk_dropout(
     y_tilde: pd.DataFrame | None = None,
     universe: pd.DataFrame | None = None,
     prev_w: pd.Series | None = None,
+    mask: "TradeMask | None" = None,
+    sigma: pd.DataFrame | None = None,
+    pred_scale: float = 1.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run ``g`` over a prediction panel.
 
@@ -112,7 +188,12 @@ def topk_dropout(
     short_held: list[str] = []
     w_prev = prev_w.reindex(pred.columns).fillna(0.0) if prev_w is not None else None
 
-    for date in pred.index:
+    # T+1: step index at which each holding first becomes sellable.
+    enforce_t1 = bool(theta.constraints.enforce_t1 and theta.constraints.enabled)
+    long_locked: dict[str, int] = {}
+    short_locked: dict[str, int] = {}
+
+    for step, date in enumerate(pred.index):
         scores = pred.loc[date]
         if universe is not None:
             scores = scores.where(universe.loc[date].astype(bool))
@@ -131,9 +212,45 @@ def topk_dropout(
                 else w_prev.copy()
             )
 
-        long_held = _select(scores, long_held, topk, n_drop)
+        row = lambda frame: (
+            frame.loc[date] if frame is not None and date in frame.index else None
+        )
+        can_buy_row = row(mask.can_buy) if mask is not None else None
+        can_sell_row = row(mask.can_sell) if mask is not None else None
+        sigma_row = row(sigma)
+
+        prev_long = set(long_held)
+        long_held = _select(
+            scores, long_held, topk, n_drop, theta=theta,
+            can_buy=can_buy_row, can_sell=can_sell_row, sigma=sigma_row,
+            locked_until=long_locked if enforce_t1 else None, step=step,
+            pred_scale=pred_scale,
+        )
+        if enforce_t1:
+            for name in long_held:
+                if name not in prev_long:
+                    long_locked[name] = step + 1        # sellable from the next step
+            for name in list(long_locked):
+                if name not in long_held:
+                    long_locked.pop(name, None)
+
         if signed:
-            short_held = _select(-scores, short_held, topk, n_drop)
+            prev_short = set(short_held)
+            short_held = _select(
+                -scores, short_held, topk, n_drop, theta=theta,
+                # A short entry sells and a short exit buys, so the buy/sell
+                # feasibility of the underlying is the other way round.
+                can_buy=can_sell_row, can_sell=can_buy_row, sigma=sigma_row,
+                locked_until=short_locked if enforce_t1 else None, step=step,
+                pred_scale=pred_scale,
+            )
+            if enforce_t1:
+                for name in short_held:
+                    if name not in prev_short:
+                        short_locked[name] = step + 1
+                for name in list(short_locked):
+                    if name not in short_held:
+                        short_locked.pop(name, None)
 
         w = pd.Series(0.0, index=pred.columns)
         if signed:

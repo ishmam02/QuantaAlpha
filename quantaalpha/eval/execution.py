@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 
 from quantaalpha.eval.data import PanelBundle
@@ -87,6 +88,50 @@ def drift(w_prev: pd.Series, y_tilde: pd.Series, theta: Protocol | None = None) 
     return positions / nav_post
 
 
+def prediction_scale(
+    pred: pd.DataFrame,
+    y_tilde: pd.DataFrame,
+    window: tuple[str, str],
+) -> float:
+    """β converting a prediction score into expected-return units.
+
+    The combiner trains on a ``CSRankNorm``-ed label, so its output is a
+    cross-sectional rank score, **not** an expected return. Measured on a real
+    fitted model the typical top-vs-median prediction gap is ~0.091 while the
+    modelled round-trip cost is ~0.0001 -- a factor of ~900. Comparing the two
+    directly, as a cost-aware trading rule must, is dimensionally meaningless:
+    the gain always wins and the rule silently degenerates into the fixed-quota
+    construction it was meant to replace.
+
+    β is the OLS slope of realised return on prediction, ``cov(p,r)/var(p)``,
+    so ``β·(ŷ_j − ŷ_i)`` is the expected return pickup from swapping i for j and
+    can be compared with a cost in the same units.
+
+    Fitted on the **training window only**. It is a property of the model, not
+    of the evaluation period, and estimating it on the evaluation window would
+    leak realised returns into the trading rule.
+    """
+    start, end = window
+    p = pred.loc[str(start):str(end)]
+    r = y_tilde.reindex(index=p.index, columns=p.columns)
+    joint = pd.concat([p.stack(), r.stack()], axis=1, keys=["p", "r"]).dropna()
+    if len(joint) < 100:
+        logger.warning("prediction_scale: only %d paired points; falling back to 1.0", len(joint))
+        return 1.0
+    var = float(joint["p"].var())
+    if not np.isfinite(var) or var <= 0:
+        return 1.0
+    beta = float(joint["p"].cov(joint["r"]) / var)
+    if not np.isfinite(beta) or beta <= 0:
+        # A non-positive slope means the model has no in-sample edge at all;
+        # scaling by it would invert the trading rule. Refuse rather than trade
+        # on a sign we do not believe.
+        logger.warning("prediction_scale: non-positive slope %.6g; falling back to 1.0", beta)
+        return 1.0
+    logger.info("prediction_scale: beta=%.6g on %s..%s (%d points)", beta, start, end, len(joint))
+    return beta
+
+
 def turnover(w: pd.Series, w_drift: pd.Series) -> float:
     """TO_t (Eq. 6) — one-way turnover, in [0, 1].
 
@@ -97,4 +142,4 @@ def turnover(w: pd.Series, w_drift: pd.Series) -> float:
     return 0.5 * float((aligned_w - aligned_drift).abs().sum())
 
 
-__all__ = ["drift", "fill_prices", "realized_return", "turnover"]
+__all__ = ["drift", "fill_prices", "prediction_scale", "realized_return", "turnover"]

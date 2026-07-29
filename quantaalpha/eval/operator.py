@@ -37,7 +37,7 @@ import pandas as pd
 from quantaalpha.eval import combiner as combiner_mod
 from quantaalpha.eval import costs as costs_mod
 from quantaalpha.eval.data import PanelBundle, align_signal, load_benchmark, load_panel
-from quantaalpha.eval.execution import fill_prices, realized_return
+from quantaalpha.eval.execution import fill_prices, prediction_scale, realized_return
 from quantaalpha.eval.metrics import (
     cx,
     prediction_metrics,
@@ -46,6 +46,7 @@ from quantaalpha.eval.metrics import (
 )
 from quantaalpha.eval.portfolio import topk_dropout
 from quantaalpha.eval.protocol import Protocol
+from quantaalpha.eval.tradability import trade_mask
 from quantaalpha.eval.scoring import dimension_scores, utility
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,16 @@ class EvaluationOperator:
         # Baseline books keyed by (zoo_hash, window) -- one fit per repository
         # state, not per candidate.
         self._baselines: dict[tuple, dict] = {}
+        self._masks: dict[tuple, object] = {}
 
     # ------------------------------------------------------------------
+    def _trade_mask(self, panel: PanelBundle):
+        """Feasibility masks for a panel, built once and reused."""
+        key = (panel.dates[0], panel.dates[-1], len(panel.instruments))
+        if key not in self._masks:
+            self._masks[key] = trade_mask(panel, self.theta)
+        return self._masks[key]
+
     def _panel(self, start: str, end: str) -> PanelBundle:
         key = (start, end)
         if key not in self._panels:
@@ -235,12 +244,27 @@ class EvaluationOperator:
         y_tilde = realized_return(fill_prices(panel, self.theta))
         universe = panel.universe.loc[window_pred.index]
 
-        w, w_drift = topk_dropout(
-            window_pred, self.theta, y_tilde=y_tilde, universe=universe
-        )
-
         sigma = costs_mod.trailing_vol(panel.close, self.theta.costs.vol_window)
         adv = costs_mod.trailing_adv(panel, self.theta)
+
+        # Hard A-share feasibility (price limits, suspensions, T+1). Cached per
+        # panel: the masks depend only on prices and Theta, never on the
+        # prediction, so rebuilding them per candidate would be pure waste.
+        mask = self._trade_mask(panel)
+
+        # Put the prediction into expected-return units before the trading rule
+        # compares it with a cost. Fitted on the TRAINING split only, so the
+        # rule never sees realised returns from the window it is evaluated on.
+        beta = 1.0
+        if self.theta.portfolio.cost_aware_dropout:
+            beta = prediction_scale(
+                prediction, y_tilde, self.theta.splits.window(self.theta.combiner.fit_split)
+            )
+
+        w, w_drift = topk_dropout(
+            window_pred, self.theta, y_tilde=y_tilde, universe=universe,
+            mask=mask, sigma=sigma, pred_scale=beta,
+        )
 
         charges = pd.Series(
             [

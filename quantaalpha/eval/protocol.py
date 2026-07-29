@@ -107,13 +107,59 @@ class Combiner:
 
 @dataclass(frozen=True)
 class Portfolio:
-    """The portfolio map ``g`` (Eq. 6). Stateful: w_t = g(ŷ_t, w_drift_t)."""
+    """The portfolio map ``g`` (Eq. 6). Stateful: w_t = g(ŷ_t, w_drift_t).
+
+    ``cost_aware_dropout`` changes what ``n_drop`` means. With it off, exactly
+    ``n_drop`` names are swapped whenever that many have fallen out of the
+    top-k, so book turnover is pinned at ``n_drop/topk`` -- measured at
+    0.1050-0.1060 across every configuration tested, which leaves the turnover
+    dimension of ``U`` carrying no information and the cost model applying to a
+    constant trade volume. A capacity-aware objective cannot express itself
+    against a construction that trades the same amount whatever it predicts.
+
+    With it on, ``n_drop`` becomes a cap rather than a quota, and a swap happens
+    only when the predicted-return gain clears the modelled round-trip cost.
+    Turnover then becomes endogenous: persistent signals trade little, noisy
+    ones trade more and pay for it.
+    """
 
     construction: str = "topk_dropout"
     topk: int = 50
     n_drop: int = 5
     signed: bool = False
     gross_leverage: float = 1.0
+    cost_aware_dropout: bool = False
+    # Gain must exceed cost by this multiple before a swap is worth making. 1.0
+    # is break-even on the modelled cost; above 1.0 demands a margin of safety
+    # against the cost model itself being optimistic.
+    swap_hurdle: float = 1.0
+
+
+@dataclass(frozen=True)
+class Constraints:
+    """Hard A-share feasibility limits (see ``eval/tradability.py``).
+
+    These are market mechanics, not costs, and they apply to both arms: a
+    comparison in which one objective is allowed to trade the untradeable is
+    not a comparison. Defaults are the main-board rules; ``enabled: false``
+    restores the unconstrained behaviour for backwards comparison.
+    """
+
+    enabled: bool = True
+    enforce_price_limits: bool = True
+    enforce_suspension: bool = True
+    # T+1 is STRUCTURALLY NON-BINDING for a once-daily book and is off by
+    # default for that reason. A name entering at step s has its buy filled at
+    # s+delta, and the earliest sale decision is step s+1, filling at
+    # s+1+delta -- always at least one session apart, whatever delta is. The
+    # machinery is kept because it would bind the moment the rebalance becomes
+    # intraday, but enabling it at daily frequency changes no book and claiming
+    # it as a modelled constraint would overstate the realism of the result.
+    enforce_t1: bool = False
+    # Main board ±10%. ST names are ±5% and STAR/ChiNext ±20%; using the
+    # main-board band on a mixed universe under-detects locks on ST names
+    # rather than inventing ones that did not happen.
+    price_limit_pct: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -218,6 +264,7 @@ class Protocol:
     combiner: Combiner
     portfolio: Portfolio
     costs: Costs
+    constraints: Constraints
     gates: Gates
     decay: Decay
     overfit: Overfit
@@ -337,6 +384,8 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
     portfolio = _build(Portfolio, dict(raw["portfolio"]))
     if portfolio.n_drop > portfolio.topk:
         raise ValueError("portfolio.n_drop cannot exceed portfolio.topk")
+    if portfolio.swap_hurdle < 0:
+        raise ValueError("portfolio.swap_hurdle must be non-negative")
 
     gates = _build(Gates, dict(raw["gates"]))
     if gates.turnover_basis not in ("book", "solo"):
@@ -352,6 +401,7 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
         combiner=combiner,
         portfolio=portfolio,
         costs=_build(Costs, dict(raw["costs"])),
+        constraints=_build(Constraints, dict(raw.get("constraints", {}))),
         gates=gates,
         decay=_build(Decay, dict(raw["decay"])),
         overfit=_build(Overfit, dict(raw["overfit"])),
