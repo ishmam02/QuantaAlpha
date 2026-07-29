@@ -86,11 +86,17 @@ run_arm () {
     ./run.sh "${DIRECTION}" 2>&1 | tee "/tmp/qa_${id}.log"
 }
 
-run_arm control   "ARM A -- control (RankIC objective)"
-run_arm treatment "ARM B -- treatment (net-of-cost U objective)"
+# QA_ARMS selects which arms to mine; QA_REUSE_A/B supply an already-mined
+# library for an arm being skipped. Re-running one arm after a code change that
+# cannot affect the other is far cheaper than re-mining both -- but note the
+# pairing is then across runs, and run-to-run generation variance is large (it
+# only cancels for arms mined in the SAME run).
+QA_ARMS="${QA_ARMS:-control treatment}"
+case " ${QA_ARMS} " in *" control "*) run_arm control "ARM A -- control (RankIC objective)";; esac
+case " ${QA_ARMS} " in *" treatment "*) run_arm treatment "ARM B -- treatment (net-of-cost U objective)";; esac
 
-LIB_A="data/factorlib/all_factors_library_control_${STAMP}.json"
-LIB_B="data/factorlib/all_factors_library_treatment_${STAMP}.json"
+LIB_A="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
+LIB_B="${QA_REUSE_B:-data/factorlib/all_factors_library_treatment_${STAMP}.json}"
 
 # Prefer the zoo subset (the effective-alpha repository) only when it actually
 # holds factors. The control arm runs the stock runner, which never sets

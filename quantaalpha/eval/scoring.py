@@ -50,13 +50,23 @@ def _usable(value) -> bool:
 def rank(value: float, incumbent_values: Iterable[float]) -> float:
     """R (Eq. 11) — fraction of the repository that beats ``value``.
 
-    ``0.0`` for an empty zoo, so ``e_j = 1``: the first factor is trivially the
-    best thing in the book, which is the only coherent convention when there is
-    nothing to compare against.
+    Eq. 11 carries a ``1/|zoo|`` factor and is therefore undefined at
+    ``|zoo| = 0``; this is where that case is pinned down.
+
+    **Neutral (``0.5``), not ``0.0``.** Returning ``0.0`` makes ``e_j = 1`` on
+    every dimension, so a batch ranked against nothing scores near the maximum
+    ``U`` -- and since evolutionary fitness is ``U`` under the treatment arm,
+    the very first batch becomes a fitness leader no legitimately-scored batch
+    can overtake. Measured on run 20260728_151227: batch 1 scored ``U=0.9500``
+    against an empty repository while batches 2-6, scored against real
+    incumbents, reached at most ``0.3750`` -- and those five ranked in exactly
+    their net-ARR order, so the ranking was working and only the empty case was
+    broken. With nothing to compare against, a candidate is neither above nor
+    below the repository, which is what ``0.5`` says.
     """
     values = [v for v in incumbent_values if _usable(v)]
     if not values:
-        return 0.0
+        return 0.5
     beaten_by = sum(1 for v in values if value < v)
     return float(beaten_by) / float(len(values))
 

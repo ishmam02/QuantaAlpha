@@ -130,3 +130,26 @@ utility:
     diversity: 0.15
     overfit: 0.10
     decay: 0.00 # optional diagnostic (Remark 1); off by default
+
+# ---------------------------------------------------------------------------
+# Admission: when U admits a candidate batch to the repository, and when a
+# member that has fallen behind is evicted (Eq. 12 / section 3.4).
+#
+# U is a weighted mean of percentile complements, so 0.5 is "better than the
+# median incumbent" -- the adaptive bar the formulation describes: constant in
+# value, rising in the standard it encodes as the repository improves.
+#
+# tau_evict sits below tau_admit deliberately. About half of any repository is
+# below its own median by construction, so evicting at the admission bar would
+# drop half the members every round and cascade toward empty. The gap is
+# hysteresis: a factor must fall clearly behind, not merely below average.
+#
+# min_size spans two batches rather than one. Factors evaluated together share
+# a metric vector, so a repository bootstrapped from a single batch holds one
+# distinct point and every percentile collapses to 0 or 1; two batches give the
+# ranking something to interpolate between.
+admission:
+  enabled: true
+  tau_admit: 0.50
+  tau_evict: 0.25
+  min_size: 6

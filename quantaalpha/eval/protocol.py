@@ -179,6 +179,33 @@ class Utility:
 
 
 @dataclass(frozen=True)
+class Admission:
+    """When ``U`` admits a candidate to the repository, and when it evicts one.
+
+    ``U`` is a weighted mean of percentile complements, so ``0.5`` is literally
+    "the median incumbent". Admitting at ``0.5`` is therefore the adaptive bar
+    §3.4 describes: the threshold is constant while the standard it encodes
+    rises with the repository.
+
+    ``tau_evict`` must sit **below** ``tau_admit``. Because every member's score
+    is a percentile within the repository, roughly half of them fall below the
+    median by construction -- evicting at the admission bar would drop half the
+    repository every round and cascade toward empty. The gap between the two
+    thresholds is hysteresis: a factor has to fall clearly behind, not merely
+    below average, before it is dropped.
+
+    ``min_size`` bootstraps the process. Ranking against nothing is
+    uninformative (see ``scoring.rank``), so the first few batches are admitted
+    unconditionally, and eviction never shrinks the repository below this.
+    """
+
+    enabled: bool = True
+    tau_admit: float = 0.5
+    tau_evict: float = 0.25
+    min_size: int = 3
+
+
+@dataclass(frozen=True)
 class Protocol:
     """Θ. Frozen, hashable, and the sole source of every evaluation knob."""
 
@@ -195,6 +222,7 @@ class Protocol:
     decay: Decay
     overfit: Overfit
     utility: Utility
+    admission: Admission = field(default_factory=Admission)
 
     def __post_init__(self) -> None:
         # Copy mutable containers so a caller holding a reference to the parsed
@@ -295,6 +323,17 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
     if abs(omega_sum - 1.0) > 1e-9:
         raise ValueError(f"utility.omega must sum to 1, got {omega_sum!r}")
 
+    admission = _build(Admission, dict(raw.get("admission", {})))
+    if not 0.0 <= admission.tau_evict <= admission.tau_admit <= 1.0:
+        # Without hysteresis the repository oscillates: U is a percentile, so
+        # about half the members sit below the admission bar at any moment.
+        raise ValueError(
+            f"admission requires 0 <= tau_evict <= tau_admit <= 1, got "
+            f"tau_evict={admission.tau_evict}, tau_admit={admission.tau_admit}"
+        )
+    if admission.min_size < 1:
+        raise ValueError("admission.min_size must be at least 1")
+
     portfolio = _build(Portfolio, dict(raw["portfolio"]))
     if portfolio.n_drop > portfolio.topk:
         raise ValueError("portfolio.n_drop cannot exceed portfolio.topk")
@@ -317,6 +356,7 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
         decay=_build(Decay, dict(raw["decay"])),
         overfit=_build(Overfit, dict(raw["overfit"])),
         utility=utility,
+        admission=admission,
     )
 
 

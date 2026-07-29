@@ -33,6 +33,7 @@ from quantaalpha.eval.data import load_factor_signal
 from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger
 from quantaalpha.eval.operator import EvaluationOperator
 from quantaalpha.eval.protocol import default_protocol_path, load_protocol
+from quantaalpha.eval.scoring import utility
 from quantaalpha.factors.experiment import QlibFactorExperiment
 from quantaalpha.factors.runner import QlibFactorRunner
 from quantaalpha.llm.client import md5_hash
@@ -195,19 +196,97 @@ class NetCostFactorRunner(QlibFactorRunner):
             }
         )
 
-        # Every mined factor joins the repository -- there is no admission step.
-        # U differentiates experiments by SCORE, dynamically, against the
-        # repository as it stands.
         batch_metrics = {k[2:]: v for k, v in res.items() if k.startswith("m_")}
-        for expr, signal in candidates.items():
-            self._repository[expr] = (signal, batch_metrics)
-        logger.info(
-            "repository: +%d factor(s) from this experiment; |zoo| = %d",
-            len(candidates), len(self._repository),
-        )
+        admitted = self._admit(float(res["U"]), candidates, batch_metrics)
+        res["admitted"] = admitted
+        if admitted:
+            evicted = self._prune()
+            res["evicted"] = len(evicted)
 
         exp.result = self._to_series(res)
         return exp
+
+    # ------------------------------------------------------------------
+    def _admit(self, u: float, candidates: dict, batch_metrics: dict) -> bool:
+        """Gate the batch on ``U`` (Eq. 12) against Θ's admission bar.
+
+        ``U`` is a weighted mean of percentile complements, so ``tau_admit=0.5``
+        means "better than the median incumbent". That is the adaptive bar of
+        §3.4: the number is constant while the standard it encodes rises as the
+        repository improves.
+
+        The first ``min_size`` factors are admitted unconditionally. They are
+        scored against an empty or near-empty repository, where the rank carries
+        no information (``scoring.rank`` returns a neutral 0.5), so gating on it
+        would be arbitrary.
+        """
+        adm = self.theta.admission
+        n = len(self._repository)
+        if not adm.enabled or n < adm.min_size:
+            reason = "gating disabled" if not adm.enabled else (
+                f"bootstrapping (|zoo|={n} < min_size={adm.min_size})")
+            for expr, signal in candidates.items():
+                self._repository[expr] = (signal, batch_metrics)
+            logger.info("repository: +%d factor(s) admitted unconditionally, %s; |zoo| = %d",
+                        len(candidates), reason, len(self._repository))
+            return True
+
+        if u < adm.tau_admit:
+            logger.info(
+                "repository: REJECTED %d factor(s), U=%.4f < tau_admit=%.2f; |zoo| = %d",
+                len(candidates), u, adm.tau_admit, n,
+            )
+            return False
+
+        for expr, signal in candidates.items():
+            self._repository[expr] = (signal, batch_metrics)
+        logger.info("repository: +%d factor(s), U=%.4f >= tau_admit=%.2f; |zoo| = %d",
+                    len(candidates), u, adm.tau_admit, len(self._repository))
+        return True
+
+    def _prune(self) -> list[str]:
+        """Evict incumbents that have fallen behind the repository they are in.
+
+        Each member is re-scored against the repository *excluding itself*, so
+        the comparison is against its peers rather than against a set containing
+        it. A member drops out when that score falls below ``tau_evict``.
+
+        Eviction uses a lower bar than admission on purpose. ``U`` is a
+        percentile, so about half of any repository sits below the median at any
+        moment; evicting at ``tau_admit`` would drop half the members every
+        round and cascade toward empty. The gap is hysteresis -- a factor must
+        fall clearly behind, not merely below average.
+
+        Granularity note: factors admitted in the same batch share one metric
+        vector, so they are ranked identically and leave together. Eviction is
+        therefore effectively per-batch, which is the finest granularity the
+        batch evaluation supports.
+        """
+        adm = self.theta.admission
+        if not adm.enabled or len(self._repository) <= adm.min_size:
+            return []
+
+        entries = list(self._repository.items())
+        scored = []
+        for expr, (signal, metrics) in entries:
+            peers = [m for other, (_, m) in entries if other != expr]
+            scored.append((utility(metrics, peers, self.theta), expr, signal, metrics))
+
+        # Never shrink below min_size: if too many fall behind, keep the best.
+        scored.sort(key=lambda row: row[0], reverse=True)
+        keep_floor = {row[1] for row in scored[: adm.min_size]}
+        evicted = [
+            expr for u, expr, _, _ in scored
+            if u < adm.tau_evict and expr not in keep_floor
+        ]
+        for expr in evicted:
+            del self._repository[expr]
+        if evicted:
+            logger.info(
+                "repository: EVICTED %d factor(s) with U < tau_evict=%.2f; |zoo| = %d",
+                len(evicted), adm.tau_evict, len(self._repository),
+            )
+        return evicted
 
     # ------------------------------------------------------------------
     def _zoo(self, exp: QlibFactorExperiment) -> tuple[dict[str, Any], list[dict]]:
@@ -317,10 +396,11 @@ class NetCostFactorRunner(QlibFactorRunner):
             "mdd": res.get("m_mdd"),
             "U": res.get("U"),
             "n_factors": res.get("n_factors"),
-            # Every evaluable factor enters the repository now that the absolute
-            # floors are gone; this flag is what the library uses to emit the
-            # zoo subset, and it stays meaningful if a gate is ever re-enabled.
-            "in_zoo": True,
+            # The real admission decision, not a constant. This is what the
+            # library reads to emit the zoo subset, so a rejected batch is
+            # absent from <library>_zoo.json while still appearing in the full
+            # library -- which is the whole point of keeping both files.
+            "in_zoo": bool(res.get("admitted", True)),
             "theta_hash": res.get("theta_hash"),
             "zoo_hash": res.get("zoo_hash"),
             "zoo_size": res.get("zoo_size"),
