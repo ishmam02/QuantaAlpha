@@ -181,27 +181,37 @@ class NetCostFactorRunner(QlibFactorRunner):
 
         names = [str(c) for c in new_factors.columns]
         res["factor_name"] = ", ".join(names)
-        self.ledger.append(
-            {
-                "factor_ids": [md5_hash(f"{n}_{e}")[:16] for n, e in zip(names, candidates)],
-                "factor_names": names,
-                "factor_exprs": list(candidates),
-                "n_factors": len(candidates),
-                "theta_hash": res["theta_hash"],
-                "zoo_hash": res["zoo_hash"],
-                "zoo_size": res["zoo_size"],
-                "metrics": {k[2:]: v for k, v in res.items() if k.startswith("m_")},
-                "e": {k[2:]: v for k, v in res.items() if k.startswith("e_")},
-                "U": res["U"],
-            }
-        )
 
+        # Decide BEFORE writing the ledger. The ledger is what sibling processes
+        # rehydrate the repository from, so a record written ahead of the
+        # decision re-admits a rejected batch through the back door -- which is
+        # exactly what happened on run 20260729_075350, where two batches logged
+        # as REJECTED were still recorded with their factor_exprs.
         batch_metrics = {k[2:]: v for k, v in res.items() if k.startswith("m_")}
         admitted = self._admit(float(res["U"]), candidates, batch_metrics)
         res["admitted"] = admitted
         if admitted:
-            evicted = self._prune()
-            res["evicted"] = len(evicted)
+            res["evicted"] = len(self._prune())
+
+        self.ledger.append(
+            {
+                "factor_ids": [md5_hash(f"{n}_{e}")[:16] for n, e in zip(names, candidates)],
+                "factor_names": names,
+                # Only an ADMITTED batch contributes incumbents. A rejected one
+                # is still recorded -- the ledger is the audit trail of every
+                # evaluation -- but under a key rehydration ignores.
+                "factor_exprs": list(candidates) if admitted else [],
+                "rejected_exprs": [] if admitted else list(candidates),
+                "admitted": admitted,
+                "n_factors": len(candidates),
+                "theta_hash": res["theta_hash"],
+                "zoo_hash": res["zoo_hash"],
+                "zoo_size": res["zoo_size"],
+                "metrics": batch_metrics,
+                "e": {k[2:]: v for k, v in res.items() if k.startswith("e_")},
+                "U": res["U"],
+            }
+        )
 
         exp.result = self._to_series(res)
         return exp
@@ -243,6 +253,21 @@ class NetCostFactorRunner(QlibFactorRunner):
         logger.info("repository: +%d factor(s), U=%.4f >= tau_admit=%.2f; |zoo| = %d",
                     len(candidates), u, adm.tau_admit, len(self._repository))
         return True
+
+    @staticmethod
+    def _weakest(res: dict, k: int = 2) -> str:
+        """The k dimensions this batch scored worst on, named for the prompt.
+
+        e_j is a percentile complement, so a low value means "most of the
+        repository beats you here". Naming the two weakest turns a rejection
+        into an instruction.
+        """
+        scores = [(v, key[2:]) for key, v in res.items()
+                  if key.startswith("e_") and isinstance(v, (int, float))]
+        if not scores:
+            return ""
+        scores.sort()
+        return ", ".join(f"{name} (e={value:.2f})" for value, name in scores[:k])
 
     def _prune(self) -> list[str]:
         """Evict incumbents that have fallen behind the repository they are in.
@@ -417,6 +442,13 @@ class NetCostFactorRunner(QlibFactorRunner):
             # absent from <library>_zoo.json while still appearing in the full
             # library -- which is the whole point of keeping both files.
             "in_zoo": bool(res.get("admitted", True)),
+            # Carried into the evolution prompts so a rejected parent tells the
+            # generator what to fix, not merely that it failed. Without these
+            # the gate only removes factors; with them it steers the search,
+            # which is the point of a repository-relative objective.
+            "admitted": bool(res.get("admitted", True)),
+            "tau_admit": self.theta.admission.tau_admit,
+            "weakest_dimensions": self._weakest(res),
             "theta_hash": res.get("theta_hash"),
             "zoo_hash": res.get("zoo_hash"),
             "zoo_size": res.get("zoo_size"),

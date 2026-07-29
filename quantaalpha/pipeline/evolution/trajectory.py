@@ -71,13 +71,33 @@ def format_objective_note(traj) -> str:
         return ""
 
     parts = [f"Objective U = {format_metric(metrics.get('U'))}"]
-    if metrics.get("feasible", True):
+
+    # `admitted` is the live signal: U gates entry to the repository, and the
+    # runner records the decision. `feasible` is the older absolute-gate flag,
+    # kept as a fallback so a re-enabled gate still reports. Defaulting both to
+    # True means a control-arm trajectory reads exactly as it always did.
+    admitted = metrics.get("admitted", metrics.get("feasible", True))
+    if admitted:
         parts.append("ADMITTED to the repository")
     else:
+        tau = metrics.get("tau_admit")
+        bar = f" < admission bar {format_metric(tau)}" if tau is not None else ""
+        parts.append(f"REJECTED{bar} -- these factors did NOT enter the repository")
+        weak = metrics.get("weakest_dimensions")
+        if weak:
+            # The whole point of surfacing this: "rejected" alone is not
+            # actionable, but "you were beaten on effectiveness and arr" tells
+            # the generator which property of the next candidate has to change.
+            parts.append(f"weakest dimensions vs the repository: {weak}")
+            parts.append(
+                "To be admitted, the next candidate must beat the median incumbent "
+                "on these dimensions -- the bar rises as the repository improves"
+            )
         failed = metrics.get("failed_gates") or ""
         names = [n.strip() for n in (failed.split(",") if isinstance(failed, str) else failed) if str(n).strip()]
         reasons = _describe_gate_failures(metrics, names)
-        parts.append("REJECTED by the feasibility gates" + (f" ({'; '.join(reasons)})" if reasons else ""))
+        if reasons:
+            parts.append("; ".join(reasons))
     return " | ".join(parts)
 
 

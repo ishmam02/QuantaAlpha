@@ -182,7 +182,13 @@ if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
     export QLIB_FACTOR_RUNNER="quantaalpha.factors.net_cost_runner.NetCostFactorRunner"
     export QLIB_FACTOR_SUMMARIZER="quantaalpha.factors.net_cost_feedback.NetCostFactorFeedback"
     export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-U}"
-    export QA_REQUIRE_FEASIBLE="${QA_REQUIRE_FEASIBLE:-true}"
+    # Rejection is FEEDBACK, not exclusion. Filtering rejected factors out of
+    # the parent pool would keep the generator from ever seeing why they were
+    # rejected, so it could not learn to clear the bar -- the gate would only
+    # shrink the repository instead of raising the quality of what enters it.
+    # U already ranks parents, so a rejected factor is deprioritised without
+    # being silenced. Set to true to restore hard exclusion.
+    export QA_REQUIRE_FEASIBLE="${QA_REQUIRE_FEASIBLE:-false}"
     # Absolute paths: the loop runs factor code inside per-factor workspaces, and
     # a relative protocol/ledger path would resolve against whatever the cwd
     # happens to be at that moment.
