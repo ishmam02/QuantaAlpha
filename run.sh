@@ -42,6 +42,16 @@ else
     exit 1
 fi
 
+# QA_CHAT_SEED overrides CHAT_SEED *after* .env is sourced. Sourcing .env
+# assigns CHAT_SEED unconditionally, so an exported value is silently clobbered
+# -- which would have left every replication of a paper run on an identical LLM
+# seed, varying only the evolution operators' RNG. The 4.05pp of run-to-run
+# variance measured here is generation noise, and sampling it means resampling
+# the generator, not just the parent-selection shuffle.
+if [ -n "${QA_CHAT_SEED:-}" ]; then
+    export CHAT_SEED="${QA_CHAT_SEED}"
+fi
+
 # =============================================================================
 # Activate conda environment
 # =============================================================================

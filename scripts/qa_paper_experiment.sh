@@ -16,6 +16,7 @@
 #   * the E_Theta comparison (full cost model) and the flat-fee comparison
 #   * the admission trajectory (does U's feedback teach?)
 # and once at the end:
+#   * the construction sweep (topk_dropout vs mean_variance)
 #   * the capacity curve (net IR vs NAV) for every library
 #   * a summary of the PAIRED difference across seeds
 #
@@ -38,6 +39,17 @@ OUT="data/results/${RUN_ID}"
 mkdir -p "${OUT}"
 
 [ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
+
+# QA_CHAT_SEED overrides CHAT_SEED *after* .env is sourced. Sourcing .env
+# unconditionally assigns CHAT_SEED, so an exported value is silently clobbered
+# -- which would have left every replication of a paper run using an identical
+# LLM seed, varying only the evolution operators' RNG. The measured 4.05pp of
+# run-to-run variance is generation noise, and sampling it properly means
+# resampling the generator, not just the parent-selection shuffle.
+if [ -n "${QA_CHAT_SEED:-}" ]; then
+    export CHAT_SEED="${QA_CHAT_SEED}"
+fi
+
 eval "$(conda shell.bash hook)" 2>/dev/null || true
 conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || \
     source activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || true
@@ -72,7 +84,10 @@ for SEED in ${QA_SEEDS}; do
     # One seed failing must not end a multi-day run: record it and carry on,
     # because the remaining seeds are still worth having and the paired summary
     # reports on however many completed.
-    if QA_SEED="${SEED}" CONFIG_PATH="${CONFIG_PATH}" \
+    # Vary BOTH seeds: QA_SEED reseeds the evolution operators, QA_CHAT_SEED
+    # the generator itself. Holding the latter fixed would sample a much
+    # narrower slice of the variation that actually dominates this study.
+    if QA_SEED="${SEED}" QA_CHAT_SEED="${SEED}" CONFIG_PATH="${CONFIG_PATH}" \
        ./scripts/qa_run_arms.sh "${DIRECTION}" 2>&1 | tee "${OUT}/seed_${SEED}.log"; then
         echo "seed ${SEED}: completed" >> "${OUT}/status.txt"
     else
@@ -101,6 +116,20 @@ for SEED in ${QA_SEEDS}; do
         [ -f "data/results/${f}_${STAMP}.md" ] && cp "data/results/${f}_${STAMP}.md" "${OUT}/" || true
     done
 done
+
+# ---- construction sweep: does g change the conclusion? ----
+# Runs before capacity because it answers a prior question: whether the cost
+# model can act on the book at all. Under top-k dropout turnover is pinned, so
+# a capacity number measured there says more about n_drop than about capacity.
+if [ ${#LIBS[@]} -gt 0 ]; then
+    echo ""
+    echo "========================================================================"
+    echo "  CONSTRUCTION SWEEP -- topk_dropout vs mean_variance"
+    echo "========================================================================"
+    PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_construction_sweep.py \
+        "${LIBS[@]}" --seeds "${QA_SEEDS_COMBINER:-42}" \
+        --out "${OUT}/construction.md" || true
+fi
 
 # ---- capacity: one curve per library, no new mining ----
 if [ ${#LIBS[@]} -gt 0 ]; then

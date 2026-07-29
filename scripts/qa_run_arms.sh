@@ -28,6 +28,17 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 # interpreter and the post-run comparison dies on `No module named 'qlib'` --
 # after both arms have already spent their LLM budget.
 [ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
+
+# QA_CHAT_SEED overrides CHAT_SEED *after* .env is sourced. Sourcing .env
+# unconditionally assigns CHAT_SEED, so an exported value is silently clobbered
+# -- which would have left every replication of a paper run using an identical
+# LLM seed, varying only the evolution operators' RNG. The measured 4.05pp of
+# run-to-run variance is generation noise, and sampling it properly means
+# resampling the generator, not just the parent-selection shuffle.
+if [ -n "${QA_CHAT_SEED:-}" ]; then
+    export CHAT_SEED="${QA_CHAT_SEED}"
+fi
+
 eval "$(conda shell.bash hook)" 2>/dev/null || true
 conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || \
     source activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || true
