@@ -34,6 +34,14 @@ cd "${SCRIPT_DIR}"
 DIRECTION="${1:?usage: $0 \"<research direction>\"}"
 CONFIG_PATH="${CONFIG_PATH:-configs/experiment_paper.yaml}"
 QA_SEEDS="${QA_SEEDS:-42 7 13}"
+# Arm B is mined once per construction. g is not a reporting choice for the
+# treatment arm: its in-loop evaluation builds the book through g, so under
+# topk_dropout -- where turnover is pinned at n_drop/topk -- the capacity-aware
+# objective is optimising against a book it cannot change the trading of. That
+# variant isolates the OBJECTIVE (only the objective differs from Arm A);
+# mean_variance is the treatment the formulation actually proposes. Both pair
+# against the SAME Arm A from the same seed, so within-run pairing holds.
+QA_ARM_B_CONSTRUCTIONS="${QA_ARM_B_CONSTRUCTIONS:-topk_dropout mean_variance}"
 RUN_ID="paper_$(date +%Y%m%d_%H%M%S)"
 OUT="data/results/${RUN_ID}"
 mkdir -p "${OUT}"
@@ -62,6 +70,10 @@ echo "------------------------------------------------------------------------"
 echo "  direction : ${DIRECTION}"
 echo "  config    : ${CONFIG_PATH}"
 echo "  seeds     : ${QA_SEEDS}"
+echo "  Arm B g   : ${QA_ARM_B_CONSTRUCTIONS}"
+N_SEEDS=$(echo ${QA_SEEDS} | wc -w | tr -d ' ')
+N_CONS=$(echo ${QA_ARM_B_CONSTRUCTIONS} | wc -w | tr -d ' ')
+echo "  mines     : $((N_SEEDS)) Arm A + $((N_SEEDS * N_CONS)) Arm B = $((N_SEEDS + N_SEEDS * N_CONS)) total"
 echo "  output    : ${OUT}"
 echo "========================================================================"
 
@@ -72,6 +84,24 @@ if ! PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_preflight.py --config "${CONF
     echo "Pre-flight FAILED. Nothing has been run. Fix the checks above first."
     exit 1
 fi
+
+# Emit a protocol with `construction` overridden. Theta remains frozen and
+# hashed for each run -- the variants are different protocols, not a mutated
+# one, so a comparison that accidentally mixed them is detectable by hash.
+protocol_for () {
+    local construction="$1"
+    local base="${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml"
+    [ "${construction}" = "topk_dropout" ] && { echo "${base}"; return; }
+    local out="${SCRIPT_DIR}/${OUT}/protocol_${construction}.yaml"
+    "${PY}" - "${base}" "${out}" "${construction}" <<'PYPROTO'
+import sys, yaml
+src, dst, construction = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = yaml.safe_load(open(src))
+cfg.setdefault("portfolio", {})["construction"] = construction
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+PYPROTO
+    echo "${out}"
+}
 
 LIBS=()
 for SEED in ${QA_SEEDS}; do
@@ -87,33 +117,56 @@ for SEED in ${QA_SEEDS}; do
     # Vary BOTH seeds: QA_SEED reseeds the evolution operators, QA_CHAT_SEED
     # the generator itself. Holding the latter fixed would sample a much
     # narrower slice of the variation that actually dominates this study.
-    if QA_SEED="${SEED}" QA_CHAT_SEED="${SEED}" CONFIG_PATH="${CONFIG_PATH}" \
-       ./scripts/qa_run_arms.sh "${DIRECTION}" 2>&1 | tee "${OUT}/seed_${SEED}.log"; then
-        echo "seed ${SEED}: completed" >> "${OUT}/status.txt"
-    else
-        echo "seed ${SEED}: FAILED (rc=$?) -- continuing with the remaining seeds" \
-            | tee -a "${OUT}/status.txt"
-    fi
+    ARM_A_LIB=""
+    for CONSTRUCTION in ${QA_ARM_B_CONSTRUCTIONS}; do
+        PROTO="$(protocol_for "${CONSTRUCTION}")"
+        TAG="seed_${SEED}_${CONSTRUCTION}"
+        echo ""
+        echo "--- Arm B construction: ${CONSTRUCTION} ---"
 
-    STAMP="$(grep -oE 'stamp     : [0-9_]+' "${OUT}/seed_${SEED}.log" | tail -1 | awk '{print $3}')"
-    if [ -z "${STAMP}" ]; then
-        echo "seed ${SEED}: no stamp found, skipping its analysis" >> "${OUT}/status.txt"
-        continue
-    fi
-    echo "${SEED} ${STAMP}" >> "${OUT}/stamps.txt"
+        # First construction mines Arm A too; later ones reuse it, so every
+        # Arm B variant is paired against the SAME control from this seed.
+        if [ -z "${ARM_A_LIB}" ]; then
+            ARMS="control treatment"; REUSE=""
+        else
+            ARMS="treatment"; REUSE="${ARM_A_LIB}"
+        fi
 
-    A="data/factorlib/all_factors_library_control_${STAMP}.json"
-    B="data/factorlib/all_factors_library_treatment_${STAMP}_zoo.json"
-    [ -f "${B}" ] || B="data/factorlib/all_factors_library_treatment_${STAMP}.json"
-    LIBS+=(--library "${A}" --label "ArmA-s${SEED}" --library "${B}" --label "ArmB-s${SEED}")
+        if QA_SEED="${SEED}" QA_CHAT_SEED="${SEED}" CONFIG_PATH="${CONFIG_PATH}" \
+           QA_PROTOCOL="${PROTO}" QA_ARMS="${ARMS}" QA_REUSE_A="${REUSE}" \
+           ./scripts/qa_run_arms.sh "${DIRECTION}" 2>&1 | tee "${OUT}/${TAG}.log"; then
+            echo "${TAG}: completed" >> "${OUT}/status.txt"
+        else
+            echo "${TAG}: FAILED -- continuing" | tee -a "${OUT}/status.txt"
+        fi
 
-    # Does U's feedback actually teach? Only answerable per run.
-    PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_analyze_ledger.py \
-        "data/results/ledger_treatment_${STAMP}.jsonl" \
-        --out "${OUT}/admission_seed_${SEED}.md" || true
+        STAMP="$(grep -oE 'stamp     : [0-9_]+' "${OUT}/${TAG}.log" | tail -1 | awk '{print $3}')"
+        if [ -z "${STAMP}" ]; then
+            echo "${TAG}: no stamp, skipping analysis" >> "${OUT}/status.txt"
+            continue
+        fi
 
-    for f in arm_comparison backtest_v2_comparison; do
-        [ -f "data/results/${f}_${STAMP}.md" ] && cp "data/results/${f}_${STAMP}.md" "${OUT}/" || true
+        A="${REUSE:-data/factorlib/all_factors_library_control_${STAMP}.json}"
+        [ -z "${ARM_A_LIB}" ] && [ -f "${A}" ] && ARM_A_LIB="${A}"
+        B="data/factorlib/all_factors_library_treatment_${STAMP}_zoo.json"
+        [ -f "${B}" ] || B="data/factorlib/all_factors_library_treatment_${STAMP}.json"
+
+        # Only the construction-matched variant is a clean objective-only A/B,
+        # so that is the one the paired summary reads.
+        if [ "${CONSTRUCTION}" = "topk_dropout" ]; then
+            echo "${SEED} ${STAMP}" >> "${OUT}/stamps.txt"
+            LIBS+=(--library "${A}" --label "ArmA-s${SEED}")
+        fi
+        LIBS+=(--library "${B}" --label "ArmB-${CONSTRUCTION}-s${SEED}")
+
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_analyze_ledger.py \
+            "data/results/ledger_treatment_${STAMP}.jsonl" \
+            --out "${OUT}/admission_${TAG}.md" || true
+
+        for f in arm_comparison backtest_v2_comparison; do
+            [ -f "data/results/${f}_${STAMP}.md" ] && \
+                cp "data/results/${f}_${STAMP}.md" "${OUT}/${f}_${TAG}.md" || true
+        done
     done
 done
 
