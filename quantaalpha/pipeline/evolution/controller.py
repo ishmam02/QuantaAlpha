@@ -28,6 +28,43 @@ from .mutation import MutationOperator
 from .crossover import CrossoverOperator
 
 
+
+def expected_factor_count(
+    num_directions: int,
+    crossover_n: int,
+    max_rounds: int,
+    factors_per_hypothesis: int,
+) -> int:
+    """How many factors a run of this shape is expected to mine.
+
+    Mirrors the task generation in ``get_all_tasks_for_current_phase``:
+
+    * round 0 -- ORIGINAL, one task per direction                  -> D
+    * round 1 -- MUTATION of each original trajectory              -> D
+    * rounds 2+ -- CROSSOVER and MUTATION alternating, each
+      operating on the previous phase's crossover results          -> C each
+
+    so ``batches = D + D + C*(max_rounds - 2)`` for ``max_rounds >= 2``.
+
+    This is an *upper* estimate: a factor whose implementation fails to produce
+    a usable signal is dropped, so a run can finish just short of it (17 rather
+    than 18 was observed). Callers sizing a budget should treat it as a target
+    and bound the search separately rather than assuming it is always reached.
+
+    It lives beside the loop it describes on purpose -- a copy of this formula
+    in a driver script would silently drift the first time the phase order
+    changes.
+    """
+    d, c, r = max(int(num_directions), 0), max(int(crossover_n), 0), int(max_rounds)
+    if r <= 0:
+        batches = 0
+    elif r == 1:
+        batches = d
+    else:
+        batches = d + d + c * (r - 2)
+    return batches * max(int(factors_per_hypothesis), 0)
+
+
 @dataclass
 class EvolutionConfig:
     """Configuration for evolution process."""

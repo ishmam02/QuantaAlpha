@@ -123,22 +123,40 @@ QA_ARMS="${QA_ARMS:-control treatment}"
 case " ${QA_ARMS} " in *" control "*) run_arm control "ARM A -- control (RankIC objective)";; esac
 case " ${QA_ARMS} " in
     *" treatment "*)
-        # Target = what Arm A actually produced, unless pinned explicitly.
+        # Target comes from the CONFIG, not from Arm A's realised output.
+        # Deriving it from Arm A would couple Arm B's budget to Arm A's own
+        # run-to-run noise (measured at 4pp on return, and one factor short of
+        # the nominal count on two of three runs) and would stop Arm B from
+        # running on its own. The config determines the shape of the search, so
+        # it determines the count both arms are aiming at.
         if [ -z "${QA_TARGET_ZOO:-}" ]; then
-            A_LIB="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
-            if [ -f "${A_LIB}" ]; then
-                N_A="$(count_factors "${A_LIB}")"
-                [ "${N_A}" -gt 0 ] && export QA_TARGET_ZOO="${N_A}"
-            fi
+            N_EXP="$(PYTHONPATH="${SCRIPT_DIR}" "${PY}" - "${CONFIG_PATH}" <<'PYCFG' 2>/dev/null
+import sys, yaml
+from quantaalpha.pipeline.evolution.controller import expected_factor_count
+c = yaml.safe_load(open(sys.argv[1])); ev = c.get("evolution", {})
+print(expected_factor_count(
+    c.get("planning", {}).get("num_directions", 2),
+    ev.get("crossover_n", 2),
+    ev.get("max_rounds", 3),
+    c.get("factor", {}).get("factors_per_hypothesis", 1)))
+PYCFG
+)"
+            case "${N_EXP}" in ''|*[!0-9]*) N_EXP=0 ;; esac
+            [ "${N_EXP}" -gt 0 ] && export QA_TARGET_ZOO="${N_EXP}"
         else
             export QA_TARGET_ZOO
         fi
         if [ -n "${QA_TARGET_ZOO:-}" ]; then
-            export QA_MAX_ROUNDS_CAP="${QA_MAX_ROUNDS_CAP:-12}"
+            # Deliberately NOT defaulted here: the controller falls back to
+            # max_rounds * 3, which scales with the configured search, whereas a
+            # fixed number here would be too tight at paper scale and wastefully
+            # loose at test scale. Export only if the caller pinned one.
+            [ -n "${QA_MAX_ROUNDS_CAP:-}" ] && export QA_MAX_ROUNDS_CAP
             echo ""
             echo "  !! BUDGET PARITY BROKEN BY DESIGN"
             echo "     Arm B mines until |zoo| >= ${QA_TARGET_ZOO} admitted factors"
-            echo "     (Arm A's count), capped at ${QA_MAX_ROUNDS_CAP} rounds."
+            echo "     (the count this config is expected to produce), capped at"
+            echo "     ${QA_MAX_ROUNDS_CAP:-max_rounds x3} rounds."
             echo "     Arm B searches more than Arm A -- report both budgets."
         fi
         run_arm treatment "ARM B -- treatment (net-of-cost U objective)"
