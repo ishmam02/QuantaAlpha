@@ -77,6 +77,18 @@ export FACTOR_CoSTEER_PYTHON_BIN="$(command -v python)"
 # (maintenance mode). Allow it so the in-loop backtest (qrun) can create experiments/recorders.
 export MLFLOW_ALLOW_FILE_STORE=true
 
+# Thread budget. The tracked configs ask for 20 LightGBM threads, which
+# oversubscribes an 8-core box 2.5x on its own and thrashes badly once several
+# instances share it. QA_THREADS caps every numeric backend to one instance's
+# fair share; the drivers set it from core count / parallelism.
+if [ -n "${QA_THREADS:-}" ]; then
+    export OMP_NUM_THREADS="${QA_THREADS}"
+    export MKL_NUM_THREADS="${QA_THREADS}"
+    export OPENBLAS_NUM_THREADS="${QA_THREADS}"
+    export NUMEXPR_NUM_THREADS="${QA_THREADS}"
+    export LGBM_NUM_THREADS="${QA_THREADS}"
+fi
+
 # Determinism. PYTHONHASHSEED must be set BEFORE the interpreter starts to have
 # any effect -- setting it inside Python is too late. cli.py:app() seeds the
 # Python and NumPy RNGs from `seed:` in the run config (or QA_SEED).

@@ -42,6 +42,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 import statistics as st
 import subprocess
 import sys
@@ -346,7 +347,11 @@ def main() -> int:
     if args.arm_b:
         plan.append(("Arm B (mined)", "custom", Path(args.arm_b)))
 
-    cache_path = ROOT / "data/results/backtest_v2_raw.json"
+    # Per-instance when QA_INSTANCE is set: this cache is a read-modify-write
+    # of a single file, so two concurrent runs would silently clobber each
+    # other's rows.
+    _inst = os.environ.get("QA_INSTANCE", "")
+    cache_path = ROOT / f"data/results/backtest_v2_raw{('_' + _inst) if _inst else ''}.json"
     cache = {} if args.no_cache else load_cache(cache_path)
 
     results: dict[str, list[dict]] = {}

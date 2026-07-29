@@ -23,6 +23,8 @@ that the composite prediction is built the same way.
 
 from __future__ import annotations
 
+import os
+
 import hashlib
 import logging
 from functools import lru_cache
@@ -182,6 +184,17 @@ def fit_predict(
         )
 
     params = dict(theta.combiner.params)
+    # QA_THREADS caps LightGBM to one instance's fair share of the machine.
+    # Theta asks for 20 threads, which oversubscribes an 8-core box on its own
+    # and thrashes once several runs share it. Capping is NOT a protocol change:
+    # thread count does not affect the fitted model, only how fast it is fitted,
+    # so Theta's hash and Property 2 are untouched.
+    _threads = os.environ.get("QA_THREADS")
+    if _threads:
+        try:
+            params["num_threads"] = max(1, int(_threads))
+        except ValueError:
+            pass
     num_boost_round = int(params.pop("num_boost_round", 500))
     # Early stopping needs a held-out set, and Θ forbids fitting or tuning on
     # valid -- so it is deliberately inert here and the model always runs the
