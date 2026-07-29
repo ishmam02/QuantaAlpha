@@ -282,6 +282,9 @@ class NetCostFactorRunner(QlibFactorRunner):
         for expr in evicted:
             del self._repository[expr]
         if evicted:
+            # Persist the decision, or a sibling process undoes it.
+            self.ledger.append({"evicted_exprs": evicted, "n_factors": 0,
+                                "metrics": {}, "U": None})
             logger.info(
                 "repository: EVICTED %d factor(s) with U < tau_evict=%.2f; |zoo| = %d",
                 len(evicted), adm.tau_evict, len(self._repository),
@@ -324,37 +327,50 @@ class NetCostFactorRunner(QlibFactorRunner):
         A partially recovered zoo still ranks correctly; it just refits the
         combiner on fewer incumbents.
         """
-        signals = {expr: signal for expr, (signal, _) in self._repository.items()}
-        metrics = [m for _, (_, m) in self._repository.items()]
-
-        recovered_metrics = recovered_signals = 0
+        # Rehydrate INTO self._repository, not into locals. _admit and _prune
+        # both reason about `len(self._repository)`, so leaving the recovered
+        # incumbents in local variables left every fresh process believing the
+        # repository was empty -- it would bootstrap-admit unconditionally and
+        # could never evict anything a sibling had contributed.
+        # Replay the ledger IN ORDER: admissions add, evictions remove. An
+        # eviction that is not replayed is no eviction at all -- the next
+        # process would rehydrate the dropped factor straight back from the
+        # admission record that precedes it.
+        recovered = signals_found = 0
+        wanted: dict[str, dict] = {}
         for record in self.ledger.read():
+            for expr in record.get("evicted_exprs") or []:
+                wanted.pop(expr, None)
             batch_metrics = record.get("metrics") or {}
             for expr in record.get("factor_exprs") or []:
-                if not expr or expr in signals or expr in self._repository:
-                    continue
-                metrics.append(batch_metrics)
-                recovered_metrics += 1
-                try:
-                    signals[expr] = load_factor_signal(expr)
-                    recovered_signals += 1
-                except (FileNotFoundError, OSError, ValueError):
-                    # Not yet cached by a sibling process. The factor still
-                    # counts as a ranking incumbent; it just cannot join the
-                    # combiner refit this time round.
-                    continue
+                if expr:
+                    wanted[expr] = batch_metrics
 
-        if recovered_metrics:
+        for expr, batch_metrics in wanted.items():
+            if expr in self._repository:
+                continue
+            try:
+                signal = load_factor_signal(expr)
+                signals_found += 1
+            except (FileNotFoundError, OSError, ValueError):
+                # Not yet cached by a sibling process. Still a ranking
+                # incumbent; it just cannot join the combiner refit.
+                signal = None
+            self._repository[expr] = (signal, batch_metrics)
+            recovered += 1
+
+        if recovered:
             logger.info(
-                "repository rehydrated from ledger: +%d incumbent(s) for ranking, "
-                "%d with signals for the refit (in-process held %d)",
-                recovered_metrics, recovered_signals, len(self._repository),
+                "repository rehydrated from ledger: +%d incumbent(s), %d with signals; "
+                "|zoo| = %d", recovered, signals_found, len(self._repository),
             )
+
+        signals = {e: s for e, (s, _) in self._repository.items() if s is not None}
+        metrics = [m for _, (_, m) in self._repository.items()]
         if not metrics:
             logger.info(
-                "repository empty (%d based experiment(s) present, ledger has no "
-                "prior records); scoring this batch against an empty zoo -- U "
-                "cannot discriminate until the repository has incumbents",
+                "repository empty (%d based experiment(s), ledger has no prior "
+                "records); scoring this batch against an empty zoo",
                 len(exp.based_experiments or []),
             )
         return signals, metrics
