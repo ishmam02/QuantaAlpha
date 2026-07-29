@@ -182,6 +182,14 @@ if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
     export QLIB_FACTOR_RUNNER="quantaalpha.factors.net_cost_runner.NetCostFactorRunner"
     export QLIB_FACTOR_SUMMARIZER="quantaalpha.factors.net_cost_feedback.NetCostFactorFeedback"
     export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-U}"
+    # Feedback can only teach a batch that is generated AFTER it. With phases
+    # run in parallel, batches inside a round are produced concurrently, so a
+    # rejection in one never reaches its siblings -- which is why the admission
+    # rate showed no trend across the 6 batches of run 20260729_081848. Forcing
+    # sequential evolution makes every batch see every earlier verdict, at the
+    # cost of wall-clock. Set QA_SEQUENTIAL_EVOLUTION=false to trade the signal
+    # back for speed.
+    export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
     # Rejection is FEEDBACK, not exclusion. Filtering rejected factors out of
     # the parent pool would keep the generator from ever seeing why they were
     # rejected, so it could not learn to clear the bar -- the gate would only

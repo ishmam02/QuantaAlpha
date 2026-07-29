@@ -378,6 +378,18 @@ def run_evolution_loop(
     top_percent_threshold = float(evolution_cfg.get("top_percent_threshold", 0.3))
     log_root = str(logger.log_trace_path)
     parallel_enabled = bool(evolution_cfg.get("parallel_enabled", False))
+    # QA_SEQUENTIAL_EVOLUTION overrides the config for the treatment arm.
+    # Feedback only teaches batches generated after it, so batches produced
+    # concurrently within a round cannot learn from each other's verdicts --
+    # the mechanism the net-of-cost objective depends on is silently disabled
+    # by parallelism. Sequential evolution costs wall-clock and buys the signal.
+    if os.environ.get("QA_SEQUENTIAL_EVOLUTION", "").lower() in ("1", "true", "yes"):
+        if parallel_enabled:
+            logger.info(
+                "QA_SEQUENTIAL_EVOLUTION set: forcing sequential evolution so each "
+                "batch sees every earlier admission verdict"
+            )
+        parallel_enabled = False
     fresh_start = bool(evolution_cfg.get("fresh_start", True))
     cleanup_on_finish = bool(evolution_cfg.get("cleanup_on_finish", False))
 
