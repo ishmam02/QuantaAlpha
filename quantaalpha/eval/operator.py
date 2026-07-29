@@ -30,6 +30,7 @@ mode, which exists solely for the end-of-run head-to-head.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -136,8 +137,9 @@ class EvaluationOperator:
         aligned_zoo = {expr: align_signal(sig, panel) for expr, sig in zoo_signals.items()}
         zoo_hash = combiner_mod.zoo_hash(zoo_signals)
 
-        # --- the book: zoo + ALL new factors, one combiner refit ---
-        book = self._strategy_batch(aligned_cands, aligned_zoo, panel, eval_window)
+        # --- the book: zoo + ALL new factors, one combiner refit per fold ---
+        book = self._strategy_batch(aligned_cands, aligned_zoo, panel, eval_window,
+                                    report=report)
         metrics = dict(book["metrics"])
 
         # --- predictive quality OF THE COMBINED PREDICTION ---
@@ -177,20 +179,77 @@ class EvaluationOperator:
         return result
 
     # ------------------------------------------------------------------
+    def _folds(self, report: bool) -> list[tuple]:
+        """(theta, eval_window) pairs the in-loop score averages over.
+
+        One entry unless walk-forward is on. The final-test evaluation always
+        uses the configured split: progressive retraining is a property of how
+        the *search* selects factors, and changing the reporting window would
+        make the arms incomparable to each other and to published numbers.
+        """
+        wf = self.theta.walk_forward
+        if report or not wf.enabled or wf.folds <= 1:
+            return [(self.theta, None)]
+        out = []
+        for train, valid in self.theta.splits.walk_forward_folds(int(wf.folds)):
+            splits = replace(self.theta.splits, train=train, valid=valid)
+            out.append((replace(self.theta, splits=splits), valid))
+        return out
+
+    def _fit_and_price(
+        self,
+        factors: dict[str, pd.DataFrame],
+        panel: PanelBundle,
+        eval_window: tuple[str, str],
+        report: bool,
+    ) -> tuple[dict, pd.DataFrame]:
+        """Refit and price one factor set, averaged over walk-forward folds.
+
+        Shared by the candidate book and the baseline book. Keeping it separate
+        from :meth:`_strategy_batch` is not cosmetic: the batch computes a
+        marginal contribution against the baseline, so if the baseline were
+        built by calling the batch the two would recurse without end.
+        """
+        folds = self._folds(report)
+        per_fold, predictions = [], []
+        for theta_fold, fold_window in folds:
+            pred = combiner_mod.fit_predict(factors, None, panel, theta_fold)
+            per_fold.append(self._book(pred, panel, fold_window or eval_window, theta_fold))
+            predictions.append(pred)
+
+        if len(per_fold) == 1:
+            return dict(per_fold[0]), predictions[0]
+
+        keys = {k for m in per_fold for k in m}
+        metrics: dict = {}
+        for k in keys:
+            vals = [float(m[k]) for m in per_fold
+                    if isinstance(m.get(k), (int, float)) and m[k] == m[k]]
+            metrics[k] = float(np.mean(vals)) if vals else np.nan
+        metrics["n_folds"] = len(per_fold)
+        logger.info(
+            "walk-forward: averaged %d fold(s); net_ir per fold = %s",
+            len(per_fold),
+            ", ".join(f"{m.get('net_ir', float('nan')):+.4f}" for m in per_fold),
+        )
+        # The last fold is the configured split, so its prediction is the one
+        # comparable with a non-walk-forward run's IC statistics.
+        return metrics, predictions[-1]
+
     def _strategy_batch(
         self,
         aligned_cands: dict[str, pd.DataFrame],
         aligned_zoo: dict[str, pd.DataFrame],
         panel: PanelBundle,
         eval_window: tuple[str, str],
+        report: bool = False,
     ) -> dict:
-        """One combiner refit on ``zoo ∪ candidates`` → one priced book."""
+        """The book from ``zoo ∪ candidates``, plus its gain over the zoo alone."""
         combined = {**aligned_zoo, **aligned_cands}
-        prediction = combiner_mod.fit_predict(combined, None, panel, self.theta)
-        metrics = self._book(prediction, panel, eval_window)
+        metrics, prediction = self._fit_and_price(combined, panel, eval_window, report)
 
         # Marginal contribution of the whole batch over the repository alone.
-        baseline = self._baseline(aligned_zoo, panel, eval_window)
+        baseline = self._baseline(aligned_zoo, panel, eval_window, report=report)
         for key in ("net_ir", "net_arr"):
             base_v, full_v = baseline.get(key), metrics.get(key)
             metrics[f"base_{key}"] = base_v
@@ -208,6 +267,7 @@ class EvaluationOperator:
         aligned_zoo: dict[str, pd.DataFrame],
         panel: PanelBundle,
         eval_window: tuple[str, str],
+        report: bool = False,
     ) -> dict:
         """The book built from ``zoo`` alone -- what f's contribution is measured against.
 
@@ -216,10 +276,10 @@ class EvaluationOperator:
         this costs one extra combiner fit per experiment rather than per factor.
         With an empty zoo it is the null model: base features only.
         """
-        key = (combiner_mod.zoo_hash(aligned_zoo), eval_window)
+        key = (combiner_mod.zoo_hash(aligned_zoo), eval_window, report)
         if key not in self._baselines:
-            pred = combiner_mod.fit_predict(aligned_zoo, None, panel, self.theta)
-            self._baselines[key] = self._book(pred, panel, eval_window)
+            self._baselines[key] = self._fit_and_price(
+                aligned_zoo, panel, eval_window, report)[0]
             logger.info(
                 "baseline book for zoo=%s (|zoo|=%d): net_ir=%.4f net_arr=%.4f",
                 key[0], len(aligned_zoo),
@@ -233,19 +293,21 @@ class EvaluationOperator:
         prediction: pd.DataFrame,
         panel: PanelBundle,
         eval_window: tuple[str, str],
+        theta: Protocol | None = None,
     ) -> dict:
         """Price one composite prediction through g and the cost model."""
+        theta = theta or self.theta
         start, end = eval_window
         window_pred = prediction.loc[str(start) : str(end)]
         if window_pred.empty:
             return {"net_ir": np.nan, "net_arr": np.nan, "mdd": np.nan,
                     "turnover_book": np.nan, "cost_bps": np.nan}
 
-        y_tilde = realized_return(fill_prices(panel, self.theta))
+        y_tilde = realized_return(fill_prices(panel, theta))
         universe = panel.universe.loc[window_pred.index]
 
-        sigma = costs_mod.trailing_vol(panel.close, self.theta.costs.vol_window)
-        adv = costs_mod.trailing_adv(panel, self.theta)
+        sigma = costs_mod.trailing_vol(panel.close, theta.costs.vol_window)
+        adv = costs_mod.trailing_adv(panel, theta)
 
         # Hard A-share feasibility (price limits, suspensions, T+1). Cached per
         # panel: the masks depend only on prices and Theta, never on the
@@ -256,13 +318,13 @@ class EvaluationOperator:
         # compares it with a cost. Fitted on the TRAINING split only, so the
         # rule never sees realised returns from the window it is evaluated on.
         beta = 1.0
-        if self.theta.portfolio.cost_aware_dropout:
+        if theta.portfolio.cost_aware_dropout:
             beta = prediction_scale(
-                prediction, y_tilde, self.theta.splits.window(self.theta.combiner.fit_split)
+                prediction, y_tilde, theta.splits.window(theta.combiner.fit_split)
             )
 
         w, w_drift = topk_dropout(
-            window_pred, self.theta, y_tilde=y_tilde, universe=universe,
+            window_pred, theta, y_tilde=y_tilde, universe=universe,
             mask=mask, sigma=sigma, pred_scale=beta,
         )
 
@@ -273,7 +335,7 @@ class EvaluationOperator:
                     w_drift.loc[date],
                     sigma.loc[date] if date in sigma.index else pd.Series(dtype=float),
                     adv.loc[date] if date in adv.index else pd.Series(dtype=float),
-                    self.theta,
+                    theta,
                 )
                 for date in w.index
             ],
@@ -283,7 +345,7 @@ class EvaluationOperator:
 
         bench = self._benchmark(str(start), str(end))
         r_net = costs_mod.net_return(w, y_tilde, bench, charges)
-        return strategy_metrics(w, w_drift, r_net, charges, self.theta)
+        return strategy_metrics(w, w_drift, r_net, charges, theta)
 
 
 __all__ = ["EvaluationOperator"]

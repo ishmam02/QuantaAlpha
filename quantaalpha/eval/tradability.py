@@ -61,15 +61,26 @@ class TradeMask:
     can_buy: pd.DataFrame
     can_sell: pd.DataFrame
     suspended: pd.DataFrame
+    universe: pd.DataFrame
 
     @property
     def stats(self) -> dict[str, float]:
-        """Share of (date, name) cells blocked, for logging and sanity checks."""
-        total = float(self.can_buy.size) or 1.0
+        """Share of blocked cells, measured **within the index universe**.
+
+        Denominating by the full (date x name) grid instead would report a name
+        that simply was not in the index yet as "suspended": on CSI 300 that
+        read 52% against a true suspension rate of a few percent. The universe
+        mask already excludes non-members from selection, so this only ever
+        affected the diagnostic -- but a 52% figure in a log is the kind of
+        thing that gets believed.
+        """
+        live = self.universe.astype(bool)
+        total = float(live.sum().sum()) or 1.0
+        blocked = lambda frame: 100.0 * float((frame & live).sum().sum()) / total
         return {
-            "pct_no_buy": 100.0 * float((~self.can_buy).sum().sum()) / total,
-            "pct_no_sell": 100.0 * float((~self.can_sell).sum().sum()) / total,
-            "pct_suspended": 100.0 * float(self.suspended.sum().sum()) / total,
+            "pct_no_buy": blocked(~self.can_buy),
+            "pct_no_sell": blocked(~self.can_sell),
+            "pct_suspended": blocked(self.suspended),
         }
 
 
@@ -104,9 +115,10 @@ def trade_mask(panel: PanelBundle, theta: Protocol) -> TradeMask:
     dates, names = panel.dates, panel.instruments
     true_frame = pd.DataFrame(True, index=dates, columns=names)
 
+    live = panel.universe.astype(bool)
     if not cons.enabled:
         return TradeMask(true_frame, true_frame.copy(),
-                         pd.DataFrame(False, index=dates, columns=names))
+                         pd.DataFrame(False, index=dates, columns=names), live)
 
     suspended = (panel.volume.fillna(0.0) <= 0) | panel.close.isna()
 
@@ -136,11 +148,11 @@ def trade_mask(panel: PanelBundle, theta: Protocol) -> TradeMask:
     else:
         can_buy, can_sell = can_buy_fill, can_sell_fill
 
-    mask = TradeMask(can_buy, can_sell, suspended.fillna(True))
+    mask = TradeMask(can_buy, can_sell, suspended.fillna(True), live)
     stats = mask.stats
     logger.info(
-        "trade constraints: %.2f%% of cells cannot be bought, %.2f%% cannot be sold, "
-        "%.2f%% suspended (price_limit=%s t1=%s)",
+        "trade constraints (within the index universe): %.2f%% cannot be bought, "
+        "%.2f%% cannot be sold, %.2f%% suspended (price_limit=%s t1=%s)",
         stats["pct_no_buy"], stats["pct_no_sell"], stats["pct_suspended"],
         cons.enforce_price_limits, cons.enforce_t1,
     )

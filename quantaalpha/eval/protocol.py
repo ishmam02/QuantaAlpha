@@ -82,6 +82,50 @@ class Splits:
     def oos_window(self) -> DateRange:
         return self.window("search_oos")
 
+    def walk_forward_folds(self, n: int) -> list[tuple[DateRange, DateRange]]:
+        """``n`` expanding-window (train, validate) folds ending at the current split.
+
+        Markets regime-shift, and a single train/validate block can sit entirely
+        inside one regime -- the model is then selected on a market that no
+        longer exists by the time the test window starts. Walk-forward retrains
+        progressively so selection is averaged over several regimes.
+
+        The window EXPANDS rather than slides: every fold trains from the same
+        start date, because dropping early history to keep a fixed-length train
+        window would confound "later regime" with "less data".
+
+        Fold ``n`` is exactly the configured ``(train, valid)`` split, so ``n=1``
+        reproduces today's behaviour and this is a strict generalisation.
+        Earlier folds step the validation window back by its own length.
+
+        ``final_test`` is never involved: folds are carved out of the
+        train+validate span alone, which is what keeps Property 3 intact.
+        """
+        import pandas as pd
+
+        if n <= 1:
+            return [(self.train, self.valid)]
+
+        v_start, v_end = pd.Timestamp(self.valid[0]), pd.Timestamp(self.valid[1])
+        t_start = pd.Timestamp(self.train[0])
+        span = v_end - v_start
+        day = pd.Timedelta(days=1)
+
+        folds: list[tuple[DateRange, DateRange]] = []
+        for k in range(n):
+            shift = (span + day) * k
+            fv_start, fv_end = v_start - shift, v_end - shift
+            ft_end = fv_start - day
+            if ft_end <= t_start:
+                # Not enough history left to train this fold; stop rather than
+                # emit a degenerate window.
+                break
+            folds.append((
+                (t_start.strftime("%Y-%m-%d"), ft_end.strftime("%Y-%m-%d")),
+                (fv_start.strftime("%Y-%m-%d"), fv_end.strftime("%Y-%m-%d")),
+            ))
+        return list(reversed(folds))
+
 
 @dataclass(frozen=True)
 class Execution:
@@ -225,6 +269,22 @@ class Utility:
 
 
 @dataclass(frozen=True)
+class WalkForward:
+    """Progressive retraining for the in-loop evaluation (§ walk-forward).
+
+    ``folds=1`` is the single fixed split. Above that, the in-loop score is the
+    mean over folds, so a factor selected because it happened to suit one
+    regime is penalised relative to one that holds across several.
+
+    Costs one combiner refit per fold, and touches only train/validate --
+    ``final_test`` is scored exactly as before.
+    """
+
+    enabled: bool = False
+    folds: int = 3
+
+
+@dataclass(frozen=True)
 class Admission:
     """When ``U`` admits a candidate to the repository, and when it evicts one.
 
@@ -270,6 +330,7 @@ class Protocol:
     overfit: Overfit
     utility: Utility
     admission: Admission = field(default_factory=Admission)
+    walk_forward: WalkForward = field(default_factory=WalkForward)
 
     def __post_init__(self) -> None:
         # Copy mutable containers so a caller holding a reference to the parsed
@@ -407,6 +468,7 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
         overfit=_build(Overfit, dict(raw["overfit"])),
         utility=utility,
         admission=admission,
+        walk_forward=_build(WalkForward, dict(raw.get("walk_forward", {}))),
     )
 
 
