@@ -72,9 +72,50 @@ if ! grep -qE "^CHAT_SEED" .env 2>/dev/null; then
     exit 1
 fi
 
+# Arm B's admission gate rejects a fraction of what it mines, so at equal
+# generation budget it ends with fewer factors than Arm A -- and factor count
+# moves the combiner independently of factor quality, which confounds the
+# comparison. QA_TREATMENT_ROUND_MULTIPLIER scales the treatment arm's evolution
+# rounds so both arms finish with a similar ADMITTED count.
+#
+# This deliberately breaks budget parity: Arm B then searches more than Arm A.
+# Equalising output rather than input is a defensible choice -- the question is
+# "18 factors chosen by U vs 18 chosen by RankIC" -- but any Arm B advantage is
+# then partly bought with extra search, and the report must say so. Setting it
+# to 1.0 restores strict budget parity at the cost of unequal counts.
+treatment_config () {
+    local mult="${QA_TREATMENT_ROUND_MULTIPLIER:-1.0}"
+    if [ "${mult}" = "1.0" ] || [ "${mult}" = "1" ]; then
+        echo "${CONFIG_PATH}"; return
+    fi
+    local out="${SCRIPT_DIR}/data/results/experiment_treatment_${STAMP}.yaml"
+    mkdir -p "$(dirname "${out}")"
+    "${PY}" - "${CONFIG_PATH}" "${out}" "${mult}" <<'PYEOF'
+import math, sys, yaml
+src, dst, mult = sys.argv[1], sys.argv[2], float(sys.argv[3])
+cfg = yaml.safe_load(open(src))
+ev = cfg.setdefault("evolution", {})
+base = int(ev.get("max_rounds", 3))
+ev["max_rounds"] = max(base, math.ceil(base * mult))
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+print(f"treatment rounds: {base} -> {ev['max_rounds']} (x{mult})", file=sys.stderr)
+PYEOF
+    echo "${out}"
+}
+
 run_arm () {
     local arm="$1" label="$2"
     local id="${arm}_${STAMP}"
+    local cfg="${CONFIG_PATH}"
+    if [ "${arm}" = "treatment" ]; then
+        cfg="$(treatment_config)"
+        if [ "${cfg}" != "${CONFIG_PATH}" ]; then
+            echo ""
+            echo "  !! BUDGET PARITY BROKEN: treatment arm uses ${cfg}"
+            echo "     (QA_TREATMENT_ROUND_MULTIPLIER=${QA_TREATMENT_ROUND_MULTIPLIER})"
+            echo "     Arm B searches more than Arm A; report both budgets."
+        fi
+    fi
     echo ""
     echo "########################################################################"
     echo "#  ${label}   (EXPERIMENT_ID=${id})"
@@ -82,7 +123,7 @@ run_arm () {
     QA_ARM="${arm}" \
     EXPERIMENT_ID="${id}" \
     FACTOR_LIBRARY_SUFFIX="${id}" \
-    CONFIG_PATH="${CONFIG_PATH}" \
+    CONFIG_PATH="${cfg}" \
     ./run.sh "${DIRECTION}" 2>&1 | tee "/tmp/qa_${id}.log"
 }
 
