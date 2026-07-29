@@ -173,6 +173,16 @@ class Portfolio:
     signed: bool = False
     gross_leverage: float = 1.0
     cost_aware_dropout: bool = False
+    # --- mean-variance member (construction: "mean_variance") ---
+    # lambda in  max w'mu - (lambda/2) w'Sigma w  - the price of variance.
+    risk_aversion: float = 10.0
+    # Explicit one-way turnover budget per rebalance. This is the knob top-k
+    # dropout does not have: there, turnover is whatever n_drop/topk dictates.
+    turnover_cap: float = 0.10
+    # Cap on any single position, so the optimiser cannot answer "concentrate
+    # everything in the highest-scoring name", which is optimal under a
+    # diagonal risk model and untradeable in practice.
+    max_weight: float = 0.05
     # Gain must exceed cost by this multiple before a swap is worth making. 1.0
     # is break-even on the modelled cost; above 1.0 demands a margin of safety
     # against the cost model itself being optimistic.

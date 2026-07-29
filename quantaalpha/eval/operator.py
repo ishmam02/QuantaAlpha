@@ -45,7 +45,7 @@ from quantaalpha.eval.metrics import (
     rho_max,
     strategy_metrics,
 )
-from quantaalpha.eval.portfolio import topk_dropout
+from quantaalpha.eval.portfolio import build_book
 from quantaalpha.eval.protocol import Protocol
 from quantaalpha.eval.tradability import trade_mask
 from quantaalpha.eval.scoring import dimension_scores, utility
@@ -318,12 +318,12 @@ class EvaluationOperator:
         # compares it with a cost. Fitted on the TRAINING split only, so the
         # rule never sees realised returns from the window it is evaluated on.
         beta = 1.0
-        if theta.portfolio.cost_aware_dropout:
+        if theta.portfolio.cost_aware_dropout or theta.portfolio.construction == "mean_variance":
             beta = prediction_scale(
                 prediction, y_tilde, theta.splits.window(theta.combiner.fit_split)
             )
 
-        w, w_drift = topk_dropout(
+        w, w_drift = build_book(
             window_pred, theta, y_tilde=y_tilde, universe=universe,
             mask=mask, sigma=sigma, pred_scale=beta,
         )

@@ -165,13 +165,26 @@ def main() -> int:
     check("A-share constraints configured", constraints)
 
     def turnover_can_move():
-        if not theta.portfolio.cost_aware_dropout:
+        port = theta.portfolio
+        if port.construction == "mean_variance":
+            return (f"mean_variance with an explicit turnover budget "
+                    f"{port.turnover_cap} (lambda={port.risk_aversion}, "
+                    f"max_weight={port.max_weight})")
+        if not port.cost_aware_dropout:
             raise RuntimeError(
-                "cost_aware_dropout is off: turnover is pinned at n_drop/topk = "
-                f"{theta.portfolio.n_drop / theta.portfolio.topk:.4f} and the cost model "
-                "cannot influence the book"
+                "cost_aware_dropout is off and construction is topk_dropout: turnover "
+                f"is pinned at n_drop/topk = {port.n_drop / port.topk:.4f} and the cost "
+                "model cannot influence the book"
             )
-        return f"cost-aware dropout on, hurdle={theta.portfolio.swap_hurdle}"
+        # Measured on real predictions: the calibrated gain/cost ratio is ~7.5,
+        # so a hurdle of 1.0 clears on essentially every swap and the book is
+        # identical to the fixed-quota one (net IR -0.2738 either way). The
+        # hurdle only starts to bind well above that.
+        if port.swap_hurdle < 5.0:
+            return (f"cost-aware dropout on, but hurdle={port.swap_hurdle} is below the "
+                    "~7.5x gain/cost ratio measured on real predictions, so it will NOT "
+                    "bind — use construction: mean_variance for a turnover budget that does")
+        return f"cost-aware dropout on, hurdle={port.swap_hurdle}"
     check("turnover is a decision, not a constant", turnover_can_move)
 
     # --- data ------------------------------------------------------------

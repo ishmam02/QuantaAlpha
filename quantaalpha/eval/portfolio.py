@@ -283,4 +283,191 @@ def solo_book(signal: pd.DataFrame, theta: Protocol, universe: pd.DataFrame | No
     return topk_dropout(signal, theta, universe=universe)
 
 
-__all__ = ["solo_book", "topk_dropout"]
+__all__ = ["build_book", "mean_variance", "solo_book", "topk_dropout"]
+
+
+def _mv_weights(
+    mu: pd.Series,
+    var: pd.Series,
+    lam: float,
+    max_weight: float,
+) -> pd.Series:
+    """argmax wᵀμ − (λ/2)wᵀΣw  s.t.  Σw = 1, 0 ≤ w ≤ max_weight, Σ diagonal.
+
+    A diagonal risk model makes the problem separable, so it has a closed form
+    given the budget multiplier ``η``::
+
+        w_i(η) = clip((μ_i − η) / (λ σ_i²), 0, max_weight)
+
+    ``Σw_i(η)`` is monotonically decreasing in ``η``, so bisection finds the η
+    that spends exactly the budget. Exact to machine precision and fast enough
+    to run per date, which a general QP over 300 names would not be.
+
+    The diagonal model is a deliberate simplification and the honest limit of
+    this implementation: it prices each name's own volatility but no
+    correlation, so it cannot see that two names are the same bet. A factor
+    risk model is the next refinement, and until then the diversity dimension
+    of ``U`` is what carries redundancy control.
+    """
+    v = var.clip(lower=1e-8)
+    lo = float(mu.min() - lam * v.max())
+    hi = float(mu.max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return pd.Series(0.0, index=mu.index)
+
+    weights = lambda eta: ((mu - eta) / (lam * v)).clip(lower=0.0, upper=max_weight)
+    if float(weights(lo).sum()) < 1.0:
+        # Even at full risk appetite the box caps prevent full investment.
+        return weights(lo)
+
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if float(weights(mid).sum()) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    w = weights(0.5 * (lo + hi))
+    total = float(w.sum())
+    return w / total if total > 0 else w
+
+
+def _apply_tradability(
+    w: pd.Series,
+    w_drift: pd.Series,
+    can_buy: pd.Series | None,
+    can_sell: pd.Series | None,
+) -> pd.Series:
+    """Clamp a target book to what can actually be traded, then re-invest.
+
+    A name that cannot be bought may not rise above its drifted weight; one
+    that cannot be sold may not fall below it. Clamping breaks the budget, so
+    the residual is redistributed across the names that ARE free to trade --
+    renormalising everything instead would silently push blocked names back
+    through the very limits just imposed.
+    """
+    if can_buy is None and can_sell is None:
+        return w
+    out = w.copy()
+    blocked = pd.Series(False, index=w.index)
+    if can_buy is not None:
+        no_buy = ~can_buy.reindex(w.index).fillna(True).astype(bool)
+        out[no_buy] = np.minimum(out[no_buy], w_drift.reindex(w.index)[no_buy])
+        blocked |= no_buy
+    if can_sell is not None:
+        no_sell = ~can_sell.reindex(w.index).fillna(True).astype(bool)
+        out[no_sell] = np.maximum(out[no_sell], w_drift.reindex(w.index)[no_sell])
+        blocked |= no_sell
+
+    residual = 1.0 - float(out.sum())
+    free = ~blocked
+    if abs(residual) > 1e-12 and bool(free.any()):
+        base = out[free]
+        share = base / base.sum() if float(base.sum()) > 0 else pd.Series(
+            1.0 / int(free.sum()), index=base.index)
+        out[free] = (base + residual * share).clip(lower=0.0)
+    return out
+
+
+def mean_variance(
+    pred: pd.DataFrame,
+    theta: Protocol,
+    y_tilde: pd.DataFrame | None = None,
+    universe: pd.DataFrame | None = None,
+    prev_w: pd.Series | None = None,
+    mask: "TradeMask | None" = None,
+    sigma: pd.DataFrame | None = None,
+    pred_scale: float = 1.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """``g`` as a mean--variance optimiser with an explicit turnover budget.
+
+    The member of the admissible family that top-k dropout cannot be: turnover
+    is a *constraint the optimiser trades against*, not a by-product of
+    ``n_drop/topk``. That is what makes it possible to ask whether a
+    capacity-aware objective produces a book that survives its own costs --
+    under top-k dropout the question is unanswerable because the book trades
+    the same amount whatever it predicts.
+
+    Expected returns are ``pred_scale · ŷ`` so that μ, the risk penalty and the
+    turnover budget are all in the same units; see
+    :func:`~quantaalpha.eval.execution.prediction_scale`.
+    """
+    port = theta.portfolio
+    lam = float(port.risk_aversion)
+    cap = float(port.turnover_cap)
+    max_w = float(port.max_weight)
+    if port.signed:
+        raise NotImplementedError("mean_variance currently builds a long-only book")
+
+    weights = pd.DataFrame(0.0, index=pred.index, columns=pred.columns)
+    drifted = pd.DataFrame(0.0, index=pred.index, columns=pred.columns)
+    w_prev = prev_w.reindex(pred.columns).fillna(0.0) if prev_w is not None else None
+
+    for date in pred.index:
+        scores = pred.loc[date]
+        if universe is not None:
+            scores = scores.where(universe.loc[date].astype(bool))
+        scores = scores.dropna()
+
+        if w_prev is None:
+            w_drift = pd.Series(0.0, index=pred.columns)
+        elif y_tilde is None:
+            w_drift = w_prev.copy()
+        else:
+            prior = y_tilde.shift(1).loc[date] if date in y_tilde.index else None
+            w_drift = drift(w_prev, prior, theta) if prior is not None else w_prev.copy()
+
+        if scores.empty:
+            weights.loc[date] = w_drift
+            drifted.loc[date] = w_drift
+            w_prev = w_drift
+            continue
+
+        mu = pred_scale * scores
+        vol = (sigma.loc[date].reindex(scores.index)
+               if sigma is not None and date in sigma.index
+               else pd.Series(0.02, index=scores.index))
+        target = _mv_weights(mu, vol.fillna(vol.median() if vol.notna().any() else 0.02) ** 2,
+                             lam, max_w)
+
+        # Spend at most the turnover budget: move partway from the drifted book
+        # toward the target. Both are on the simplex, so the blend is feasible.
+        w_full = target.reindex(pred.columns).fillna(0.0)
+        step = w_full - w_drift
+        move = 0.5 * float(step.abs().sum())
+        if move > cap > 0:
+            w_new = w_drift + step * (cap / move)
+        else:
+            w_new = w_full
+
+        row = lambda f: (f.loc[date] if f is not None and date in f.index else None)
+        w_new = _apply_tradability(
+            w_new, w_drift,
+            row(mask.can_buy) if mask is not None else None,
+            row(mask.can_sell) if mask is not None else None,
+        )
+
+        exposure = float(w_new.abs().sum())
+        if exposure > float(port.gross_leverage) + 1e-6:
+            raise AssertionError(f"gross leverage {exposure:.6f} exceeds "
+                                 f"{port.gross_leverage} on {date}")
+
+        weights.loc[date] = w_new
+        drifted.loc[date] = w_drift
+        w_prev = w_new
+
+    return weights, drifted
+
+
+CONSTRUCTIONS = {"topk_dropout": topk_dropout, "mean_variance": mean_variance}
+
+
+def build_book(pred: pd.DataFrame, theta: Protocol, **kwargs):
+    """Dispatch to the construction named in Θ."""
+    try:
+        fn = CONSTRUCTIONS[theta.portfolio.construction]
+    except KeyError:
+        raise NotImplementedError(
+            f"unsupported construction {theta.portfolio.construction!r}; "
+            f"known: {sorted(CONSTRUCTIONS)}"
+        ) from None
+    return fn(pred, theta, **kwargs)
