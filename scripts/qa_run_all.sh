@@ -24,6 +24,19 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${SCRIPT_DIR}"
 
+# Re-exec under caffeinate so a multi-day run is not ended by the machine
+# sleeping. nohup only survives the terminal closing; it does nothing about
+# system sleep, and the default macOS behaviour on battery is to sleep.
+#   -i  no idle sleep      -m  no disk sleep      -s  no system sleep (on AC)
+# This does NOT defeat closing the lid: that sleeps the machine regardless
+# unless an external display is attached (clamshell) or pmset disablesleep is
+# set. The pre-flight below says so explicitly rather than letting you find out
+# on day three.
+if [ -z "${QA_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    export QA_CAFFEINATED=1
+    exec caffeinate -ims "$0" "$@"
+fi
+
 DIRECTION="${1:?usage: $0 \"<research direction>\"}"
 SEEDS="${QA_SEEDS:-42 7 13}"
 N_SEEDS=$(echo ${SEEDS} | wc -w | tr -d ' ')
@@ -55,6 +68,26 @@ if ! PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_preflight.py \
     echo ""
     echo "Pre-flight FAILED -- nothing started."
     exit 1
+fi
+
+# --- power: an 8-day run must survive the machine being left alone ---
+if command -v pmset >/dev/null 2>&1; then
+    ON_AC=$(pmset -g batt 2>/dev/null | grep -c "AC Power")
+    LID_SLEEPS=$(pmset -g custom 2>/dev/null | awk '/AC Power/,0' | awk '/ disablesleep/{print $2}')
+    echo ""
+    echo "POWER"
+    if [ "${ON_AC}" -eq 0 ]; then
+        echo "  !! ON BATTERY -- macOS sleeps on battery by default and the run will"
+        echo "     stop. Plug in before leaving this."
+    else
+        echo "  on AC power, running under caffeinate (no idle/disk/system sleep)"
+    fi
+    if [ "${LID_SLEEPS:-0}" != "1" ]; then
+        echo "  !! CLOSING THE LID WILL STILL SLEEP THE MACHINE and pause the run."
+        echo "     Leave it open, or attach an external display, or run:"
+        echo "         sudo pmset -a disablesleep 1     # undo: sudo pmset -a disablesleep 0"
+        echo "     The run resumes on wake, but hours of wall-clock are lost."
+    fi
 fi
 
 mkdir -p data/results
