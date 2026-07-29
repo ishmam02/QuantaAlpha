@@ -65,7 +65,14 @@ combiner: # procedure A — Eq. 2; FROZEN, seed included
     - "$close/Ref($close, 1)-1"
   fit_split: train
 
-portfolio: # g — Eq. 6; the baseline's construction
+portfolio:
+  # Turnover must be a decision, not a constant. With this off the book always
+  # swaps n_drop names, so turnover is pinned at n_drop/topk (measured 0.105
+  # across every configuration) and the cost model cannot influence what is
+  # traded -- a capacity-aware objective then has nothing to express itself
+  # through. See eval/portfolio.py and execution.prediction_scale.
+  cost_aware_dropout: true
+  swap_hurdle: 1.0 # g — Eq. 6; the baseline's construction
   construction: topk_dropout
   topk: 50 # conf_combined_factors.yaml:66, backtest.yaml:120
   n_drop: 5 # :67, :121
@@ -153,3 +160,16 @@ admission:
   tau_admit: 0.50
   tau_evict: 0.25
   min_size: 6
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation for the IN-LOOP evaluation only. A single
+# train/validate block can sit inside one market regime, so a factor is
+# selected on a market that no longer exists by the time the test window
+# starts. Folds expand from a common start date and end at the configured
+# split, so folds=1 reproduces the fixed split exactly. final_test is never
+# involved -- progressive retraining changes how the search SELECTS, not how
+# results are reported.
+walk_forward:
+  enabled: true
+  folds: 3
