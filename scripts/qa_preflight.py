@@ -86,6 +86,52 @@ def main() -> int:
         return f"model={os.environ['CHAT_MODEL']} temp={temp} seed={os.environ['CHAT_SEED']}"
     check("LLM env pinned (temperature 0, seed set)", env)
 
+    def llm_live():
+        """Actually call the model. Checking it is *configured* is not enough.
+
+        kimi-k2.5 was retired at 2026-07-31 00:00 PDT. A paper run started that
+        morning failed on its first request and spent 2.6 hours retrying: 2090
+        HTTP 410s, zero factors, zero libraries. Every other check passed,
+        because every other check asked whether the model was NAMED rather than
+        whether it ANSWERS. One request up front is the difference between
+        losing four seconds and losing an afternoon.
+        """
+        import json
+        import urllib.request
+
+        base = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
+        model = os.environ.get("CHAT_MODEL", "")
+        if not base or not model:
+            raise RuntimeError("OPENAI_BASE_URL or CHAT_MODEL unset")
+        req = urllib.request.Request(
+            f"{base}/chat/completions",
+            data=json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                "max_tokens": 2000, "temperature": 0,
+            }).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                payload = json.load(r)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode()[:200]
+            raise RuntimeError(f"{model} returned HTTP {exc.code}: {body}") from None
+        except Exception as exc:
+            raise RuntimeError(f"{model} unreachable at {base}: {exc}") from None
+
+        content = (payload.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if not content.strip():
+            raise RuntimeError(
+                f"{model} answered with EMPTY content. Reasoning models can spend the "
+                f"whole budget before emitting any -- raise CHAT_MAX_TOKENS or pick "
+                f"another model; mining cannot parse an empty response."
+            )
+        return f"{model} answered {content.strip()[:20]!r}"
+    check("LLM endpoint answers", llm_live)
+
     # --- protocol --------------------------------------------------------
     from quantaalpha.eval.protocol import default_protocol_path, load_protocol
     theta = load_protocol(default_protocol_path())
