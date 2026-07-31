@@ -77,6 +77,11 @@ echo "  mines     : $((N_SEEDS)) Arm A + $((N_SEEDS * N_CONS)) Arm B = $((N_SEED
 echo "  output    : ${OUT}"
 echo "========================================================================"
 
+# Hoisted here, not left to run.sh, for two reasons: the pre-flight check for
+# process fan-out runs in THIS shell and must see the same value the mining
+# runs will use, and every child inherits it so both arms are covered.
+export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
+
 # ---- pre-flight: fail in seconds rather than after days ----
 if ! PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_preflight.py --config "${CONFIG_PATH}" \
         | tee "${OUT}/preflight.txt"; then

@@ -73,6 +73,12 @@ echo "  parallel  : ${PARALLEL} instance(s) x ~${PROC_PER_INSTANCE} proc = "\
 echo "  arm B g   : ${QA_ARM_B_CONSTRUCTIONS:-topk_dropout mean_variance}"
 echo "========================================================================"
 
+# Hoisted here rather than left to run.sh: the process fan-out check runs in
+# THIS shell and must see the same value the mining runs will use. Without it
+# pre-flight measured the parallel configuration, failed, and refused to start
+# a run that would in fact have been sequential and safe.
+export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
+
 # Fail in seconds, once, before any instance starts.
 [ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
 eval "$(conda shell.bash hook)" 2>/dev/null || true
