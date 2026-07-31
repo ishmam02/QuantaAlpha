@@ -130,6 +130,7 @@ for SEED in ${SEEDS}; do
     QA_INSTANCE="s${SEED}" \
     FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${SEED}" \
     QA_THREADS="${THREADS}" \
+    QA_REUSE_A="${QA_REUSE_A:-}" \
     nohup ./scripts/qa_paper_experiment.sh "${DIRECTION}" > "${LOG}" 2>&1 &
     PIDS+=($!)
     LAUNCHED=$((LAUNCHED + 1))

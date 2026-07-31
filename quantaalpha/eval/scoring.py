@@ -31,10 +31,28 @@ from quantaalpha.eval.protocol import Protocol
 
 # dimension -> (metric key, higher_is_better)
 RANKED_DIMENSIONS: dict[str, tuple[str, bool]] = {
-    # Rank on MARGINAL contribution, not the book's absolute performance:
-    # candidates sharing a zoo produce near-identical absolute net_ir, so
-    # ranking on it barely discriminates. Must match what the gate admits on.
-    "effectiveness": ("delta_net_ir", True),
+    # Ranks on the book's absolute risk-adjusted return, NOT on marginal
+    # contribution. Marginal contribution was the original choice, on the
+    # reasoning that candidates sharing a zoo produce near-identical absolute
+    # net_ir. Two independent measurements say otherwise:
+    #
+    #   * delta_net_ir gating flipped 3 of 4 verdicts across combiner seeds --
+    #     the deltas are smaller than the noise on them;
+    #   * delta necessarily decays toward zero as the repository grows, so
+    #     every batch ties at rank 0 and the heaviest dimension (omega 0.30)
+    #     turns into noise exactly when the repository starts working. Observed
+    #     live on run 20260731_144810: batches 5-10 all scored e_effectiveness
+    #     = 0.00, freezing the zoo at 12, and the gate rejected the best batch
+    #     of the entire run (net ARR -1.3%) while having admitted one at
+    #     -2.80%. A bar that shuts as the repository improves is a ratchet, not
+    #     a quality criterion.
+    #
+    # Replaying that ledger: ranking on delta_net_ir admits 4/10 and rejects
+    # the best batch; on net_ir it admits 7/10, rejects the worst (-10.2%) and
+    # admits the best. net_ir rather than net_arr because `arr` already ranks
+    # net_arr -- reusing it here would put 0.50 of the weight on one quantity
+    # under two names, where net_ir is risk-adjusted and stays distinct.
+    "effectiveness": ("net_ir", True),
     "arr": ("net_arr", True),
     "stability": ("rank_icir", True),
     "turnover": ("turnover_book", False),

@@ -122,7 +122,21 @@ for SEED in ${QA_SEEDS}; do
     # Vary BOTH seeds: QA_SEED reseeds the evolution operators, QA_CHAT_SEED
     # the generator itself. Holding the latter fixed would sample a much
     # narrower slice of the variation that actually dominates this study.
-    ARM_A_LIB=""
+    # QA_REUSE_A lets an already-mined control library stand in, so a change
+    # that only affects the treatment arm does not pay to re-mine a control it
+    # cannot have altered. Arm A's pipeline never reads Theta's scoring, so
+    # reusing it is exact, not an approximation -- but the pairing is then
+    # across runs for that seed, and run-to-run generation variance only
+    # cancels for arms mined together. Say so in the write-up.
+    ARM_A_LIB="${QA_REUSE_A:-}"
+    if [ -n "${ARM_A_LIB}" ]; then
+        if [ -f "${ARM_A_LIB}" ]; then
+            echo "  reusing Arm A: ${ARM_A_LIB} ($(count_factors "${ARM_A_LIB}") factors)"
+        else
+            echo "  !! QA_REUSE_A=${ARM_A_LIB} not found; will mine Arm A instead"
+            ARM_A_LIB=""
+        fi
+    fi
     for CONSTRUCTION in ${QA_ARM_B_CONSTRUCTIONS}; do
         PROTO="$(protocol_for "${CONSTRUCTION}")"
         TAG="seed_${SEED}_${CONSTRUCTION}"
