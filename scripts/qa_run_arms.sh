@@ -131,48 +131,64 @@ run_arm () {
 # pairing is then across runs, and run-to-run generation variance is large (it
 # only cancels for arms mined in the SAME run).
 QA_ARMS="${QA_ARMS:-control treatment}"
-case " ${QA_ARMS} " in *" control "*) run_arm control "ARM A -- control (RankIC objective)";; esac
-case " ${QA_ARMS} " in
-    *" treatment "*)
-        # Target comes from the CONFIG, not from Arm A's realised output.
-        # Deriving it from Arm A would couple Arm B's budget to Arm A's own
-        # run-to-run noise (measured at 4pp on return, and one factor short of
-        # the nominal count on two of three runs) and would stop Arm B from
-        # running on its own. The config determines the shape of the search, so
-        # it determines the count both arms are aiming at.
-        if [ -z "${QA_TARGET_ZOO:-}" ]; then
-            N_EXP="$(PYTHONPATH="${SCRIPT_DIR}" "${PY}" - "${CONFIG_PATH}" <<'PYCFG' 2>/dev/null
+# QA_ARM_ORDER decides which arm mines first. Treatment leads by default: it is
+# the arm carrying whatever change is under test, so a mistake in it surfaces in
+# the first hour rather than after the control has spent three. The arms are
+# independent -- Arm B's factor target comes from the config, not from Arm A's
+# output -- so the order affects only when you learn something, never what.
+QA_ARM_ORDER="${QA_ARM_ORDER:-treatment control}"
+
+setup_treatment () {
+    # Target comes from the CONFIG, not from Arm A's realised output.
+    # Deriving it from Arm A would couple Arm B's budget to Arm A's own
+    # run-to-run noise (measured at 4pp on return, and one factor short of
+    # the nominal count on two of three runs) and would stop Arm B from
+    # running on its own. The config determines the shape of the search, so
+    # it determines the count both arms are aiming at.
+    if [ -z "${QA_TARGET_ZOO:-}" ]; then
+        N_EXP="$(PYTHONPATH="${SCRIPT_DIR}" "${PY}" - "${CONFIG_PATH}" <<'PYCFG' 2>/dev/null
 import sys, yaml
 from quantaalpha.pipeline.evolution.controller import expected_factor_count
 c = yaml.safe_load(open(sys.argv[1])); ev = c.get("evolution", {})
 print(expected_factor_count(
-    c.get("planning", {}).get("num_directions", 2),
-    ev.get("crossover_n", 2),
-    ev.get("max_rounds", 3),
-    c.get("factor", {}).get("factors_per_hypothesis", 1)))
+c.get("planning", {}).get("num_directions", 2),
+ev.get("crossover_n", 2),
+ev.get("max_rounds", 3),
+c.get("factor", {}).get("factors_per_hypothesis", 1)))
 PYCFG
 )"
-            case "${N_EXP}" in ''|*[!0-9]*) N_EXP=0 ;; esac
-            [ "${N_EXP}" -gt 0 ] && export QA_TARGET_ZOO="${N_EXP}"
-        else
-            export QA_TARGET_ZOO
-        fi
-        if [ -n "${QA_TARGET_ZOO:-}" ]; then
-            # Deliberately NOT defaulted here: the controller falls back to
-            # max_rounds * 3, which scales with the configured search, whereas a
-            # fixed number here would be too tight at paper scale and wastefully
-            # loose at test scale. Export only if the caller pinned one.
-            [ -n "${QA_MAX_ROUNDS_CAP:-}" ] && export QA_MAX_ROUNDS_CAP
-            echo ""
-            echo "  !! BUDGET PARITY BROKEN BY DESIGN"
-            echo "     Arm B mines until |zoo| >= ${QA_TARGET_ZOO} admitted factors"
-            echo "     (the count this config is expected to produce), capped at"
-            echo "     ${QA_MAX_ROUNDS_CAP:-max_rounds x3} rounds."
-            echo "     Arm B searches more than Arm A -- report both budgets."
-        fi
+        case "${N_EXP}" in ''|*[!0-9]*) N_EXP=0 ;; esac
+        [ "${N_EXP}" -gt 0 ] && export QA_TARGET_ZOO="${N_EXP}"
+    else
+        export QA_TARGET_ZOO
+    fi
+    if [ -n "${QA_TARGET_ZOO:-}" ]; then
+        # Deliberately NOT defaulted here: the controller falls back to
+        # max_rounds * 3, which scales with the configured search, whereas a
+        # fixed number here would be too tight at paper scale and wastefully
+        # loose at test scale. Export only if the caller pinned one.
+        [ -n "${QA_MAX_ROUNDS_CAP:-}" ] && export QA_MAX_ROUNDS_CAP
+        echo ""
+        echo "  !! BUDGET PARITY BROKEN BY DESIGN"
+        echo "     Arm B mines until |zoo| >= ${QA_TARGET_ZOO} admitted factors"
+        echo "     (the count this config is expected to produce), capped at"
+        echo "     ${QA_MAX_ROUNDS_CAP:-max_rounds x3} rounds."
+        echo "     Arm B searches more than Arm A -- report both budgets."
+    fi
+}
+
+for _arm in ${QA_ARM_ORDER}; do
+    case " ${QA_ARMS} " in
+        *" ${_arm} "*) ;;
+        *) continue ;;
+    esac
+    if [ "${_arm}" = "treatment" ]; then
+        setup_treatment
         run_arm treatment "ARM B -- treatment (net-of-cost U objective)"
-        ;;
-esac
+    else
+        run_arm control "ARM A -- control (RankIC objective)"
+    fi
+done
 
 LIB_A="${QA_REUSE_A:-data/factorlib/all_factors_library_control_${STAMP}.json}"
 LIB_B="${QA_REUSE_B:-data/factorlib/all_factors_library_treatment_${STAMP}.json}"
