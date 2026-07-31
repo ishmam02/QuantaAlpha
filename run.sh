@@ -52,6 +52,18 @@ if [ -n "${QA_CHAT_SEED:-}" ]; then
     export CHAT_SEED="${QA_CHAT_SEED}"
 fi
 
+# Applies to BOTH arms. Two reasons, and the second is what crashed a run.
+#
+# 1. Feedback can only teach a batch generated after it, so batches produced
+#    concurrently inside a round never see each other's verdicts.
+# 2. With num_directions=10 and parallel_enabled, ONE arm forks ~16 Python
+#    processes, each loading pandas, qlib and panel data. Two instances put 32
+#    interpreters on an 8-core/16 GB box and exhausted memory ~35 minutes in.
+#    Setting this only for the treatment arm, as it was, left the control arm
+#    running fully parallel -- and both instances were mining the control arm
+#    when the machine died.
+export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
+
 # =============================================================================
 # Activate conda environment
 # =============================================================================
@@ -204,14 +216,6 @@ if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
     export QLIB_FACTOR_RUNNER="quantaalpha.factors.net_cost_runner.NetCostFactorRunner"
     export QLIB_FACTOR_SUMMARIZER="quantaalpha.factors.net_cost_feedback.NetCostFactorFeedback"
     export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-U}"
-    # Feedback can only teach a batch that is generated AFTER it. With phases
-    # run in parallel, batches inside a round are produced concurrently, so a
-    # rejection in one never reaches its siblings -- which is why the admission
-    # rate showed no trend across the 6 batches of run 20260729_081848. Forcing
-    # sequential evolution makes every batch see every earlier verdict, at the
-    # cost of wall-clock. Set QA_SEQUENTIAL_EVOLUTION=false to trade the signal
-    # back for speed.
-    export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
     # Rejection is FEEDBACK, not exclusion. Filtering rejected factors out of
     # the parent pool would keep the generator from ever seeing why they were
     # rejected, so it could not learn to clear the bar -- the gate would only

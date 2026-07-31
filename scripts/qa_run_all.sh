@@ -43,19 +43,33 @@ N_SEEDS=$(echo ${SEEDS} | wc -w | tr -d ' ')
 
 CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)"
 RAM_GB="$(( $(sysctl -n hw.memsize 2>/dev/null || echo 17179869184) / 1073741824 ))"
-# ~6 GB per instance, and never more instances than seeds or cores/2.
-BY_RAM=$(( RAM_GB / 6 )); [ "${BY_RAM}" -lt 1 ] && BY_RAM=1
-BY_CPU=$(( CORES / 4 ));  [ "${BY_CPU}" -lt 1 ] && BY_CPU=1
+
+# Size by PROCESSES, not by instances. An earlier version budgeted ~6 GB per
+# instance and picked two on a 16 GB box -- but an instance is not one process.
+# With num_directions=10 and parallel evolution each instance forked ~16 Python
+# interpreters, every one of them loading pandas, qlib and panel data. Two
+# instances meant 32 interpreters, memory was exhausted about 35 minutes in and
+# the machine went down with nothing to show for it.
+#
+# QA_SEQUENTIAL_EVOLUTION (set in run.sh, both arms) now holds an instance to
+# roughly PROC_PER_INSTANCE interpreters. Budget ~1.2 GB each, keep 4 GB for the
+# OS, and never exceed one instance per 2 cores.
+PROC_PER_INSTANCE="${QA_PROC_PER_INSTANCE:-3}"
+GB_PER_PROC=2
+USABLE_GB=$(( RAM_GB - 4 )); [ "${USABLE_GB}" -lt 2 ] && USABLE_GB=2
+BY_RAM=$(( USABLE_GB / (PROC_PER_INSTANCE * GB_PER_PROC) )); [ "${BY_RAM}" -lt 1 ] && BY_RAM=1
+BY_CPU=$(( CORES / (PROC_PER_INSTANCE * 2) ));               [ "${BY_CPU}" -lt 1 ] && BY_CPU=1
 PARALLEL="${QA_PARALLEL:-$(( BY_RAM < BY_CPU ? BY_RAM : BY_CPU ))}"
 [ "${PARALLEL}" -gt "${N_SEEDS}" ] && PARALLEL="${N_SEEDS}"
-THREADS=$(( CORES / PARALLEL )); [ "${THREADS}" -lt 1 ] && THREADS=1
+THREADS=$(( CORES / (PARALLEL * PROC_PER_INSTANCE) )); [ "${THREADS}" -lt 1 ] && THREADS=1
 
 echo "========================================================================"
 echo "  FULL EXPERIMENT -- ${N_SEEDS} seed(s), ${PARALLEL} at a time"
 echo "------------------------------------------------------------------------"
 echo "  host      : ${CORES} cores, ${RAM_GB} GB RAM"
 echo "  seeds     : ${SEEDS}"
-echo "  parallel  : ${PARALLEL}  (${THREADS} threads each)"
+echo "  parallel  : ${PARALLEL} instance(s) x ~${PROC_PER_INSTANCE} proc = "\
+     "$(( PARALLEL * PROC_PER_INSTANCE )) interpreters, ${THREADS} thread(s) each"
 echo "  arm B g   : ${QA_ARM_B_CONSTRUCTIONS:-topk_dropout mean_variance}"
 echo "========================================================================"
 
@@ -97,7 +111,11 @@ for SEED in ${SEEDS}; do
     # Throttle to PARALLEL concurrent instances.
     while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${PARALLEL}" ]; do sleep 30; done
 
-    LOG="/tmp/qa_full_seed_${SEED}.log"
+    # NOT /tmp: macOS clears it on reboot, so the crash that ends a run also
+    # destroys the only record of why. The per-seed logs written under
+    # data/results survived; these did not.
+    mkdir -p data/results/logs
+    LOG="data/results/logs/qa_full_seed_${SEED}.log"
     echo "launching seed ${SEED} -> ${LOG}"
     # Every shared mutable path is made per-instance. The factor-signal cache is
     # keyed by expression MD5 and the flat-fee cache is a read-modify-write of
@@ -122,6 +140,6 @@ echo "  ALL SEEDS COMPLETE"
 echo "========================================================================"
 ls -1d data/results/paper_* 2>/dev/null | sed 's/^/  /'
 echo ""
-echo "Per-seed logs: /tmp/qa_full_seed_*.log"
+echo "Per-seed logs: data/results/logs/qa_full_seed_*.log"
 echo "Read each run's paired_summary.md; the effect is the PAIRED difference,"
 echo "not either arm's own number."

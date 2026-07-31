@@ -214,6 +214,40 @@ def main() -> int:
         return f"{n} factors expected per arm (Arm B mines until it ADMITS this many)"
     check("config produces a sane factor target", expected_count)
 
+    def process_fanout():
+        """Would this config fork more interpreters than the box can hold?
+
+        This is the check that did not exist when a run took the machine down.
+        num_directions=10 with parallel evolution forks ~16 Python processes per
+        instance, each loading pandas, qlib and panel data; two instances put 32
+        on a 16 GB box and exhausted memory 35 minutes in.
+        """
+        import shutil as _sh
+        import yaml
+        cfg = yaml.safe_load((ROOT / args.config).read_text())
+        ev = cfg.get("evolution", {})
+        dirs = int(cfg.get("planning", {}).get("num_directions", 2))
+        sequential = os.environ.get("QA_SEQUENTIAL_EVOLUTION", "").lower() in ("1", "true", "yes")
+        parallel = bool(ev.get("parallel_enabled", False)) and not sequential
+        procs = dirs if parallel else 1
+
+        try:
+            ram_gb = int(os.popen("sysctl -n hw.memsize").read().strip()) / 1e9
+        except Exception:
+            ram_gb = 16.0
+        budget = max(int((ram_gb - 4) / 2), 1)
+        if procs > budget:
+            raise RuntimeError(
+                f"config would fork ~{procs} worker processes per instance "
+                f"(num_directions={dirs}, parallel evolution on) against room for "
+                f"~{budget} on {ram_gb:.0f} GB. Set QA_SEQUENTIAL_EVOLUTION=true "
+                f"or reduce num_directions -- this is what crashed the machine."
+            )
+        return (f"~{procs} worker process(es) per instance, budget ~{budget} "
+                f"on {ram_gb:.0f} GB"
+                + ("" if parallel else " (sequential evolution)"))
+    check("process fan-out fits in memory", process_fanout)
+
     print("=" * 68)
     if _failures:
         print(f"{len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")
