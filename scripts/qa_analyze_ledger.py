@@ -60,9 +60,18 @@ def main() -> int:
 
     lines = [f"# Admission trajectory — `{Path(args.ledger).name}`", ""]
 
-    # Batches that saw the same repository size were generated concurrently.
-    sizes = [r.get("zoo_size", 0) for r in evals]
-    concurrent = len(sizes) - len(set(sizes))
+    # Concurrency detection. Equal zoo sizes are NOT evidence on their own: a
+    # rejected batch leaves the repository unchanged, so the next batch
+    # legitimately sees the same size under strictly sequential execution.
+    # Simulate instead -- track the size each batch SHOULD have seen given the
+    # verdicts before it, and flag only those that saw less, since that means
+    # they were evaluated before an earlier admission had landed.
+    expected, concurrent = 0, 0
+    for r in evals:
+        if r.get("zoo_size", 0) < expected:
+            concurrent += 1
+        if r.get("admitted"):
+            expected += int(r.get("n_factors", 0) or 0)
 
     lines += [
         f"{len(evals)} evaluated batch(es), "
