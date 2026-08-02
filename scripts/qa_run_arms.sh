@@ -118,7 +118,14 @@ run_arm () {
     echo "########################################################################"
     echo "#  ${label}   (EXPERIMENT_ID=${id})"
     echo "########################################################################"
+    # QA_TARGET_ZOO is passed per arm, never inherited. `export` in
+    # setup_treatment persists for the rest of the shell, so once the treatment
+    # arm ran first the control arm silently picked up its target -- and since
+    # the control arm writes no ledger, replay_repository reported 0 admitted
+    # and it extended to the round cap. Observed: Arm A ran 7 rounds against a
+    # configured 5 and reached 194 factors on its way to ~450.
     QA_ARM="${arm}" \
+    QA_TARGET_ZOO="${_ARM_TARGET:-}" \
     EXPERIMENT_ID="${id}" \
     FACTOR_LIBRARY_SUFFIX="${id}" \
     CONFIG_PATH="${CONFIG_PATH}" \
@@ -158,11 +165,11 @@ c.get("factor", {}).get("factors_per_hypothesis", 1)))
 PYCFG
 )"
         case "${N_EXP}" in ''|*[!0-9]*) N_EXP=0 ;; esac
-        [ "${N_EXP}" -gt 0 ] && export QA_TARGET_ZOO="${N_EXP}"
+        [ "${N_EXP}" -gt 0 ] && _ARM_TARGET="${N_EXP}"
     else
-        export QA_TARGET_ZOO
+        _ARM_TARGET="${QA_TARGET_ZOO}"
     fi
-    if [ -n "${QA_TARGET_ZOO:-}" ]; then
+    if [ -n "${_ARM_TARGET:-}" ]; then
         # Deliberately NOT defaulted here: the controller falls back to
         # max_rounds * 3, which scales with the configured search, whereas a
         # fixed number here would be too tight at paper scale and wastefully
@@ -170,7 +177,7 @@ PYCFG
         [ -n "${QA_MAX_ROUNDS_CAP:-}" ] && export QA_MAX_ROUNDS_CAP
         echo ""
         echo "  !! BUDGET PARITY BROKEN BY DESIGN"
-        echo "     Arm B mines until |zoo| >= ${QA_TARGET_ZOO} admitted factors"
+        echo "     Arm B mines until |zoo| >= ${_ARM_TARGET} admitted factors"
         echo "     (the count this config is expected to produce), capped at"
         echo "     ${QA_MAX_ROUNDS_CAP:-max_rounds x3} rounds."
         echo "     Arm B searches more than Arm A -- report both budgets."
@@ -182,6 +189,7 @@ for _arm in ${QA_ARM_ORDER}; do
         *" ${_arm} "*) ;;
         *) continue ;;
     esac
+    _ARM_TARGET=""          # cleared per arm: only the treatment arm has a target
     if [ "${_arm}" = "treatment" ]; then
         setup_treatment
         run_arm treatment "ARM B -- treatment (net-of-cost U objective)"

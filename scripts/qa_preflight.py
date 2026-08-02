@@ -294,6 +294,27 @@ def main() -> int:
                 + ("" if parallel else " (sequential evolution)"))
     check("process fan-out fits in memory", process_fanout)
 
+    def target_not_leaked():
+        """QA_TARGET_ZOO must not reach the control arm.
+
+        The control arm writes no ledger, so a target it can never satisfy sends
+        it to the round cap. Observed on run 20260731_191752: `export` inside
+        setup_treatment persisted for the rest of the shell, the control arm
+        inherited 150, reported 0 admitted forever, and ran 7 rounds against a
+        configured 5 -- heading for ~450 factors against the treatment arm's 174.
+        """
+        import re
+        src = (ROOT / "scripts/qa_run_arms.sh").read_text()
+        if re.search(r"^\s*export QA_TARGET_ZOO", src, re.M):
+            raise RuntimeError(
+                "qa_run_arms.sh exports QA_TARGET_ZOO into the shell; it will leak "
+                "into whichever arm runs next. Pass it per arm instead."
+            )
+        if 'QA_TARGET_ZOO="${_ARM_TARGET:-}"' not in src:
+            raise RuntimeError("run_arm does not pass QA_TARGET_ZOO per arm")
+        return "passed per arm, not exported"
+    check("factor target cannot leak between arms", target_not_leaked)
+
     print("=" * 68)
     if _failures:
         print(f"{len(_failures)} CHECK(S) FAILED: {', '.join(_failures)}")
