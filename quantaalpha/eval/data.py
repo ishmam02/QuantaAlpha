@@ -209,10 +209,27 @@ def factor_cache_path(expression: str, cache_dir: str | os.PathLike[str] | None 
 
 
 @lru_cache(maxsize=64)
-def _read_cached_signal(path: str) -> pd.Series:
+def _read_cached_signal(path: str):
+    """Load a cached signal, in whichever shape it was stored.
+
+    Two shapes are legitimate. A signal cached straight from computation is a
+    ``(datetime, instrument)`` MultiIndex Series, sometimes wrapped in a
+    one-column frame. A signal cached after alignment is a WIDE
+    ``(dates x instruments)`` frame.
+
+    The unwrap must therefore be conditional. Taking ``.iloc[:, 0]``
+    unconditionally reduces a wide frame to a single instrument's column --
+    a DatetimeIndex Series, which ``align_signal`` then rejects outright with
+    "expected a (datetime, instrument) MultiIndex Series". That is exactly what
+    happened when the cache was compacted to the aligned form: every consumer
+    broke, while a test calling ``align_signal`` on the pickle directly passed,
+    because it never went through this function.
+    """
     obj = pd.read_pickle(path)
     if isinstance(obj, pd.DataFrame):
-        obj = obj.iloc[:, 0]
+        if isinstance(obj.index, pd.MultiIndex) or obj.shape[1] == 1:
+            obj = obj.iloc[:, 0]        # a Series in a one-column wrapper
+        # else: a wide, already-aligned frame -- pass it through untouched
     return obj
 
 
