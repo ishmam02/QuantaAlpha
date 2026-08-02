@@ -79,6 +79,21 @@ portfolio:
   signed: false # long-only + benchmark excess (baseline-comparable)
   gross_leverage: 1.0 # Σ|w| ≤ 1
 
+  # --- mean_variance member of the admissible family ---
+  # Explicit rather than left to the dataclass defaults: turnover_cap defaulted
+  # to 0.10, exactly equal to n_drop/topk, so the mean-variance budget bound at
+  # the same level the top-k construction is structurally capped at. Both arms
+  # then traded the same amount (measured 0.0989 vs 0.1063) and the construction
+  # comparison tested nothing.
+  #
+  # 0.02 is 5x tighter than top-k can go, which is the point: it is the only
+  # setting under which "turnover is a budget" differs from "turnover is a
+  # by-product". Measured on a real library: cap 0.02 gave net IR -0.0354 at
+  # 0.66 bps/day, against -0.2738 at 4.31 bps/day for top-k dropout.
+  turnover_cap: 0.02
+  risk_aversion: 10.0
+  max_weight: 0.05
+
 costs: # Eq. 7
   kappa0: 0.0020 # = open_cost 0.0005 + close_cost 0.0015 → nests Qlib's flat fee
   # Slippage as a fraction of daily volatility per unit traded weight.
