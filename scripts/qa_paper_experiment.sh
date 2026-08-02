@@ -182,12 +182,31 @@ for SEED in ${QA_SEEDS}; do
             "data/results/ledger_treatment_${STAMP}.jsonl" \
             --out "${OUT}/admission_${TAG}.md" || true
 
+        # Reclaim orphaned signals as we go. Each mined factor caches ~228 MB
+        # at full 2008-2026 x 5982-instrument resolution, so a seed costs ~100 GB
+        # and three exhaust a 1 TB disk mid-run. Orphans -- pickles no library
+        # references -- are always safe; a seed's whole cache is only dropped
+        # after its comparisons have written their results.
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_prune_cache.py --orphans --yes || true
+
         for f in arm_comparison backtest_v2_comparison; do
             [ -f "data/results/${f}_${STAMP}.md" ] && \
                 cp "data/results/${f}_${STAMP}.md" "${OUT}/${f}_${TAG}.md" || true
         done
     done
 done
+
+# ---- reclaim the finished seeds' signal caches ----
+# Safe only here: the comparisons above have written their markdown and JSON,
+# so the signals are needed solely to RE-score, and every factor can be
+# recomputed from the expression its library stores. Set QA_KEEP_CACHE=1 to
+# retain them for re-scoring at a different Theta.
+if [ -z "${QA_KEEP_CACHE:-}" ]; then
+    for SEED in ${SEEDS}; do
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_prune_cache.py \
+            --seed "${SEED}" --yes || true
+    done
+fi
 
 # ---- construction sweep: does g change the conclusion? ----
 # Runs before capacity because it answers a prior question: whether the cost
