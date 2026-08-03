@@ -137,9 +137,36 @@ for SEED in ${SEEDS}; do
     sleep 5     # distinct STAMP: it has one-second resolution
 done
 
+# --- background compactor -------------------------------------------------
+# library.py caches each signal exactly as computed: the full 2008-2026 x 5982
+# grid, ~228 MB, where every consumer reads the 2427 x 622 evaluation panel --
+# 12 MB. Left alone a seed accumulates ~13 GB/hour and fills the disk mid-run,
+# which has already happened twice.
+#
+# Compacting at the source would mean a qlib init and a panel load inside every
+# factor write, in BOTH arms -- the control arm otherwise never touches E_Theta.
+# A periodic sweep is the cheaper trade: it skips files younger than 60s and
+# replaces atomically, so a miner reading a signal sees the old file or the new
+# one, never a partial.
+(
+    sleep "${QA_COMPACT_INTERVAL:-1800}"
+    while pgrep -f "qa_paper_experiment.sh" >/dev/null 2>&1; do
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_compact_cache.py --yes \
+            >> data/results/logs/compact_auto.log 2>&1
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_prune_cache.py --orphans --yes \
+            >> data/results/logs/compact_auto.log 2>&1
+        echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
+            >> data/results/logs/compact_auto.log
+        sleep "${QA_COMPACT_INTERVAL:-1800}"
+    done
+) &
+COMPACTOR_PID=$!
+echo "  background compactor: pid ${COMPACTOR_PID}, every ${QA_COMPACT_INTERVAL:-1800}s"
+
 echo ""
 echo "${LAUNCHED} instance(s) launched. Waiting for all to finish..."
 for pid in "${PIDS[@]}"; do wait "${pid}"; done
+kill "${COMPACTOR_PID}" 2>/dev/null || true
 
 echo ""
 echo "========================================================================"
