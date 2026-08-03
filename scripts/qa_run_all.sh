@@ -155,6 +155,12 @@ done
             >> data/results/logs/compact_auto.log 2>&1
         PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_prune_cache.py --orphans --yes \
             >> data/results/logs/compact_auto.log 2>&1
+        # Workspaces and pickle caches dwarf the signal cache -- a finished arm
+        # leaves ~87 GB of them against ~2 GB of compacted signals -- and the
+        # compactor never touched them. Reaped only for stamps whose process has
+        # exited AND whose every factor resolves in factor_cache.
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_reap_scratch.py --yes \
+            >> data/results/logs/compact_auto.log 2>&1
         echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
             >> data/results/logs/compact_auto.log
         sleep "${QA_COMPACT_INTERVAL:-1800}"
