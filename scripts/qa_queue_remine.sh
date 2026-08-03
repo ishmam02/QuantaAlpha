@@ -29,6 +29,27 @@ mkdir -p data/results/logs
   PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_prune_cache.py --orphans --yes 2>&1 | tail -2
   echo "free: $(df -h . | awk 'NR==2{print $4}')"
 
+  # Retire the 16000-token arms BEFORE the re-mine. Two reasons:
+  #
+  #  1. qa_make_report groups rows by `__label__`, which names the
+  #     CONFIGURATION, not the run. Old and new "Arm A (mined)" rows would be
+  #     averaged into one column -- silently mixing two token budgets, which is
+  #     the exact confound this re-mine exists to remove.
+  #  2. The flat-fee cache is a single file per instance, so rows written by
+  #     the confounded comparison would persist into the clean one.
+  #
+  # Archived rather than deleted: topk@16000 against topk@65536 is a second,
+  # independent measurement of the token-budget effect on a different
+  # construction, which corroborates the 1.9pp seen on mean_variance.
+  ARCHIVE="data/results/archive_16k_tokens"
+  mkdir -p "${ARCHIVE}"
+  for f in data/factorlib/*_20260731_191752*.json; do
+      [ -e "$f" ] && mv "$f" "${ARCHIVE}/" && echo "archived $(basename "$f")"
+  done
+  mv data/results/ledger_treatment_20260731_191752.jsonl "${ARCHIVE}/" 2>/dev/null
+  rm -f data/results/backtest_v2_raw_s42.json data/results/backtest_v2_raw.json
+  echo "purged the flat-fee cache so the clean comparison recomputes from scratch"
+
   # No QA_REUSE_A: Arm A is re-mined too, so all three arms share one budget.
   # QA_ARM_B_CONSTRUCTIONS=topk_dropout mines Arm B under the published
   # construction; mean_variance is already done at this budget.
