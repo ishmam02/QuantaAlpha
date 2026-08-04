@@ -262,6 +262,8 @@ def are_nodes_equal(node1: Node, node2: Node) -> bool:
         return node1.name == node2.name and len(node1.args) == len(node2.args)
     elif isinstance(node1, BinaryOpNode):
         return node1.op == node2.op
+    elif isinstance(node1, UnaryOpNode):
+        return node1.op == node2.op
     elif isinstance(node1, ConditionalNode):
         return True
     return False
@@ -286,6 +288,8 @@ def find_largest_common_subtree(root1: Node, root2: Node) -> Opt[SubtreeMatch]:
             return 1 + sum(get_subtree_size(arg) for arg in node.args)
         elif isinstance(node, BinaryOpNode):
             return 1 + get_subtree_size(node.left) + get_subtree_size(node.right)
+        elif isinstance(node, UnaryOpNode):
+            return 1 + get_subtree_size(node.operand)
         elif isinstance(node, ConditionalNode):
             return 1 + get_subtree_size(node.condition) + \
                    get_subtree_size(node.true_expr) + \
@@ -301,6 +305,8 @@ def find_largest_common_subtree(root1: Node, root2: Node) -> Opt[SubtreeMatch]:
         elif isinstance(root, BinaryOpNode):
             result.extend(get_all_subtrees(root.left))
             result.extend(get_all_subtrees(root.right))
+        elif isinstance(root, UnaryOpNode):
+            result.extend(get_all_subtrees(root.operand))
         elif isinstance(root, ConditionalNode):
             result.extend(get_all_subtrees(root.condition))
             result.extend(get_all_subtrees(root.true_expr))
@@ -331,6 +337,8 @@ def find_largest_common_subtree(root1: Node, root2: Node) -> Opt[SubtreeMatch]:
             else:
                 return are_subtrees_equal(node1.left, node2.left) and \
                        are_subtrees_equal(node1.right, node2.right)
+        elif isinstance(node1, UnaryOpNode):
+            return are_subtrees_equal(node1.operand, node2.operand)
         elif isinstance(node1, ConditionalNode):
             return are_subtrees_equal(node1.condition, node2.condition) and \
                    are_subtrees_equal(node1.true_expr, node2.true_expr) and \
@@ -415,9 +423,11 @@ def count_number_nodes(node: Node) -> int:
         return sum(count_number_nodes(arg) for arg in node.args)
     elif isinstance(node, BinaryOpNode):
         return count_number_nodes(node.left) + count_number_nodes(node.right)
+    elif isinstance(node, UnaryOpNode):
+        return count_number_nodes(node.operand)
     elif isinstance(node, ConditionalNode):
-        return (count_number_nodes(node.condition) + 
-                count_number_nodes(node.true_expr) + 
+        return (count_number_nodes(node.condition) +
+                count_number_nodes(node.true_expr) +
                 count_number_nodes(node.false_expr))
     return 0
 
@@ -459,6 +469,8 @@ def collect_unique_vars(node: Node, unique_vars: set) -> None:
     elif isinstance(node, BinaryOpNode):
         collect_unique_vars(node.left, unique_vars)
         collect_unique_vars(node.right, unique_vars)
+    elif isinstance(node, UnaryOpNode):
+        collect_unique_vars(node.operand, unique_vars)
     elif isinstance(node, ConditionalNode):
         collect_unique_vars(node.condition, unique_vars)
         collect_unique_vars(node.true_expr, unique_vars)
@@ -531,6 +543,8 @@ def collect_base_features(node: Node, base_features: set) -> None:
     elif isinstance(node, BinaryOpNode):
         collect_base_features(node.left, base_features)
         collect_base_features(node.right, base_features)
+    elif isinstance(node, UnaryOpNode):
+        collect_base_features(node.operand, base_features)
     elif isinstance(node, ConditionalNode):
         collect_base_features(node.condition, base_features)
         collect_base_features(node.true_expr, base_features)
@@ -553,9 +567,11 @@ def count_nodes(node: Node) -> int:
         return 1 + sum(count_nodes(arg) for arg in node.args)
     elif isinstance(node, BinaryOpNode):
         return 1 + count_nodes(node.left) + count_nodes(node.right)
+    elif isinstance(node, UnaryOpNode):
+        return 1 + count_nodes(node.operand)
     elif isinstance(node, ConditionalNode):
-        return 1 + (count_nodes(node.condition) + 
-                    count_nodes(node.true_expr) + 
+        return 1 + (count_nodes(node.condition) +
+                    count_nodes(node.true_expr) +
                     count_nodes(node.false_expr))
     return 0
 
