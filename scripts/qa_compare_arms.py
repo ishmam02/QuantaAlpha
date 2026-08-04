@@ -55,6 +55,11 @@ logger = logging.getLogger("qa_compare_arms")
 
 PAPER = {"ic": 0.0472, "rank_ic": 0.0459, "qlib_arr": 0.0468, "qlib_ir": 0.6453, "mdd": -0.1180}
 
+# Above this share of a library missing its signals, the cause is the cache
+# rather than a few factors that never compiled, and the comparison would be
+# reporting on a library that no longer resembles what the arm mined.
+MAX_MISSING_SHARE = 0.10
+
 BASELINE = "LightGBM baseline (base features only)"
 ARM_A = "Arm A — RankIC objective (mined only)"
 ARM_B = "Arm B — net-of-cost U (mined only)"
@@ -71,6 +76,22 @@ def load_library(path: Path) -> list[tuple[str, str]]:
         if expr:
             out.append((name, expr))
     return out
+
+
+def build_zoo(entries, panel, label):
+    """Align every factor that has a cached signal; report the ones that don't.
+
+    Returns ``(zoo, missing)`` so the caller decides what a gap means. Nothing
+    is silently dropped: an excluded factor changes the design matrix and
+    therefore the result, so it has to reach the log and the summary.
+    """
+    zoo, missing = {}, []
+    for name, expr in entries:
+        try:
+            zoo[expr] = align_signal(load_factor_signal(expr), panel)
+        except FileNotFoundError:
+            missing.append((name, expr))
+    return zoo, missing
 
 
 def score(op, theta, panel, window, factors, seeds, label):
@@ -134,8 +155,35 @@ def main() -> int:
         logger.error("One of the libraries has no factors with cached signals.")
         return 2
 
-    zoo_a = {e: align_signal(load_factor_signal(e), panel) for _, e in fa}
-    zoo_b = {e: align_signal(load_factor_signal(e), panel) for _, e in fb}
+    zoo_a, miss_a = build_zoo(fa, panel, "Arm A")
+    zoo_b, miss_b = build_zoo(fb, panel, "Arm B")
+
+    # A library entry is a record of what the search proposed, which is not the
+    # same as what it managed to compute. The mean_variance arm admitted three
+    # factors whose expressions pipe a cross-sectional operator into a
+    # time-series one (DELTA(STD($return), 5)); they never executed, so they
+    # carry no implementation code, no result_h5_path and no cached signal,
+    # while all 153 siblings carry all three. The comprehension that used to
+    # build these dicts raised on the first of them and destroyed the whole
+    # comparison -- 153 computed factors reported nothing because of 3 that
+    # were never computable. Missing signals are now dropped loudly and
+    # counted, and only an implausible number of them aborts the run.
+    for label, missing, total in (("Arm A", miss_a, len(fa)), ("Arm B", miss_b, len(fb))):
+        if not missing:
+            continue
+        share = len(missing) / max(total, 1)
+        logger.warning(
+            "%s: %d/%d factor(s) have no cached signal and are EXCLUDED: %s",
+            label, len(missing), total, ", ".join(n for n, _ in missing[:8])
+            + (" ..." if len(missing) > 8 else ""))
+        if share > MAX_MISSING_SHARE:
+            logger.error(
+                "%s is missing %.0f%% of its signals (>%.0f%%). That is a broken "
+                "cache rather than a few uncomputable factors -- refusing to "
+                "report a comparison on a library this incomplete. Run "
+                "scripts/qa_repair_signals.py to see which and why.",
+                label, 100 * share, 100 * MAX_MISSING_SHARE)
+            return 2
 
     res = {
         BASELINE: score(op, theta,    panel, window, {},    seeds, "baseline"),
@@ -182,7 +230,13 @@ def main() -> int:
     row("Turnover (book)", "turnover_book", "{:.4f}")
     row("Cost (bps/day)", "cost_bps", "{:.2f}")
     row("IS→OOS gap", "is_oos_gap")
-    lines.append(f"| Factor count | 0 | {len(fa)} | {len(fb)} | — |")
+    # The count that priced the book, not the count the library claims. These
+    # differ whenever an arm admitted a factor it could not compute, and factor
+    # count moves the combiner independently of factor quality -- so a reader
+    # comparing the arms needs the number actually used.
+    lines.append(f"| Factor count (scored) | 0 | {len(zoo_a)} | {len(zoo_b)} | — |")
+    if miss_a or miss_b:
+        lines.append(f"| Excluded, no signal | — | {len(miss_a)} | {len(miss_b)} | — |")
 
     if res_base:
         lines += [
@@ -247,6 +301,21 @@ def main() -> int:
         "numbers — run it per arm with `--factor-source custom`. It charges a flat fee "
         "only, so it will read far better than the columns above.",
     ]
+
+    if miss_a or miss_b:
+        lines += [
+            "",
+            "### Excluded factors",
+            "",
+            "Admitted to the library but never computed — no implementation code, no "
+            "`result_h5_path`, no cached signal — so they could not be priced and are "
+            "absent from the design matrix. They are listed because excluding a factor "
+            "changes the result, not as a footnote.",
+            "",
+        ]
+        for label, missing in (("Arm A", miss_a), ("Arm B", miss_b)):
+            for name, _ in missing:
+                lines.append(f"- {label}: `{name}`")
 
     table = "\n".join(lines)
     print()
