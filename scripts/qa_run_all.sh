@@ -83,6 +83,19 @@ export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
 [ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
 eval "$(conda shell.bash hook)" 2>/dev/null || true
 conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || true
+
+# Resolved here, after the activation that gives it the right value, because the
+# maintenance sweep below runs in THIS shell rather than under run.sh -- which is
+# where PY happened to be defined. Under `set -u` the bare reference aborted the
+# sweep subshell on its first cycle, so the automatic compaction added to stop
+# the disk filling had in fact never run once; the disk kept filling and the
+# cause looked like the compactor being too slow. Failing loudly here beats
+# discovering it from a full disk on day three.
+PY="$(command -v python)"
+if [ -z "${PY}" ]; then
+    echo "No python on PATH after activating ${CONDA_ENV_NAME:-quantaalpha} -- aborting."
+    exit 1
+fi
 if ! PYTHONPATH="${SCRIPT_DIR}" python scripts/qa_preflight.py \
         --config "${CONFIG_PATH:-configs/experiment_paper.yaml}"; then
     echo ""
@@ -160,6 +173,14 @@ done
         # compactor never touched them. Reaped only for stamps whose process has
         # exited AND whose every factor resolves in factor_cache.
         PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_reap_scratch.py --yes \
+            >> data/results/logs/compact_auto.log 2>&1
+        # Reaping only fires once an arm exits, which leaves the *running* arm's
+        # execute-memo growing at ~6 GB/hour -- 20 GB in the first 3.4 hours of
+        # the Arm B re-mine, against 7 hours of disk runway and 11.6 hours left
+        # to mine. Safe to drop while live because that memo is keyed on the
+        # factor's code text with no post-process, so a miss re-runs one
+        # factor.py; see the tool for why its siblings are left alone.
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_prune_pickle_cache.py --yes \
             >> data/results/logs/compact_auto.log 2>&1
         echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
             >> data/results/logs/compact_auto.log
