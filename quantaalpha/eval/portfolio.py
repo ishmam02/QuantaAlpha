@@ -17,6 +17,8 @@ alongside precisely because it *does* discriminate between signals.
 
 from __future__ import annotations
 
+import inspect
+
 import logging
 
 import numpy as np
@@ -377,6 +379,7 @@ def mean_variance(
     mask: "TradeMask | None" = None,
     sigma: pd.DataFrame | None = None,
     pred_scale: float = 1.0,
+    close: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """``g`` as a mean--variance optimiser with an explicit turnover budget.
 
@@ -397,6 +400,21 @@ def mean_variance(
     max_w = float(port.max_weight)
     if port.signed:
         raise NotImplementedError("mean_variance currently builds a long-only book")
+
+    # The risk model. "diagonal" is the original behaviour and stays the
+    # default so no existing protocol changes meaning by upgrading the code;
+    # "factor" prices correlation, which is the difference between a book that
+    # holds twelve names and a book that holds one bet twelve times.
+    roll = None
+    if getattr(port, "covariance", "diagonal") == "factor":
+        if close is None:
+            raise ValueError(
+                "covariance='factor' needs the close panel to estimate the risk "
+                "model; the caller must pass close=")
+        from quantaalpha.eval.riskmodel import RollingFactorRisk, mv_weights_factor
+
+        roll = RollingFactorRisk(close, port.risk_window, port.risk_refresh,
+                                 port.n_factors, port.idio_shrink)
 
     weights = pd.DataFrame(0.0, index=pred.index, columns=pred.columns)
     drifted = pd.DataFrame(0.0, index=pred.index, columns=pred.columns)
@@ -423,11 +441,23 @@ def mean_variance(
             continue
 
         mu = pred_scale * scores
-        vol = (sigma.loc[date].reindex(scores.index)
-               if sigma is not None and date in sigma.index
-               else pd.Series(0.02, index=scores.index))
-        target = _mv_weights(mu, vol.fillna(vol.median() if vol.notna().any() else 0.02) ** 2,
-                             lam, max_w)
+        risk = roll.for_date(date, scores.index) if roll is not None else None
+        if risk is not None:
+            from quantaalpha.eval.riskmodel import mv_weights_factor
+
+            target = mv_weights_factor(mu, risk, lam, max_w,
+                                       w_start=w_drift.reindex(scores.index))
+        else:
+            # Either the diagonal model was asked for, or the factor model has
+            # no window yet (the first year of the panel). Falling back is
+            # deliberate: a rank-deficient risk model is worse than an honest
+            # diagonal one.
+            vol = (sigma.loc[date].reindex(scores.index)
+                   if sigma is not None and date in sigma.index
+                   else pd.Series(0.02, index=scores.index))
+            target = _mv_weights(
+                mu, vol.fillna(vol.median() if vol.notna().any() else 0.02) ** 2,
+                lam, max_w)
 
         # Spend at most the turnover budget: move partway from the drifted book
         # toward the target. Both are on the simplex, so the blend is feasible.
@@ -462,7 +492,13 @@ CONSTRUCTIONS = {"topk_dropout": topk_dropout, "mean_variance": mean_variance}
 
 
 def build_book(pred: pd.DataFrame, theta: Protocol, **kwargs):
-    """Dispatch to the construction named in Θ."""
+    """Dispatch to the construction named in Θ.
+
+    Kwargs are filtered to what the chosen construction actually accepts, so a
+    caller can offer everything any member of the family might want without the
+    others raising on an argument they have no use for -- ``close`` is only
+    meaningful to the risk model inside ``mean_variance``.
+    """
     try:
         fn = CONSTRUCTIONS[theta.portfolio.construction]
     except KeyError:
@@ -470,4 +506,5 @@ def build_book(pred: pd.DataFrame, theta: Protocol, **kwargs):
             f"unsupported construction {theta.portfolio.construction!r}; "
             f"known: {sorted(CONSTRUCTIONS)}"
         ) from None
-    return fn(pred, theta, **kwargs)
+    accepted = inspect.signature(fn).parameters
+    return fn(pred, theta, **{k: v for k, v in kwargs.items() if k in accepted})

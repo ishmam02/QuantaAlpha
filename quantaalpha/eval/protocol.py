@@ -188,6 +188,31 @@ class Portfolio:
     # against the cost model itself being optimistic.
     swap_hurdle: float = 1.0
 
+    # --- risk model -------------------------------------------------------
+    # "diagonal" prices each name's own volatility and no correlation, so the
+    # optimiser cannot see that two names are the same bet and will happily
+    # hold both at full weight. It is the honest limit of the first
+    # implementation and it is not what anyone runs a book on.
+    #
+    # "factor" fits a k-factor statistical model to trailing returns --
+    # Sigma = B diag(lambda) B' + diag(d) -- which is the structure every
+    # commercial risk model (Barra, Axioma) has, estimated statistically
+    # instead of from vendor fundamentals. Low rank plus diagonal keeps
+    # Sigma @ w at O(nk) rather than O(n^2), so the optimiser stays fast.
+    covariance: str = "diagonal"
+    # Trailing window used to estimate the model, and how often it is refit.
+    # Both are point-in-time: the window ends strictly before the date being
+    # optimised. Monthly refit is the standard institutional cadence and keeps
+    # the cost of a 2427-date backtest bounded.
+    risk_window: int = 252
+    risk_refresh: int = 21
+    n_factors: int = 5
+    # Shrinkage of the idiosyncratic variances toward their cross-sectional
+    # mean. A statistical model estimated on 252 days of 300 names leaves the
+    # smallest d_i badly under-estimated, and the optimiser will chase exactly
+    # those names because they look riskless.
+    idio_shrink: float = 0.20
+
 
 @dataclass(frozen=True)
 class Constraints:

@@ -323,9 +323,12 @@ class EvaluationOperator:
                 prediction, y_tilde, theta.splits.window(theta.combiner.fit_split)
             )
 
+        # The FULL close history, not the evaluation slice: the risk model
+        # estimates from a trailing window that reaches back before the window
+        # it prices, and truncating it would silently shorten that lookback.
         w, w_drift = build_book(
             window_pred, theta, y_tilde=y_tilde, universe=universe,
-            mask=mask, sigma=sigma, pred_scale=beta,
+            mask=mask, sigma=sigma, pred_scale=beta, close=panel.close,
         )
 
         charges = pd.Series(
