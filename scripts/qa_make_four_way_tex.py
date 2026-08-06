@@ -128,6 +128,32 @@ def main() -> int:
     add(r"\bottomrule")
     add(r"\end{tabular}}")
 
+    # ---- cost model x construction --------------------------------------
+    matrix_dir = Path(args.in_dir)
+    variants = [("flat", "topk_dropout"), ("flat", "mean_variance"),
+                ("full", "topk_dropout"), ("full", "mean_variance")]
+    if all((matrix_dir / f"cost_construction_matrix.{k}.json").exists() for k, _ in ORDER):
+        for metric, cmd, spec, scale, suf in (
+                ("net_arr", "MatrixNetARR", "+.2f", 100.0, r"\%"),
+                ("turnover_book", "MatrixTurnover", ".4f", 1.0, "")):
+            add(rf"\newcommand{{\{cmd}}}{{%")
+            add(r"\begin{tabular}{lrrrr}")
+            add(r"\toprule")
+            add(r" & \multicolumn{2}{c}{flat fee} & \multicolumn{2}{c}{full costs} \\")
+            add(r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}")
+            add(r" & top-$k$ & mean-var & top-$k$ & mean-var \\")
+            add(r"\midrule")
+            for key, label in ORDER:
+                m = json.loads((matrix_dir / f"cost_construction_matrix.{key}.json")
+                               .read_text())["metrics"]
+                cells = []
+                for ck, g in variants:
+                    v, _ = _ms(m[f"{ck}/{g}"][metric])
+                    cells.append(rf"${scale*v:{spec}}{suf}$")
+                add(f"{label} & " + " & ".join(cells) + r" \\")
+            add(r"\bottomrule")
+            add(r"\end{tabular}}")
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(L) + "\n")
