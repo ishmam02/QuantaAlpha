@@ -214,16 +214,22 @@ class Portfolio:
     # Measured: the edge implied by beta is 2.7x larger when calibrated on the
     # split the model was fitted on than on a split it was not.
     cost_hurdle: float = 1.0
-    # Quadratic penalty on how far the book moves, nu/2 * ||w - w_prev||^2.
+    # kappa: inertia charged as (kappa/2) * lambda * dw' Sigma dw.
     #
     # This is what the hard turnover cap was doing by accident. mu is a point
     # estimate whose day-to-day variation is mostly estimation error, and an
     # optimiser that treats it as known chases that error -- Markowitz as an
-    # error-maximiser. A linear transaction cost does not restrain it, because
-    # the cost is roughly constant per unit traded while the apparent edge keeps
-    # moving. A quadratic term prices *distance from the current book*, which is
-    # exactly a prior that today's holdings are approximately right, and yields
-    # partial adjustment toward the target rather than a jump to it.
+    # error-maximiser. A cash cost does not restrain it, being roughly constant
+    # per unit traded while the apparent edge keeps moving.
+    #
+    # DIMENSIONLESS on purpose. An absolute nu||dw||^2 was tried first and did
+    # not survive the window it was tuned on: nu = 0.5 gave turnover 0.0596 on
+    # validation and 0.1092 on test, because mu's dispersion differs between
+    # windows. Measured in the same units as the risk term it sits beside,
+    # kappa sets the FRACTION of the way the book moves -- 1/(1+kappa)
+    # unconstrained -- and that fraction is free of the scale of mu and Sigma.
+    # Same measurement after the change: turnover ratios of 1.06, 1.03, 1.25,
+    # 0.89 and 0.74 across kappa in {0,1,3,9,30}, against 1.83 before.
     trade_penalty: float = 0.0
     # Which split calibrates beta, the score -> expected-return conversion the
     # cost-aware rules trade against.

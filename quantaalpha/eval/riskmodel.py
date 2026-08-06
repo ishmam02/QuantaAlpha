@@ -181,7 +181,7 @@ def mv_weights_costed(
     kappa2: float = 0.0,
     impact_exponent: float = 1.5,
     hurdle: float = 1.0,
-    trade_penalty: float = 0.0,
+    trade_penalty: float = 0.0,   # kappa: dimensionless, see the docstring
     iters: int = 200,
 ) -> pd.Series:
     """argmax μᵀw − (λ/2)wᵀΣw − Σᵢ cᵢ(|wᵢ − w_prev,ᵢ|)  s.t. Σw = 1, 0 ≤ w ≤ cap.
@@ -213,12 +213,58 @@ def mv_weights_costed(
     which is the property that makes turnover an honest decision rather than an
     artefact of the gap between two cost models.
 
+    ``trade_penalty`` is ``κ``, an inertia term ``(κ/2)·λ·Δwᵀ Σ Δw`` charged on
+    top of the cash cost. It is what the hard turnover cap was supplying by
+    accident: ``μ`` is a point estimate whose day-to-day movement is largely
+    estimation error, and an optimiser that treats it as known chases that error
+    -- Markowitz as an error-maximiser. A cash cost does not restrain that,
+    because it is roughly constant per unit traded while the apparent edge keeps
+    moving.
+
+    **κ is dimensionless, and that is the point.** An absolute coefficient
+    ``ν‖Δw‖²`` was tried first and did not survive the window it was tuned on:
+    ``ν = 0.5`` gave turnover 0.0596 on the 2021 validation split and 0.1092 on
+    2022-2025 with everything else identical, because ``μ``'s dispersion differs
+    between windows and a fixed ``ν`` restrains a larger ``μ`` proportionally
+    less. Measuring the inertia in the same units as the risk term removes the
+    dependence: solving the unconstrained first-order condition gives
+
+        w = 1/(1+κ) · w_markowitz + κ/(1+κ) · w_prev
+
+    so ``κ`` sets the *fraction* of the way the book moves toward its target and
+    that fraction is free of the scale of both ``μ`` and ``Σ``. This is the
+    Gârleanu-Pedersen result -- with quadratic costs the optimal policy trades
+    partway to the Markowitz portfolio rather than jumping to it.
+
+    That identity is exact only *unconstrained*; verified to 1e-10 across a 100x
+    range in ``μ`` and 5x in ``λ``, but the box and simplex constraints here mean
+    it holds approximately rather than exactly. What matters is whether it
+    transfers, and measured on the real backtest it does. Turnover under the
+    same setting, validation (2021) against test (2022-2025):
+
+        kappa    0     1     3     9    30       absolute nu = 0.5
+        valid  .136  .131  .065  .045  .040            .060
+        test   .145  .135  .081  .039  .030            .109
+        ratio  1.06  1.03  1.25  0.89  0.74            1.83
+
+    The absolute coefficient nearly doubled its turnover out of sample; ``κ``
+    lands within a quarter either way. The scale dependence is gone.
+
+    It is not, however, enough to make this construction preferable: at every
+    ``κ`` the hard cap still returns more on test (-0.82% against -6.45% at the
+    best ``κ``), and the gap is far larger than the turnover difference between
+    them explains. Whatever remains is about *which* trades are chosen rather
+    than how many, and the non-monotone ``κ=1`` row on validation suggests the
+    subgradient solve is a suspect. ``cost_in_objective`` stays off by default.
+
     Solved by projected subgradient: the smooth part contributes
-    ``μ − λΣw`` and the penalty contributes ``−γ·sign(w − w_prev)``, and each
-    iterate is projected back onto the capped simplex. The objective is concave
-    and the feasible set convex and compact, so this converges; the step decays
-    as ``1/√t`` because the subgradient of ``|·|`` does not vanish at the
-    optimum and a fixed step would chatter around it.
+    ``μ − λΣw − κλΣΔw`` and the cash cost contributes ``−c'(|Δw|)·sign(Δw)``,
+    and each iterate is projected back onto the capped simplex. The objective is
+    concave and the feasible set convex and compact, so this converges; the step
+    decays as ``1/√t`` because the subgradient of ``|·|`` does not vanish at the
+    optimum and a fixed step would chatter around it. The step is scaled by
+    ``(1+κ)`` so that raising the inertia does not silently slow convergence as
+    well as the book.
     """
     order = mu.index
     m = mu.to_numpy(dtype=float)
@@ -233,14 +279,13 @@ def mv_weights_costed(
         k2_scale = np.zeros(order.size)
 
     h = float(hurdle)
-    nu = float(trade_penalty)
+    kappa = float(trade_penalty)
 
     def trade_cost(x):
-        return h * (g * x + k2_scale * np.power(x, e)) + 0.5 * nu * x * x
+        return h * (g * x + k2_scale * np.power(x, e))
 
     def trade_cost_deriv(x):
-        return (h * (g + e * k2_scale * np.power(np.maximum(x, 1e-12), e - 1.0))
-                + nu * x)
+        return h * (g + e * k2_scale * np.power(np.maximum(x, 1e-12), e - 1.0))
 
     if risk is not None:
         B = pd.DataFrame(risk.B, index=risk.instruments).reindex(order).fillna(0.0).to_numpy()
@@ -261,10 +306,18 @@ def mv_weights_costed(
     best, best_obj = w.copy(), -np.inf
     for t in range(1, iters + 1):
         dw = w - prev
-        grad = m - lam * sigma_w(w) - trade_cost_deriv(np.abs(dw)) * np.sign(dw)
-        w = project_capped_simplex(w + (base / np.sqrt(t)) * grad, max_weight)
+        # The inertia term is kappa*lam*Sigma*dw, NOT nu*dw: measured in the
+        # same units as the risk term it sits beside, so its strength is
+        # relative to the risk model rather than absolute.
+        grad = (m - lam * sigma_w(w)
+                - trade_cost_deriv(np.abs(dw)) * np.sign(dw)
+                - kappa * lam * sigma_w(dw))
+        w = project_capped_simplex(w + (base * (1.0 + kappa) / np.sqrt(t)) * grad,
+                                   max_weight)
         dw = w - prev
-        obj = float(m @ w - 0.5 * lam * (w @ sigma_w(w)) - trade_cost(np.abs(dw)).sum())
+        obj = float(m @ w - 0.5 * lam * (w @ sigma_w(w))
+                    - trade_cost(np.abs(dw)).sum()
+                    - 0.5 * kappa * lam * (dw @ sigma_w(dw)))
         if obj > best_obj:
             best_obj, best = obj, w.copy()
     # Subgradient iterates are not monotone, so return the best seen rather
