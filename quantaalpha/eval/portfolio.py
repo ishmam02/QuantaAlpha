@@ -380,6 +380,7 @@ def mean_variance(
     sigma: pd.DataFrame | None = None,
     pred_scale: float = 1.0,
     close: pd.DataFrame | None = None,
+    adv: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """``g`` as a mean--variance optimiser with an explicit turnover budget.
 
@@ -405,6 +406,7 @@ def mean_variance(
     # default so no existing protocol changes meaning by upgrading the code;
     # "factor" prices correlation, which is the difference between a book that
     # holds twelve names and a book that holds one bet twelve times.
+    costed = bool(getattr(port, "cost_in_objective", False))
     roll = None
     if getattr(port, "covariance", "diagonal") == "factor":
         if close is None:
@@ -442,7 +444,29 @@ def mean_variance(
 
         mu = pred_scale * scores
         risk = roll.for_date(date, scores.index) if roll is not None else None
-        if risk is not None:
+        vol_row = (sigma.loc[date].reindex(scores.index)
+                   if sigma is not None and date in sigma.index
+                   else pd.Series(0.02, index=scores.index))
+        vol_row = vol_row.fillna(vol_row.median() if vol_row.notna().any() else 0.02)
+
+        if costed:
+            from quantaalpha.eval.riskmodel import mv_weights_costed
+
+            # gamma is the LINEAR part of Eq. 7 per unit weight traded --
+            # commission plus volatility-scaled slippage. Impact depends on the
+            # size being traded, so pricing it here would have the optimiser
+            # charging itself for a quantity it is still choosing; leaving it
+            # out keeps the penalty a lower bound on the true cost.
+            gamma = theta.costs.kappa0 + theta.costs.kappa1 * vol_row
+            adv_row = None
+            if adv is not None and date in adv.index:
+                adv_row = adv.loc[date].reindex(scores.index) / float(theta.costs.nav)
+            target = mv_weights_costed(
+                mu, risk, None if risk is not None else vol_row ** 2,
+                gamma, w_drift.reindex(scores.index).fillna(0.0), lam, max_w,
+                adv_w=adv_row, kappa2=float(theta.costs.kappa2),
+                impact_exponent=float(theta.costs.impact_exponent))
+        elif risk is not None:
             from quantaalpha.eval.riskmodel import mv_weights_factor
 
             target = mv_weights_factor(mu, risk, lam, max_w,
@@ -452,19 +476,19 @@ def mean_variance(
             # no window yet (the first year of the panel). Falling back is
             # deliberate: a rank-deficient risk model is worse than an honest
             # diagonal one.
-            vol = (sigma.loc[date].reindex(scores.index)
-                   if sigma is not None and date in sigma.index
-                   else pd.Series(0.02, index=scores.index))
-            target = _mv_weights(
-                mu, vol.fillna(vol.median() if vol.notna().any() else 0.02) ** 2,
-                lam, max_w)
+            target = _mv_weights(mu, vol_row ** 2, lam, max_w)
 
         # Spend at most the turnover budget: move partway from the drifted book
         # toward the target. Both are on the simplex, so the blend is feasible.
         w_full = target.reindex(pred.columns).fillna(0.0)
         step = w_full - w_drift
         move = 0.5 * float(step.abs().sum())
-        if move > cap > 0:
+        if costed:
+            # The optimiser has already paid for this trade. Re-applying the
+            # budget here would scale its choice back down uniformly and undo
+            # exactly the selectivity the cost term buys.
+            w_new = w_full
+        elif move > cap > 0:
             w_new = w_drift + step * (cap / move)
         else:
             w_new = w_full

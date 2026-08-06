@@ -169,6 +169,104 @@ def mv_weights_factor(
     return pd.Series(w, index=order)
 
 
+def mv_weights_costed(
+    mu: pd.Series,
+    risk: FactorRisk | None,
+    var: pd.Series | None,
+    gamma: pd.Series,
+    w_prev: pd.Series,
+    lam: float,
+    max_weight: float,
+    adv_w: pd.Series | None = None,
+    kappa2: float = 0.0,
+    impact_exponent: float = 1.5,
+    iters: int = 200,
+) -> pd.Series:
+    """argmax μᵀw − (λ/2)wᵀΣw − Σᵢ cᵢ(|wᵢ − w_prev,ᵢ|)  s.t. Σw = 1, 0 ≤ w ≤ cap.
+
+    Turnover as a *price* rather than a quota. The hard budget in
+    :func:`~quantaalpha.eval.portfolio.mean_variance` scales every trade down by
+    the same factor once the book moves too far, so the most valuable trade is
+    cut as hard as the least valuable one -- it spends the budget without
+    choosing what to spend it on. Here each name pays its own
+    ``γᵢ = κ₀ + κ₁σᵢ`` to move, and a position changes only where the expected
+    return justifies what moving it costs. Turnover stops being a parameter and
+    becomes an outcome, which is the only regime in which a net-of-cost
+    objective can express an advantage over a gross one.
+
+    ``cᵢ`` is the whole of Eq. 7's per-name cost, not just its linear part::
+
+        cᵢ(x) = γᵢ x + κ₂ x^e / advᵢ^(e−1),      x = |wᵢ − w_prev,ᵢ|
+
+    with ``γᵢ = κ₀ + κ₁σᵢ``. Charging only ``γ`` was tried first and it
+    over-traded badly: turnover came out at 0.1247 against 0.0194 under the hard
+    cap, realised cost 4.50 bps/day, net ARR −2.30% against −0.82%. An optimiser
+    given a lower bound on its costs will spend right up to that bound, so a
+    "conservative" omission is not conservative at all -- it is an instruction
+    to trade more than the evaluator will charge for.
+
+    Including impact costs nothing structurally: it depends only on this name's
+    own trade, so the objective stays separable, and ``x^1.5`` is convex, so it
+    stays concave. The optimiser now prices exactly what ``costs.cost`` charges,
+    which is the property that makes turnover an honest decision rather than an
+    artefact of the gap between two cost models.
+
+    Solved by projected subgradient: the smooth part contributes
+    ``μ − λΣw`` and the penalty contributes ``−γ·sign(w − w_prev)``, and each
+    iterate is projected back onto the capped simplex. The objective is concave
+    and the feasible set convex and compact, so this converges; the step decays
+    as ``1/√t`` because the subgradient of ``|·|`` does not vanish at the
+    optimum and a fixed step would chatter around it.
+    """
+    order = mu.index
+    m = mu.to_numpy(dtype=float)
+    g = gamma.reindex(order).fillna(0.0).to_numpy(dtype=float)
+    prev = w_prev.reindex(order).fillna(0.0).to_numpy(dtype=float)
+    e = float(impact_exponent)
+    if kappa2 > 0 and adv_w is not None:
+        a = adv_w.reindex(order)
+        a = a.fillna(a.median() if a.notna().any() else 1.0).clip(lower=1e-9).to_numpy()
+        k2_scale = float(kappa2) / np.power(a, e - 1.0)
+    else:
+        k2_scale = np.zeros(order.size)
+
+    def trade_cost(x):
+        return g * x + k2_scale * np.power(x, e)
+
+    def trade_cost_deriv(x):
+        return g + e * k2_scale * np.power(np.maximum(x, 1e-12), e - 1.0)
+
+    if risk is not None:
+        B = pd.DataFrame(risk.B, index=risk.instruments).reindex(order).fillna(0.0).to_numpy()
+        d = pd.Series(risk.d, index=risk.instruments).reindex(order)
+        d = d.fillna(d.median() if d.notna().any() else 1e-4).to_numpy()
+        local = FactorRisk(order, B, risk.f_var, d)
+        sigma_w = local.grad
+        curvature = local.curvature()
+    else:
+        v = (var.reindex(order).fillna(var.median() if var.notna().any() else 4e-4)
+             .clip(lower=1e-8).to_numpy())
+        sigma_w = lambda w: v * w  # noqa: E731 -- diagonal Sigma
+        curvature = float(v.max())
+
+    w = project_capped_simplex(prev.copy(), max_weight)
+    L = max(lam * curvature, 1e-12)
+    base = 1.0 / L
+    best, best_obj = w.copy(), -np.inf
+    for t in range(1, iters + 1):
+        dw = w - prev
+        grad = m - lam * sigma_w(w) - trade_cost_deriv(np.abs(dw)) * np.sign(dw)
+        w = project_capped_simplex(w + (base / np.sqrt(t)) * grad, max_weight)
+        dw = w - prev
+        obj = float(m @ w - 0.5 * lam * (w @ sigma_w(w)) - trade_cost(np.abs(dw)).sum())
+        if obj > best_obj:
+            best_obj, best = obj, w.copy()
+    # Subgradient iterates are not monotone, so return the best seen rather
+    # than the last -- otherwise the answer depends on where the oscillation
+    # happened to stop.
+    return pd.Series(best, index=order)
+
+
 class RollingFactorRisk:
     """Refits ``FactorRisk`` on a calendar cadence, point-in-time.
 
@@ -210,4 +308,4 @@ class RollingFactorRisk:
 
 
 __all__ = ["FactorRisk", "RollingFactorRisk", "fit_factor_risk",
-           "mv_weights_factor", "project_capped_simplex"]
+           "mv_weights_costed", "mv_weights_factor", "project_capped_simplex"]

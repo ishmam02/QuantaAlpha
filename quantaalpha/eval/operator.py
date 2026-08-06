@@ -315,20 +315,22 @@ class EvaluationOperator:
         mask = self._trade_mask(panel)
 
         # Put the prediction into expected-return units before the trading rule
-        # compares it with a cost. Fitted on the TRAINING split only, so the
-        # rule never sees realised returns from the window it is evaluated on.
+        # compares it with a cost. Never the evaluation window -- that would leak
+        # realised returns into the trading rule -- but WHICH earlier window
+        # matters: see Portfolio.scale_split for why the fit split flatters it.
         beta = 1.0
         if theta.portfolio.cost_aware_dropout or theta.portfolio.construction == "mean_variance":
-            beta = prediction_scale(
-                prediction, y_tilde, theta.splits.window(theta.combiner.fit_split)
+            scale_window = theta.splits.window(
+                getattr(theta.portfolio, "scale_split", None) or theta.combiner.fit_split
             )
+            beta = prediction_scale(prediction, y_tilde, scale_window)
 
         # The FULL close history, not the evaluation slice: the risk model
         # estimates from a trailing window that reaches back before the window
         # it prices, and truncating it would silently shorten that lookback.
         w, w_drift = build_book(
             window_pred, theta, y_tilde=y_tilde, universe=universe,
-            mask=mask, sigma=sigma, pred_scale=beta, close=panel.close,
+            mask=mask, sigma=sigma, pred_scale=beta, close=panel.close, adv=adv,
         )
 
         charges = pd.Series(

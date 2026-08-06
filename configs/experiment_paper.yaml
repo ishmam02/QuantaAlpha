@@ -139,10 +139,31 @@ factor:
     free_args_ratio_threshold: 0.5
 
   # Uniqueness/duplication checking against factor zoo
+  #
+  # factor_zoo_path was null, and null means FactorRegulator.alphazoo is an
+  # EMPTY frame -- so match_alphazoo compared every candidate against nothing,
+  # returned a match size of 0, and the duplication gate could never fire. The
+  # check reported "enabled: true" throughout. Together with rho_bar: null in
+  # the protocol that left novelty unenforced in two independent places.
+  #
+  # The pool is Alpha158(20), which is what the paper says seeds the search,
+  # translated into the mining DSL by quantaalpha/factors/seed_pool.py. The
+  # translation is load-bearing rather than cosmetic: mined candidates are
+  # written with DELAY/TS_MEAN/TS_STD, so leaving Qlib's Ref/Mean/Std in the
+  # zoo would make every structural comparison miss and the check would stay
+  # inert in a quieter way. Regenerate with:
+  #   python -c "from quantaalpha.factors.seed_pool import write_alphazoo_csv as w; \
+  #              w('data/factorlib/alpha158_20_seed_pool.csv')"
+  #
+  # threshold is the largest common SUBTREE, in nodes, allowed against any
+  # seed. The seeds run 5-15 nodes with a median of 8, so 8 catches
+  # near-verbatim reuse of a whole seed while leaving incidental overlap --
+  # ($close-$open)/$open appears inside plenty of legitimate factors -- alone.
+  # This is a pathology filter, not a similarity policy.
   duplication:
     enabled: true
-    threshold: 5
-    factor_zoo_path: null # Use default when null
+    threshold: 8
+    factor_zoo_path: "data/factorlib/alpha158_20_seed_pool.csv"
 
 # ============================================================
 # BACKTEST CONFIGURATION

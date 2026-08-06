@@ -131,7 +131,17 @@ gates: # F_Theta -- DISABLED
   gamma_ic: null
   gamma_ir: null
   tau_max: null
-  rho_bar: null
+  # rho_bar is BACK, alone among the six. The two gates that were measured to
+  # fail were gamma_ic (stand-alone IC anti-correlated with contribution) and
+  # gamma_delta (not reproducible across combiner seeds). rho_bar was never
+  # shown to fail; it was removed as collateral when they were.
+  #
+  # It is also the one gate whose job is catching a pathology rather than
+  # ranking quality. A candidate correlated 0.95+ with something already in the
+  # repository is a duplicate, not a weak factor, and rejecting duplicates
+  # cannot starve the repository the way an absolute quality floor did -- which
+  # is the failure the other four are still disabled for.
+  rho_bar: 0.95
   gamma_cx: null
   turnover_basis: book
 
@@ -140,18 +150,37 @@ decay: # §3.4 item 7
   lambda_d: 0.5
 
 overfit:
-  delta_ref: 0.02 # reference IS→OOS RankIC gap for normalizing e_overfit
+  # Reference IS->OOS RankIC gap at which e_overfit reaches 0.
+  #
+  # Was 0.02, which is far below anything the search actually produces: the
+  # measured gap is +0.3015 for Arm A and +0.2824 for Arm B against +0.0332 for
+  # the un-mined baseline. Every mined factor therefore saturated the term at
+  # exactly 0.0 and the dimension could not order them -- it distinguished
+  # "mined" from "not mined" and nothing finer. 0.40 sits above the observed
+  # arm level so that typical candidates land mid-range and better and worse
+  # over-fitting is actually separable.
+  delta_ref: 0.40
 
 utility:
   mode: weighted_rank # net_ir | net_arr | weighted_rank
   omega: # must sum to 1
     effectiveness: 0.30
-    arr: 0.20
+    arr: 0.10
     stability: 0.15
     turnover: 0.10
     diversity: 0.15
     overfit: 0.10
-    decay: 0.00 # optional diagnostic (Remark 1); off by default
+    # Was 0.00 -- computed on every candidate, reported, and weighted out of
+    # the objective entirely. The measured behaviour of both arms is that they
+    # earn money in 2022-2023 and lose it in 2024-2025, so decay is the failure
+    # mode the search most needs to price, and it was the one term U ignored.
+    #
+    # The weight comes out of `arr` rather than off the top. `effectiveness`
+    # ranks net_ir and `arr` ranks net_arr; both are net-return quantities on
+    # the same book, so 0.50 of the weight sat on one thing under two names.
+    # Moving 0.10 of it to decay reduces that double-count and prices
+    # persistence at the same time.
+    decay: 0.10
 
 # ---------------------------------------------------------------------------
 # Admission: when U admits a candidate batch to the repository, and when a

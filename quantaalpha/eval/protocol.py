@@ -199,6 +199,27 @@ class Portfolio:
     # commercial risk model (Barra, Axioma) has, estimated statistically
     # instead of from vendor fundamentals. Low rank plus diagonal keeps
     # Sigma @ w at O(nk) rather than O(n^2), so the optimiser stays fast.
+    # Turnover as a price instead of a quota. With this on, the objective
+    # carries a per-name transaction-cost term and ``turnover_cap`` stops
+    # binding -- how much the book trades becomes an outcome of whether trading
+    # pays rather than a number set in advance. A hard cap scales every trade
+    # down by the same factor once the book moves too far, spending the budget
+    # without choosing what to spend it on, and it also fixes turnover at the
+    # same level for every arm, which is precisely the condition under which a
+    # net-of-cost objective cannot demonstrate anything.
+    cost_in_objective: bool = False
+    # Which split calibrates beta, the score -> expected-return conversion the
+    # cost-aware rules trade against.
+    #
+    # "train" was the original choice and it is the window the combiner was
+    # FITTED on, so beta measures the model's in-sample edge. The measured
+    # IS->OOS RankIC gap is +0.28 for both arms against +0.03 for the un-mined
+    # baseline, which means the optimiser is told to expect roughly the edge the
+    # model shows on data it has already seen. It then trades for that edge and
+    # pays real costs for it. "valid" calibrates on a window the model did not
+    # fit, so beta reflects what the edge is actually worth out of sample; it is
+    # still strictly before final_test, so Property 3 is untouched.
+    scale_split: str = "train"
     covariance: str = "diagonal"
     # Trailing window used to estimate the model, and how often it is refit.
     # Both are point-in-time: the window ends strictly before the date being

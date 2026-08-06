@@ -96,19 +96,28 @@ def _overfit_score(m: dict, theta: Protocol) -> float:
     history rather than by repository rank", so it is computed directly in
     [0, 1]: half from structural parsimony, half from how much the IS edge
     survived into the OOS proxy.
+
+    Each half is included only when it can actually be computed, and the score
+    is the mean of whatever is available. The previous version defaulted a
+    missing term to ``1.0`` and averaged it in regardless, so with
+    ``gamma_cx: null`` -- the shipped configuration -- ``cx_term`` was pinned at
+    1.0 on every candidate and half of this dimension was a constant. At
+    ``omega["overfit"] = 0.10`` that made 0.05 of the total utility weight
+    inert while still appearing in the objective.
     """
     complexity = m.get("cx")
     gap = m.get("is_oos_gap")
 
-    cx_term = 1.0
+    terms: list[float] = []
     if _usable(complexity) and theta.gates.gamma_cx:
-        cx_term = 1.0 - min(1.0, float(complexity) / float(theta.gates.gamma_cx))
-
-    gap_term = 1.0
+        terms.append(1.0 - min(1.0, float(complexity) / float(theta.gates.gamma_cx)))
     if _usable(gap) and theta.overfit.delta_ref:
-        gap_term = 1.0 - min(1.0, max(0.0, float(gap)) / float(theta.overfit.delta_ref))
+        terms.append(1.0 - min(1.0, max(0.0, float(gap)) / float(theta.overfit.delta_ref)))
 
-    return float(0.5 * cx_term + 0.5 * gap_term)
+    if not terms:
+        # Nothing measurable: score neutrally rather than award a free 1.0.
+        return 0.5
+    return float(sum(terms) / len(terms))
 
 
 def dimension_scores(m: dict, zoo_metrics: Sequence[dict], theta: Protocol) -> dict[str, float]:
