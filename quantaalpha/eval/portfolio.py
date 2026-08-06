@@ -465,7 +465,9 @@ def mean_variance(
                 mu, risk, None if risk is not None else vol_row ** 2,
                 gamma, w_drift.reindex(scores.index).fillna(0.0), lam, max_w,
                 adv_w=adv_row, kappa2=float(theta.costs.kappa2),
-                impact_exponent=float(theta.costs.impact_exponent))
+                impact_exponent=float(theta.costs.impact_exponent),
+                hurdle=float(getattr(port, "cost_hurdle", 1.0)),
+                trade_penalty=float(getattr(port, "trade_penalty", 0.0)))
         elif risk is not None:
             from quantaalpha.eval.riskmodel import mv_weights_factor
 

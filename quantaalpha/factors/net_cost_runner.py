@@ -29,6 +29,7 @@ import pandas as pd
 from quantaalpha.components.runner import CachedRunner
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.core.utils import cache_with_pickle
+from quantaalpha.eval.admission import PopulationStats
 from quantaalpha.eval.data import align_signal, load_factor_signal
 from quantaalpha.eval.ledger import DEFAULT_LEDGER_PATH, Ledger, replay_repository
 from quantaalpha.eval.operator import EvaluationOperator
@@ -104,6 +105,13 @@ class NetCostFactorRunner(QlibFactorRunner):
         # what keeps Eq. 2 and Eq. 11 synchronized on the same repository state:
         # two separate accumulators would silently drift apart.
         self._repository: dict[str, tuple[Any, dict]] = {}
+        # Every batch's utility, admitted or not -- the reference the generator
+        # is told its percentile against. Deliberately NOT the repository, which
+        # is a winners-only sample.
+        self._population = PopulationStats()
+        # Last measured marginal contribution per admitted expression, so a full
+        # repository knows which incumbent a candidate would have to displace.
+        self._contributions: dict[str, float] = {}
         logger.info(
             "NetCostFactorRunner active: theta=%s protocol=%s ledger=%s",
             self.theta.hash, default_protocol_path(), self.ledger.path,
@@ -188,7 +196,29 @@ class NetCostFactorRunner(QlibFactorRunner):
         # exactly what happened on run 20260729_075350, where two batches logged
         # as REJECTED were still recorded with their factor_exprs.
         batch_metrics = {k[2:]: v for k, v in res.items() if k.startswith("m_")}
-        admitted = self._admit(float(res["U"]), candidates, batch_metrics)
+
+        # Feedback reference: EVERY batch, admitted or not. The repository is a
+        # winners-only sample and a poor yardstick for how generation is going;
+        # this one is the distribution the generator actually produces. It gates
+        # nothing, which is why it can safely include the failures.
+        self._population.observe(float(res["U"]))
+        res["population"] = self._population.summary(float(res["U"]))
+
+        if self.theta.admission.mode == "marginal_contribution":
+            decision = self._decide_marginal(candidates, zoo_signals, zoo_metrics,
+                                             batch_metrics)
+            admitted = decision.admit
+            if admitted:
+                if decision.displaced:
+                    self._repository.pop(decision.displaced, None)
+                for expr, signal in candidates.items():
+                    self._repository[expr] = (self._compact(signal), batch_metrics)
+            logger.info("repository: %s -- %s; |zoo| = %d  [%s]",
+                        "ADMIT" if admitted else "REJECT", decision.reason,
+                        len(self._repository), res["population"])
+            res.update(decision.as_record())
+        else:
+            admitted = self._admit(float(res["U"]), candidates, batch_metrics)
         res["admitted"] = admitted
         if admitted:
             res["evicted"] = len(self._prune())
@@ -217,6 +247,47 @@ class NetCostFactorRunner(QlibFactorRunner):
         return exp
 
     # ------------------------------------------------------------------
+    def _decide_marginal(self, candidates, zoo_signals, zoo_metrics,
+                         batch_metrics) -> "Decision":
+        """Measure the batch's marginal contribution once per seed, then judge.
+
+        The delta is what ``E_Theta`` already computes -- the book with these
+        factors minus the book without them -- but measured across seeds rather
+        than once, because as a point estimate it flipped 3 of 4 verdicts. The
+        combiner averages its seed ensemble into a single prediction, so the
+        spread has to come from separate evaluations; that costs roughly one
+        extra fit per seed and buys a bar that means something.
+        """
+        from dataclasses import replace as _replace
+
+        from quantaalpha.eval.admission import decide
+        from quantaalpha.eval.operator import EvaluationOperator
+
+        deltas = []
+        for seed in self.theta.admission.test_seeds:
+            th = _replace(self.theta,
+                          combiner=_replace(self.theta.combiner, seeds=(int(seed),)))
+            try:
+                r = EvaluationOperator(th).evaluate(
+                    candidates, zoo_signals=zoo_signals, zoo_metrics=zoo_metrics)
+                deltas.append(r.get("m_delta_net_ir"))
+            except Exception:
+                logger.exception("marginal contribution failed on seed %s", seed)
+
+        weakest = None
+        if self.theta.admission.capacity and self._contributions:
+            name, value = min(self._contributions.items(), key=lambda kv: kv[1])
+            weakest = (name, value)
+
+        d = decide(deltas, len(self._repository), self.theta,
+                   metrics=batch_metrics, weakest=weakest)
+        if d.admit and d.mean == d.mean:
+            for expr in candidates:
+                self._contributions[expr] = d.mean
+        if d.displaced:
+            self._contributions.pop(d.displaced, None)
+        return d
+
     def _admit(self, u: float, candidates: dict, batch_metrics: dict) -> bool:
         """Gate the batch on ``U`` (Eq. 12) against Θ's admission bar.
 

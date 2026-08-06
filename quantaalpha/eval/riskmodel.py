@@ -180,6 +180,8 @@ def mv_weights_costed(
     adv_w: pd.Series | None = None,
     kappa2: float = 0.0,
     impact_exponent: float = 1.5,
+    hurdle: float = 1.0,
+    trade_penalty: float = 0.0,
     iters: int = 200,
 ) -> pd.Series:
     """argmax μᵀw − (λ/2)wᵀΣw − Σᵢ cᵢ(|wᵢ − w_prev,ᵢ|)  s.t. Σw = 1, 0 ≤ w ≤ cap.
@@ -230,11 +232,15 @@ def mv_weights_costed(
     else:
         k2_scale = np.zeros(order.size)
 
+    h = float(hurdle)
+    nu = float(trade_penalty)
+
     def trade_cost(x):
-        return g * x + k2_scale * np.power(x, e)
+        return h * (g * x + k2_scale * np.power(x, e)) + 0.5 * nu * x * x
 
     def trade_cost_deriv(x):
-        return g + e * k2_scale * np.power(np.maximum(x, 1e-12), e - 1.0)
+        return (h * (g + e * k2_scale * np.power(np.maximum(x, 1e-12), e - 1.0))
+                + nu * x)
 
     if risk is not None:
         B = pd.DataFrame(risk.B, index=risk.instruments).reindex(order).fillna(0.0).to_numpy()

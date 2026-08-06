@@ -208,6 +208,23 @@ class Portfolio:
     # same level for every arm, which is precisely the condition under which a
     # net-of-cost objective cannot demonstrate anything.
     cost_in_objective: bool = False
+    # Margin of safety on the modelled cost, mirroring swap_hurdle. The
+    # optimiser trades whenever the modelled edge exceeds the modelled cost, and
+    # both are estimates -- but only one of them is systematically optimistic.
+    # Measured: the edge implied by beta is 2.7x larger when calibrated on the
+    # split the model was fitted on than on a split it was not.
+    cost_hurdle: float = 1.0
+    # Quadratic penalty on how far the book moves, nu/2 * ||w - w_prev||^2.
+    #
+    # This is what the hard turnover cap was doing by accident. mu is a point
+    # estimate whose day-to-day variation is mostly estimation error, and an
+    # optimiser that treats it as known chases that error -- Markowitz as an
+    # error-maximiser. A linear transaction cost does not restrain it, because
+    # the cost is roughly constant per unit traded while the apparent edge keeps
+    # moving. A quadratic term prices *distance from the current book*, which is
+    # exactly a prior that today's holdings are approximately right, and yields
+    # partial adjustment toward the target rather than a jump to it.
+    trade_penalty: float = 0.0
     # Which split calibrates beta, the score -> expected-return conversion the
     # cost-aware rules trade against.
     #
@@ -365,6 +382,42 @@ class Admission:
     tau_admit: float = 0.5
     tau_evict: float = 0.25
     min_size: int = 3
+
+    # --- marginal-contribution mode (see eval/admission.py) ---------------
+    # "utility_rank" is the original percentile bar, kept so old protocols
+    # reproduce exactly. "marginal_contribution" admits on whether the book
+    # actually improves, tested against the noise on that measurement.
+    mode: str = "utility_rank"
+
+    # How many standard errors the improvement must clear. This is the bar, and
+    # it is dynamic by construction: it scales with how precisely the delta can
+    # be measured rather than with a percentile of a winners-only sample. 1.0 is
+    # "more likely than not, on this evidence"; raise it to demand more.
+    k_sigma: float = 1.0
+
+    # Combiner seeds used to measure the delta. delta_net_ir flipped 3 of 4
+    # verdicts across seeds as a point estimate, which is why it needs a spread
+    # rather than a single number. Fewer than two seeds leaves the standard
+    # error undefined and the test cannot pass.
+    test_seeds: tuple[int, ...] = (42, 1, 7)
+
+    # Repository capacity. Once full, admission becomes replacement: a
+    # candidate enters only by displacing the incumbent it beats, so the
+    # criterion stops decaying as marginal contribution shrinks and the library
+    # improves rather than merely growing. None means unbounded.
+    capacity: int | None = None
+
+    # Re-measure incumbents against the CURRENT repository every N rounds and
+    # drop those whose contribution has gone below evict_below. A factor that
+    # was additive at |zoo|=12 can be redundant at 150, and nothing in its own
+    # metrics changes to say so. 0 disables re-scoring.
+    evict_every: int = 0
+    evict_below: float = 0.0
+
+    # Pathology floor. Rejects signals that cannot be priced, never signals
+    # that are merely weak -- that distinction is what separates this from the
+    # absolute quality gates that were removed for starving the repository.
+    min_coverage: float = 0.30
 
 
 @dataclass(frozen=True)
