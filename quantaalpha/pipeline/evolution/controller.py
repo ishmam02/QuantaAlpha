@@ -21,6 +21,7 @@ from .trajectory import (
     StrategyTrajectory,
     TrajectoryPool,
     RoundPhase,
+    _PRIMARY_METRIC,
     _REQUIRE_FEASIBLE,
     is_admissible,
 )
@@ -93,6 +94,9 @@ class EvolutionConfig:
     # Parent selection for crossover: best | random | weighted | weighted_inverse | top_percent_plus_random
     parent_selection_strategy: str = "best"
 
+    # Fraction of the previous phase kept as mutation parents, best first. 1.0
+    # reproduces the old behaviour of mutating everything.
+    mutation_top_fraction: float = 1.0
     # Top percent threshold when parent_selection_strategy = "top_percent_plus_random"
     top_percent_threshold: float = 0.3
 
@@ -545,8 +549,28 @@ class EvolutionController:
             prev_phase_trajs, minimum=1, what="mutation targets"
         )
 
-        # Sort by direction_id for consistent ordering
-        prev_phase_trajs.sort(key=lambda t: t.direction_id)
+        # Select mutation parents on FITNESS, not on arrival order.
+        #
+        # This sorted by direction_id and mutated everything, which is not a
+        # selection operator at all: the below-median half of the population was
+        # bred exactly as often as the best of it. Crossover has always ranked
+        # its parents (parent_selection_strategy); mutation never did, so half
+        # the evolutionary budget was spent on directions the evidence already
+        # said were not working. Measured consequence: marginal contribution had
+        # no resolvable trend across a run (t=+0.42 over 79 batches), i.e. the
+        # search was drifting rather than improving.
+        #
+        # mutation_top_fraction keeps a tail of weaker parents rather than
+        # breeding only the leader, because the fitness is noisy and a strict
+        # top-1 collapses diversity in a population this small.
+        prev_phase_trajs = self._rank_by_fitness(prev_phase_trajs)
+        frac = float(getattr(self.config, "mutation_top_fraction", 1.0) or 1.0)
+        if 0.0 < frac < 1.0 and len(prev_phase_trajs) > 1:
+            keep = max(1, int(round(frac * len(prev_phase_trajs))))
+            dropped = len(prev_phase_trajs) - keep
+            prev_phase_trajs = prev_phase_trajs[:keep]
+            logger.info(f"mutation: kept the top {keep} of {keep + dropped} "
+                        f"parent(s) by {_PRIMARY_METRIC}, dropped {dropped}")
         self._mutation_targets = prev_phase_trajs
         
         # Update active branch count
@@ -589,6 +613,33 @@ class EvolutionController:
         self._crossover_idx = 0
         logger.info(f"Prepared {len(self._crossover_groups)} crossover groups from {len(candidates)} candidates")
     
+    def _rank_by_fitness(
+        self, trajectories: list[StrategyTrajectory]
+    ) -> list[StrategyTrajectory]:
+        """Best first, on ``_PRIMARY_METRIC``, ties and misses last.
+
+        Trajectories whose fitness is missing sort to the back rather than
+        being dropped: a metric that failed to extract is not evidence that the
+        trajectory was bad, and discarding it silently would shrink the
+        population for a reason unrelated to quality.
+        """
+        def key(t):
+            v = t.get_primary_metric()
+            return (v is not None, v if v is not None else 0.0)
+
+        ranked = sorted(trajectories, key=key, reverse=True)
+        scored = [t for t in ranked if t.get_primary_metric() is not None]
+        if scored:
+            logger.info(
+                f"parents ranked on {_PRIMARY_METRIC}: best "
+                f"{scored[0].get_primary_metric():.5f} worst "
+                f"{scored[-1].get_primary_metric():.5f} ({len(scored)}/{len(ranked)} scored)")
+        else:
+            logger.warning(
+                f"no trajectory carries {_PRIMARY_METRIC} -- mutation parents fall back "
+                "to arrival order, which is not selection. Check the runner emits it.")
+        return ranked
+
     def _admissible_parents(
         self,
         trajectories: list[StrategyTrajectory],
@@ -958,6 +1009,9 @@ class EvolutionController:
     # Keys emitted by NetCostFactorRunner._to_series, by coercion type.
     _NET_COST_FLOAT_KEYS = (
         "U", "rho_max", "turnover_book", "turnover_solo", "cx", "cost_bps", "zoo_size",
+        # Marginal contribution -- the fitness that anchors selection to the
+        # book rather than to a percentile of a winners-only sample.
+        "delta_net_ir", "delta_net_arr", "base_net_ir",
         "e_effectiveness", "e_arr", "e_stability", "e_turnover", "e_diversity",
         "e_overfit", "e_decay",
     )

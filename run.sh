@@ -215,7 +215,14 @@ if [ "${QA_ARM_RESOLVED}" = "treatment" ]; then
     # is what we want here.
     export QLIB_FACTOR_RUNNER="quantaalpha.factors.net_cost_runner.NetCostFactorRunner"
     export QLIB_FACTOR_SUMMARIZER="quantaalpha.factors.net_cost_feedback.NetCostFactorFeedback"
-    export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-U}"
+    # Fitness for parent selection. U was the obvious choice and the wrong one:
+    # measured on the mean_variance run it correlates +0.41 with repository SIZE
+    # and only +0.50 with the marginal contribution it is meant to stand in for,
+    # because a candidate ranks above more incumbents as the zoo fills with
+    # mediocre ones. Replaying that run, switching to delta_net_ir changes the
+    # bred parent in 7 of 7 groups and lifts the mean contribution of what gets
+    # bred from +0.00384 to +0.06507.
+    export QA_PRIMARY_METRIC="${QA_PRIMARY_METRIC:-delta_net_ir}"
     # Rejection is FEEDBACK, not exclusion. Filtering rejected factors out of
     # the parent pool would keep the generator from ever seeing why they were
     # rejected, so it could not learn to clear the bar -- the gate would only

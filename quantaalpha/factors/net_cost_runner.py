@@ -539,6 +539,14 @@ class NetCostFactorRunner(QlibFactorRunner):
             "turnover_solo": res.get("m_turnover_solo"),
             "cx": res.get("m_cx"),
             "cost_bps": res.get("m_cost_bps"),
+            # Marginal contribution of this batch over the repository alone.
+            # The evolution controller selects parents on _PRIMARY_METRIC, and
+            # until now this key never reached it -- so "best" could only ever
+            # mean best by U, which drifts with repository size (corr +0.41)
+            # rather than tracking what the batch added (corr +0.04).
+            "delta_net_ir": res.get("m_delta_net_ir"),
+            "delta_net_arr": res.get("m_delta_net_arr"),
+            "base_net_ir": res.get("m_base_net_ir"),
         }
         payload.update({k: v for k, v in res.items() if k.startswith("e_")})
         return pd.Series(payload)

@@ -372,6 +372,9 @@ def run_evolution_loop(
 
     mutation_enabled = bool(evolution_cfg.get("mutation_enabled", True))
     crossover_enabled = bool(evolution_cfg.get("crossover_enabled", True))
+    mutation_top_fraction = float(
+        evolution_cfg.get("mutation_top_fraction", 1.0) or 1.0
+    )
     parent_selection_strategy = str(
         evolution_cfg.get("parent_selection_strategy", "best")
     )
@@ -431,6 +434,7 @@ def run_evolution_loop(
         crossover_n=crossover_n,
         prefer_diverse_crossover=True,
         parent_selection_strategy=parent_selection_strategy,
+        mutation_top_fraction=mutation_top_fraction,
         top_percent_threshold=top_percent_threshold,
         parallel_enabled=parallel_enabled,
         pool_save_path=str(pool_save_path),
@@ -464,7 +468,8 @@ def run_evolution_loop(
     else:
         logger.info("Mode: original only (no evolution)")
     logger.info(
-        f"Parent selection: {parent_selection_strategy}"
+        f"Parent selection: {parent_selection_strategy} | "
+        f"mutation parents: top {100*mutation_top_fraction:.0f}%"
         + (
             f" (top_percent={top_percent_threshold})"
             if parent_selection_strategy == "top_percent_plus_random"

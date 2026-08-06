@@ -71,6 +71,18 @@ evolution:
   #       crossover only → round 0=original, 1+=crossover, ...
   max_rounds: 5
 
+  # Fraction of the previous phase kept as mutation parents, ranked best-first.
+  #
+  # Was effectively 1.0 -- _prepare_mutation_targets sorted by direction_id and
+  # mutated everything, so the below-median half of the population was bred as
+  # often as the best of it. That is not a selection operator, and it shows:
+  # marginal contribution had no resolvable trend across a 79-batch run
+  # (t=+0.42), i.e. the search drifted rather than improved.
+  #
+  # 0.5 rather than something tighter because the fitness is noisy and a small
+  # population collapses in diversity if only the leader breeds.
+  mutation_top_fraction: 0.5
+
   # Crossover: number of parents selected per crossover operation
   crossover_size: 2
   # Crossover: number of combinations per round (parallelism after crossover)
