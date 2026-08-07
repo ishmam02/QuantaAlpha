@@ -176,14 +176,37 @@ def net_return(
     y_tilde: pd.DataFrame,
     bench: pd.Series,
     c: pd.Series,
+    delta: int = 0,
 ) -> pd.Series:
     """r_net (Eq. 8) — ``w·ỹ − r_bench − c``.
 
     The benchmark subtraction is what makes this an *excess* return, matching
     the published baseline's ``excess_return_with_cost`` reporting.
+
+    **The two series must cover the same holding period, and they did not.**
+    ``y_tilde[t]`` is the return earned between consecutive *fills*: with
+    ``fill_rule="open_next"`` and ``δ=1`` that is ``open[t+2]/open[t+1] − 1``,
+    which is essentially day ``t+1``'s move. ``load_benchmark`` returns
+    ``close.pct_change()``, so ``bench[t]`` is day ``t``'s move. Subtracting
+    them unshifted differences two series one day out of step, which does not
+    hedge the market -- it adds a second, independent copy of it.
+
+    Measured on Arm B's book over 2022-2025: ``corr(book, bench) = +0.025`` at
+    the old alignment against ``+0.688`` at ``shift(-1)``, and the excess
+    volatility was *higher* than either input (0.2795 annualised, against 0.2185
+    for the book and 0.1798 for the benchmark) -- the signature of subtracting
+    something uncorrelated. Aligning takes it to 0.1612. Qlib's own backtest of
+    the same library reports 0.0804, so this closes most of a gap that had made
+    our net IR and our geometrically-compounded net ARR look far worse than
+    they are; the mean is barely affected, since the benchmark is near
+    zero-mean at any lag.
+
+    ``delta`` is the execution latency from Θ. Shifting by it is what keeps the
+    alignment tied to the fill rule rather than to a constant someone tuned.
     """
     gross = (w * y_tilde.reindex(index=w.index, columns=w.columns)).sum(axis=1)
-    benchmark = bench.reindex(gross.index).fillna(0.0)
+    aligned = bench.shift(-int(delta)) if delta else bench
+    benchmark = aligned.reindex(gross.index).fillna(0.0)
     charges = c.reindex(gross.index).fillna(0.0)
     out = gross - benchmark - charges
     out.name = "r_net"

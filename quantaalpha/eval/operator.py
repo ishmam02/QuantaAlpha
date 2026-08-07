@@ -349,7 +349,8 @@ class EvaluationOperator:
         )
 
         bench = self._benchmark(str(start), str(end))
-        r_net = costs_mod.net_return(w, y_tilde, bench, charges)
+        r_net = costs_mod.net_return(w, y_tilde, bench, charges,
+                                     delta=int(theta.execution.delta))
         return strategy_metrics(w, w_drift, r_net, charges, theta)
 
 
