@@ -48,6 +48,44 @@ def _cs_rank_norm(df: pd.DataFrame) -> pd.DataFrame:
     return (ranked - 0.5) * _CS_RANK_SCALE
 
 
+def _preprocess_v2(features: pd.DataFrame, label: pd.Series):
+    """Backtest V2's preprocessing, step for step.
+
+    Ported rather than approximated, because approximating it is what produced
+    the discrepancy this exists to close: on the same 156-factor library our
+    prediction scored Rank IC +0.0336 on the test split against Backtest V2's
+    +0.1179, and the two engines' daily excess returns were *uncorrelated*
+    (-0.029 at every lag from -5 to +5) -- two different models, not two
+    reports of one.
+
+    Three differences from the native path, all here:
+
+    1. **ProcessInf.** Infinities are replaced with 0. The native path filled
+       NaNs and left ``inf`` alone. They are demonstrably present -- the
+       Alpha158(20) seed ``SHADOW_RATIO`` has ``1e-12`` in a denominator and a
+       standard deviation of 1.8e11 on real data.
+    2. **Rank BEFORE dropping label-NaN rows.** The native path dropped first,
+       so every cross-sectional rank was computed over the subset of names that
+       happened to have a label that day, and the same factor value received a
+       different feature value depending on how many neighbours were droppable.
+       Ranking first fixes the cross-section.
+    3. **No 3.46 scaling.** Qlib's ``CSRankNorm`` divides by the standard
+       deviation of a uniform to give unit variance; Backtest V2's inline
+       version does not. Monotone, so it cannot change a tree's splits or the
+       IC, but it is kept faithful so the two paths are byte-comparable rather
+       than merely similar.
+
+    Grouping is by the datetime level, matching ``groupby(level=dt_level)``
+    there.
+    """
+    feat = features.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    ranked = feat.groupby(level="datetime", group_keys=False).rank(pct=True) - 0.5
+    keep = label.notna()
+    ranked, label = ranked[keep], label[keep]
+    label = label.groupby(level="datetime", group_keys=False).rank(pct=True) - 0.5
+    return ranked.fillna(0.0), label
+
+
 def _wide_to_long(frame: pd.DataFrame, name: str) -> pd.Series:
     try:  # pandas >= 2.1 spells "keep the NaNs" this way
         out = frame.stack(future_stack=True)
@@ -164,13 +202,16 @@ def fit_predict(
     features = pd.DataFrame(columns)
     label = _label(panel, theta).reindex(features.index)
 
-    # ---- preprocessing, in the baseline handler's exact order ----
-    features = features.fillna(0.0)                      # Fillna(feature)
-    keep = label.notna()                                 # DropnaLabel
-    features, label = features[keep], label[keep]
-    features = _cs_rank_norm(features)                   # CSRankNorm(feature)
-    label = _cs_rank_norm(label.to_frame()).iloc[:, 0]   # CSRankNorm(label)
-    features = features.fillna(0.0)
+    if getattr(theta.combiner, "engine", "native") == "backtest_v2":
+        features, label = _preprocess_v2(features, label)
+    else:
+        # ---- preprocessing, in the baseline handler's exact order ----
+        features = features.fillna(0.0)                      # Fillna(feature)
+        keep = label.notna()                                 # DropnaLabel
+        features, label = features[keep], label[keep]
+        features = _cs_rank_norm(features)                   # CSRankNorm(feature)
+        label = _cs_rank_norm(label.to_frame()).iloc[:, 0]   # CSRankNorm(label)
+        features = features.fillna(0.0)
 
     # ---- fit on train only ----
     train_start, train_end = theta.splits.window(theta.combiner.fit_split)

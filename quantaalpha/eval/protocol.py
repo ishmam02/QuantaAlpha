@@ -147,6 +147,19 @@ class Combiner:
     params: dict[str, Any] = field(default_factory=dict)
     base_features: tuple[str, ...] = ()
     fit_split: str = "train"
+    # Which preprocessing pipeline produces the prediction.
+    #
+    # "native" is the original, written to mirror the baseline handler. It does
+    # not: it omits ProcessInf, and it drops label-NaN rows BEFORE rank
+    # normalising, so a factor's feature value depended on how many of its
+    # cross-sectional neighbours happened to be droppable that day.
+    #
+    # "backtest_v2" ports the published path exactly (backtest/runner.py,
+    # _create_dataset_with_computed_factors). The two engines produced
+    # UNCORRELATED daily returns from the same library -- Rank IC +0.0336 here
+    # against +0.1179 there on the test split -- so this is not a reporting
+    # difference to reconcile but a different model to replace.
+    engine: str = "native"
 
 
 @dataclass(frozen=True)
