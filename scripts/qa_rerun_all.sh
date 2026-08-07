@@ -1,0 +1,141 @@
+#!/bin/bash
+# Re-run the experiment after the evaluator and selection fixes.
+#
+#   ./scripts/qa_rerun_all.sh "price-volume factor mining"
+#
+# Shape:
+#   seed 42          Arm B only, both constructions (Arm A reused -- SEE BELOW)
+#   seeds 7, 13      full: Arm A + Arm B topk_dropout + Arm B mean_variance
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE REUSING ARM A ON SEED 42
+#
+# Arm A's generation is NOT unchanged. Four things reach the control arm, not
+# the one:
+#
+#   1. factor_ast.py unary-minus fix. Expressions whose root is a negation
+#      counted zero nodes and were rejected; they now count. ACCEPTS MORE.
+#   2. factor_zoo_path is set. It was null, which made FactorRegulator.alphazoo
+#      an empty frame and the duplication gate inert. It now fires against
+#      Alpha158(20). REJECTS MORE.
+#   3. duplication.threshold 5 -> 8, loosening that newly-live gate.
+#   4. evolution.mutation_top_fraction 0.5. Mutation used to breed every
+#      trajectory; it now breeds the top half by fitness -- RankIC for the
+#      control arm, delta_net_ir for the treatment arm.
+#
+# All four are generation-side and therefore SHOULD apply to both arms: the A/B
+# holds generation fixed and varies only the objective, so a change that
+# reached one arm alone would confound it. But it does mean the existing
+# 151-factor Arm A was mined under a different generation process, and pairing
+# it with a freshly-mined Arm B is a cross-generation comparison, not a clean
+# A/B.
+#
+# QA_REUSE_A is therefore OFF by default and seed 42 re-mines Arm A too. Set
+# QA_REUSE_A=<path> only if you want the older library and accept the caveat.
+# ---------------------------------------------------------------------------
+
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${SCRIPT_DIR}"
+
+if [ -z "${QA_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    export QA_CAFFEINATED=1
+    exec caffeinate -ims "$0" "$@"
+fi
+
+DIRECTION="${1:?usage: $0 \"<research direction>\"}"
+PRIMARY_SEED="${QA_PRIMARY_SEED:-42}"
+OTHER_SEEDS="${QA_OTHER_SEEDS:-7 13}"
+CONSTRUCTIONS="${QA_ARM_B_CONSTRUCTIONS:-topk_dropout mean_variance}"
+
+[ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
+eval "$(conda shell.bash hook)" 2>/dev/null || true
+conda activate "${CONDA_ENV_NAME:-quantaalpha}" 2>/dev/null || true
+PY="$(command -v python)"
+[ -z "${PY}" ] && { echo "no python after activating ${CONDA_ENV_NAME:-quantaalpha}"; exit 1; }
+
+# Sequential evolution, and the process fan-out check below must see it.
+export QA_SEQUENTIAL_EVOLUTION="${QA_SEQUENTIAL_EVOLUTION:-true}"
+CONFIG="${CONFIG_PATH:-configs/experiment_paper.yaml}"
+
+echo "========================================================================"
+echo "  RE-RUN after the evaluator + selection fixes"
+echo "------------------------------------------------------------------------"
+echo "  seed ${PRIMARY_SEED}    : $( [ -n "${QA_REUSE_A:-}" ] && echo "Arm B only (reusing ${QA_REUSE_A})" || echo "Arm A + Arm B" )"
+echo "  seeds ${OTHER_SEEDS} : Arm A + Arm B"
+echo "  Arm B g   : ${CONSTRUCTIONS}"
+echo "  config    : ${CONFIG}"
+echo ""
+echo "  What changed since the last run:"
+echo "    evaluator  benchmark aligned to the fill rule (net_arr/net_ir were"
+echo "               understated in EVERY previously reported figure)"
+echo "    selection  mutation parents ranked on fitness (were unranked)"
+echo "    fitness    delta_net_ir for Arm B (was U, which drifts with |zoo|)"
+echo "    novelty    alphazoo seeded from Alpha158(20) (the gate was inert)"
+echo "    parser     unary minus no longer silently rejected"
+echo "========================================================================"
+
+if ! PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_preflight.py --config "${CONFIG}"; then
+    echo ""
+    echo "Pre-flight FAILED -- nothing started."
+    exit 1
+fi
+
+# Seed the library and the alphazoo before mining, so round 0 starts from the
+# Alpha158(20) pool the paper describes rather than from nothing.
+echo ""
+echo "Seeding the Alpha158(20) pool..."
+PYTHONPATH="${SCRIPT_DIR}" "${PY}" - <<'PYSEED'
+from quantaalpha.factors.seed_pool import write_alphazoo_csv
+print("  alphazoo ->", write_alphazoo_csv("data/factorlib/alpha158_20_seed_pool.csv"))
+PYSEED
+
+mkdir -p data/results/logs
+run_seed () {
+    local seed="$1" arms="$2" label="$3"
+    for construction in ${CONSTRUCTIONS}; do
+        local tag="rerun_seed_${seed}_${construction}"
+        local log="data/results/logs/${tag}.log"
+        echo ""
+        echo "--- seed ${seed} | ${construction} | ${label} -> ${log}"
+        local proto="${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml"
+        if [ "${construction}" != "topk_dropout" ]; then
+            proto="${SCRIPT_DIR}/data/results/protocol_${construction}_rerun.yaml"
+            PYTHONPATH="${SCRIPT_DIR}" "${PY}" - "${construction}" "${proto}" <<'PYPROTO'
+import sys, yaml
+construction, dst = sys.argv[1], sys.argv[2]
+cfg = yaml.safe_load(open("quantaalpha/eval/protocol_csi300.yaml"))
+cfg.setdefault("portfolio", {})["construction"] = construction
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+print(f"  wrote {dst}")
+PYPROTO
+        fi
+        QA_SEED="${seed}" QA_CHAT_SEED="${seed}" \
+        CONFIG_PATH="${CONFIG}" QA_PROTOCOL="${proto}" \
+        QA_ARMS="${arms}" QA_REUSE_A="${QA_REUSE_A:-}" \
+        FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
+        QA_INSTANCE="s${seed}" \
+        ./scripts/qa_run_arms.sh "${DIRECTION}" > "${log}" 2>&1 \
+            && echo "    completed" || echo "    FAILED -- continuing"
+    done
+}
+
+if [ -n "${QA_REUSE_A:-}" ]; then
+    run_seed "${PRIMARY_SEED}" "treatment" "Arm B only, Arm A reused"
+else
+    run_seed "${PRIMARY_SEED}" "control treatment" "full"
+fi
+for seed in ${OTHER_SEEDS}; do
+    run_seed "${seed}" "control treatment" "full"
+done
+
+echo ""
+echo "========================================================================"
+echo "  DONE. Logs: data/results/logs/rerun_seed_*.log"
+echo ""
+echo "  The measurement that decides whether the search now LEARNS is not the"
+echo "  admission rate -- that rose 54%->78% on the last run purely because the"
+echo "  U bar softened as the zoo filled. It is whether delta_net_ir acquires a"
+echo "  positive slope across batches, currently t=+0.42:"
+echo "    python scripts/qa_analyze_ledger.py data/results/ledger_treatment_<stamp>.jsonl"
+echo "========================================================================"
