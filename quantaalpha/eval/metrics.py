@@ -73,16 +73,32 @@ def _cross_sectional_corr(a: pd.DataFrame, b: pd.DataFrame, method: str) -> pd.S
     return pd.Series(out, dtype=float).sort_index()
 
 
-def label_frame(panel: PanelBundle, theta: Protocol) -> pd.DataFrame:
-    """The close-to-close training label as a wide frame.
+_LABEL_FIELDS = {"$close": "close", "$open": "open", "$vwap": "vwap"}
 
-    Matches Θ's ``label_expr`` (``Ref($close,-2)/Ref($close,-1)-1``) evaluated
-    on the panel's raw close, i.e. exactly what the baseline Qlib handler
-    computes. Used for **IC only** — realized P&L comes from the fill series
-    in ``execution.py``, which is the point of the label/fill split.
+
+def label_frame(panel: PanelBundle, theta: Protocol) -> pd.DataFrame:
+    """Θ's training label as a wide frame, for IC.
+
+    **Derived from ``Θ.execution.label_expr``, not hardcoded.** This used to
+    return ``close.shift(-2)/close.shift(-1) - 1`` regardless of what the
+    protocol said, which was correct only for as long as nobody changed the
+    label. Changing it would then have moved the *training* target while
+    leaving the *IC* target on close, so every IC in the system would have
+    silently measured a quantity the model was no longer fitting.
+
+    Only the ``Ref(P,-2)/Ref(P,-1)-1`` shape is understood, because that is the
+    only shape the wide-panel form can express. Anything else raises rather
+    than falling back to close and being quietly wrong about it.
     """
-    close = panel.close
-    return close.shift(-2) / close.shift(-1) - 1.0
+    expr = theta.execution.label_expr
+    field = next((f for f in _LABEL_FIELDS if f in expr), None)
+    if field is None or "Ref(" not in expr or "-2" not in expr or "-1" not in expr:
+        raise ValueError(
+            f"label_frame cannot express {expr!r}. It understands "
+            f"Ref(P,-2)/Ref(P,-1)-1 for P in {sorted(_LABEL_FIELDS)}; anything "
+            "else must be evaluated through Qlib rather than on the panel.")
+    price = getattr(panel, _LABEL_FIELDS[field])
+    return price.shift(-2) / price.shift(-1) - 1.0
 
 
 def cx(expr: str) -> int:

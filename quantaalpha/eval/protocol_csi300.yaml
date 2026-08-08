@@ -34,7 +34,19 @@ splits:
 execution: # Eq. 4-5
   delta: 1
   fill_rule: open_next # Φ = open(t+1); matches deal_price:open everywhere
-  label_expr: "Ref($close, -2) / Ref($close, -1) - 1" # backtest.yaml:55 — used for IC only
+  # OPEN-to-open, matching the fill rule. It was close-to-close while the book
+  # fills open[t+1] -> open[t+2], so the model was trained to predict a return
+  # the book never earns -- the same day, measured between different endpoints.
+  #
+  # That mismatch is also why the benchmark-alignment fix could only reach
+  # corr(book, bench) = 0.689 rather than ~0.9: an open-to-open book cannot
+  # track a close-to-close index any better than the overnight/intraday
+  # decomposition allows.
+  #
+  # COST OF THIS CHANGE: IC now measures open-to-open predictability. That is
+  # the quantity the book actually trades, but it is NOT comparable to the
+  # paper's +0.0459 or to any other close-to-close IC. Quote it as such.
+  label_expr: "Ref($open, -2) / Ref($open, -1) - 1"
 
 combiner: # procedure A — Eq. 2; FROZEN, seed included
   model: lightgbm

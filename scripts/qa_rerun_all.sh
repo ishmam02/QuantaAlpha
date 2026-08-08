@@ -152,6 +152,34 @@ for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
     done
 done
 
+# --- reference: Qlib's own backtest, the path the paper's numbers come from ---
+# A DIFFERENT ENGINE, not this experiment priced differently. It charges a
+# commission and price limits and models no slippage, impact or borrow, so it
+# cannot score the objective these arms were mined under. It is here because the
+# published figures come from it and a comparable number is worth having.
+#
+# Read it with the caveat this repository measured: on the Arm B library it
+# reports RankIC 0.1179 while the library's best individual factor manages
+# 0.0505 and none exceeds 0.10, so its headline is not attainable from these
+# inputs. Treat it as "what the published path says", not as ground truth.
+echo ""
+echo "========================================================================"
+echo "  REFERENCE: Qlib's own backtest (the published path)"
+echo "========================================================================"
+for lib in data/factorlib/all_factors_library_*_zoo.json \
+           data/factorlib/all_factors_library_control_*.json; do
+    [ -f "${lib}" ] || continue
+    case "${lib}" in *_zoo.json|*control_*) ;; *) continue ;; esac
+    echo "  ${lib}"
+    PYTHONPATH="${SCRIPT_DIR}" "${PY}" -m quantaalpha.backtest.run_backtest \
+        -c configs/backtest.yaml \
+        --factor-source custom \
+        --factor-json "${lib}" \
+        >> data/results/logs/qlib_reference.log 2>&1 \
+        && echo "    done" || echo "    FAILED (see data/results/logs/qlib_reference.log)"
+done
+echo "  metrics: data/results/backtest_v2_results/*_backtest_metrics.json"
+
 echo ""
 echo "========================================================================"
 echo "  DONE. Logs: data/results/logs/rerun_seed_*.log"
