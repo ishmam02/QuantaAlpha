@@ -36,7 +36,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in-dir", default="data/results")
     ap.add_argument("--out", default="reports/four_way_tables.tex")
-    ap.add_argument("--protocol", default="data/results/protocol_mv_tuned.yaml")
+    ap.add_argument("--protocol", default="quantaalpha/eval/protocol_csi300.yaml")
     args = ap.parse_args()
 
     import sys

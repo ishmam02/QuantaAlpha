@@ -101,9 +101,21 @@ portfolio:
   # setting under which "turnover is a budget" differs from "turnover is a
   # by-product". Measured on a real library: cap 0.02 gave net IR -0.0354 at
   # 0.66 bps/day, against -0.2738 at 4.31 bps/day for top-k dropout.
+  # Chosen by sweeping 54 configurations on the 2021 VALIDATION split and
+  # priced on final_test exactly once afterwards -- selecting a construction by
+  # its performance on the window it is then reported on consumes the split the
+  # design exists to protect. risk_aversion 10 -> 25 and max_weight 0.05 -> 0.03
+  # came out of that sweep; the tighter position cap also cut combiner-seed
+  # dispersion from 0.45pp to 0.16pp, which is what made the Arm A/Arm B gap
+  # resolvable at all. Both winners sat on the edge of the grid, so the optimum
+  # is not yet bracketed -- widen it before treating these as settled.
   turnover_cap: 0.02
-  risk_aversion: 10.0
-  max_weight: 0.05
+  risk_aversion: 25.0
+  max_weight: 0.03
+  # "factor" fits a k-factor statistical risk model; it LOST to diagonal in 28
+  # of 36 matched pairs on validation, plausibly because a long-only book capped
+  # at 3% per name is already forced to diversify. Available, not default.
+  covariance: diagonal
 
 costs: # Eq. 7
   kappa0: 0.0020 # = open_cost 0.0005 + close_cost 0.0015 → nests Qlib's flat fee

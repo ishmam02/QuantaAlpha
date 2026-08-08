@@ -129,6 +129,29 @@ for seed in ${OTHER_SEEDS}; do
     run_seed "${seed}" "control treatment" "full"
 done
 
+# --- reference: the same engine, priced under a flat fee ----------------
+# Not a result, a reference point. The in-loop objective and the headline both
+# charge the full cost model; this reprices the identical books with kappa1,
+# kappa2 and borrow zeroed so the distance between the two is legible as one
+# number rather than inferred across tables. It uses OUR engine throughout --
+# Qlib's own backtest is a separate question and is deliberately not mixed in
+# here, because it cannot charge slippage or impact at all.
+echo ""
+echo "========================================================================"
+echo "  REFERENCE: flat fee, same engine, same books"
+echo "========================================================================"
+for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
+    lib_a="data/factorlib/all_factors_library_control_$(ls -t data/factorlib 2>/dev/null | grep -oE "control_[0-9_]+\.json" | head -1 | sed 's/control_//;s/\.json//')"
+    for construction in ${CONSTRUCTIONS}; do
+        out="data/results/flatfee_reference_seed_${seed}_${construction}.json"
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_flatfee_reference.py \
+            --seed "${seed}" --construction "${construction}" --out "${out}" \
+            >> data/results/logs/flatfee_reference.log 2>&1 \
+            && echo "  seed ${seed} ${construction} -> ${out}" \
+            || echo "  seed ${seed} ${construction}: skipped (no library yet)"
+    done
+done
+
 echo ""
 echo "========================================================================"
 echo "  DONE. Logs: data/results/logs/rerun_seed_*.log"
