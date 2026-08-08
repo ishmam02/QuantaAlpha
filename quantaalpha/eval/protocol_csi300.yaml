@@ -236,6 +236,49 @@ utility:
 # ranking something to interpolate between.
 admission:
   enabled: true
+
+  # marginal_contribution, NOT utility_rank. The percentile bar failed in a
+  # recorded way: the first two batches are admitted unconditionally to
+  # bootstrap the ranking and then ARE the yardstick, so a lucky pair sets a
+  # bar nothing clears -- the top-k re-mine froze at 18 factors and rejected 33
+  # consecutive batches while factor quality was statistically identical to the
+  # run that reached 174. It fails the other way too: on the mean_variance run
+  # U rose with repository SIZE (corr +0.409) as the zoo filled with mediocre
+  # members, so the admission rate climbed 54% -> 78% purely because the bar
+  # softened. Marginal contribution is measured against the CURRENT book and is
+  # near-orthogonal to zoo size (corr +0.039), so it can drift neither way.
+  mode: marginal_contribution
+
+  # The bar: the improvement must clear k_sigma standard errors, measured over
+  # test_seeds. delta_net_ir as a POINT estimate flipped 3 of 4 verdicts across
+  # combiner seeds, which is a fact about the estimate rather than the quantity
+  # -- so it is tested rather than thresholded. This makes the requirement
+  # genuinely dynamic without anyone choosing a percentile, and it is the
+  # multiplier on in-loop cost: three seeds means three evaluations per batch.
+  k_sigma: 1.0
+  test_seeds: [42, 1, 7]
+
+  # Pathology floor only -- too sparse to price, constant, or a near-duplicate.
+  # Never weakness: an absolute quality floor is what starved the repository
+  # when gamma_ic was enabled.
+  min_coverage: 0.30
+
+  # Unbounded for this run. QA_TARGET_ZOO stops mining at 150 admitted, so a
+  # capacity of 150 would be reached and never exercised. Capacity is the knob
+  # for the continuous setting, where admission becomes replacement and the
+  # library improves instead of merely growing.
+  capacity: null
+
+  # Re-scoring every incumbent against the current repository costs one
+  # evaluation each, so it is off for a 150-factor run. evict_below is the bar
+  # when it is on: a member must be actively unhelpful, not merely unproven.
+  evict_every: 0
+  evict_below: 0.0
+
+  # Legacy percentile eviction, still live: _prune runs on every admission and
+  # ranks members by U. See the note in net_cost_runner._prune -- under
+  # marginal_contribution these two disagree about what "behind" means, and
+  # reconciling them is outstanding.
   tau_admit: 0.50
   tau_evict: 0.25
   min_size: 6

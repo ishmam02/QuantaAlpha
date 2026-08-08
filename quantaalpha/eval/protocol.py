@@ -538,6 +538,13 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
 
     combiner_raw = dict(raw["combiner"])
     combiner_raw["base_features"] = tuple(combiner_raw.get("base_features", ()))
+    # Same coercion for the admission test seeds: YAML gives a list, the
+    # dataclass declares a tuple, and Theta is frozen -- a mutable member in a
+    # supposedly immutable protocol is the kind of thing Property 1 exists to
+    # prevent.
+    adm_raw = raw.get("admission")
+    if isinstance(adm_raw, dict) and "test_seeds" in adm_raw:
+        adm_raw["test_seeds"] = tuple(int(s) for s in adm_raw["test_seeds"])
     combiner_raw["params"] = dict(combiner_raw.get("params", {}))
     if "seed" in combiner_raw:      # accept the old scalar form
         combiner_raw.setdefault("seeds", [combiner_raw.pop("seed")])
