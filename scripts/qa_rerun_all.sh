@@ -95,22 +95,14 @@ from quantaalpha.factors.seed_pool import write_alphazoo_csv
 print("  alphazoo ->", write_alphazoo_csv("data/factorlib/alpha158_20_seed_pool.csv"))
 PYSEED
 
-# The alphazoo above only feeds the novelty gate. Seeding the LIBRARY is the
-# other half of "the initial seed factor pool is derived from Alpha158(20)":
-# without it the search starts from an empty repository and the seed pool is a
-# thing candidates are compared against rather than a thing they build on.
-# Applied per seed and to BOTH arms, since it is generation-side.
-if [ "${QA_SEED_LIBRARY:-true}" = "true" ]; then
-    for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
-        PYTHONPATH="${SCRIPT_DIR}" \
-        FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
-        "${PY}" scripts/qa_seed_library.py \
-            --library "data/factorlib/seed_pool_s${seed}.json" \
-            >> data/results/logs/seed_library.log 2>&1 \
-            && echo "  seed ${seed} library seeded" \
-            || echo "  seed ${seed} library seeding FAILED (see logs/seed_library.log)"
-    done
-fi
+# The alphazoo above feeds the novelty gate. QA_SEED_POOL is the other half:
+# FactorLibraryManager seeds a NEW library from Alpha158(20) when it creates
+# one, which is where this has to happen -- the library filename carries the
+# run's stamp and the stamp does not exist until the run starts, so a script
+# that pre-writes a seeded file writes one nothing opens. That is what an
+# earlier version of this block did.
+export QA_SEED_POOL="${QA_SEED_POOL:-true}"
+echo "  library seeding: QA_SEED_POOL=${QA_SEED_POOL}"
 
 mkdir -p data/results/logs
 
@@ -127,11 +119,22 @@ QA_PARENT_PID=$$
 (
     while kill -0 "${QA_PARENT_PID}" 2>/dev/null; do
         sleep "${QA_COMPACT_INTERVAL:-1800}"
-        for tool in qa_compact_cache.py "qa_prune_cache.py --orphans" \
-                    qa_reap_scratch.py qa_prune_pickle_cache.py; do
-            # shellcheck disable=SC2086
-            PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/${tool} --yes \
-                >> data/results/logs/compact_auto.log 2>&1
+        # FACTOR_CACHE_DIR is per-seed and these tools READ it: the compactor
+        # rewrites signals in it and the reaper's guard asks whether a factor
+        # is cached there before allowing a workspace to go. Without it they
+        # operate on the default directory, which for a per-seed run is empty
+        # -- the compactor would compact nothing and the reaper would refuse
+        # every stamp, so the sweep would run and free nothing while the disk
+        # filled anyway.
+        for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
+            for tool in qa_compact_cache.py "qa_prune_cache.py --orphans" \
+                        qa_reap_scratch.py qa_prune_pickle_cache.py; do
+                # shellcheck disable=SC2086
+                PYTHONPATH="${SCRIPT_DIR}" \
+                FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
+                "${PY}" scripts/${tool} --yes \
+                    >> data/results/logs/compact_auto.log 2>&1
+            done
         done
         echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
             >> data/results/logs/compact_auto.log

@@ -114,6 +114,9 @@ class NetCostFactorRunner(QlibFactorRunner):
         self._contributions: dict[str, float] = {}
         # Cadence counter for contribution-based eviction.
         self._rounds_since_evict = 0
+        # One EvaluationOperator per admission test seed, reused for the
+        # whole run so the panel and baseline caches survive across batches.
+        self._seed_ops: dict[int, EvaluationOperator] = {}
         logger.info(
             "NetCostFactorRunner active: theta=%s protocol=%s ledger=%s",
             self.theta.hash, default_protocol_path(), self.ledger.path,
@@ -267,11 +270,23 @@ class NetCostFactorRunner(QlibFactorRunner):
 
         deltas = []
         for seed in self.theta.admission.test_seeds:
-            th = _replace(self.theta,
-                          combiner=_replace(self.theta.combiner, seeds=(int(seed),)))
+            # ONE operator per seed for the whole run, not one per batch. The
+            # panel, the tradability masks and the baseline books are cached on
+            # the INSTANCE, so constructing a fresh operator each time reloads a
+            # 2427x622 panel and rebuilds the masks on every batch -- 150 panel
+            # loads per arm at 50 batches x 3 seeds, none of them reused. Held
+            # here, each seed's baseline cache also survives across batches,
+            # which is the larger saving: the baseline for a given repository
+            # state is then fitted once rather than once per candidate.
+            op = self._seed_ops.get(int(seed))
+            if op is None:
+                th = _replace(self.theta,
+                              combiner=_replace(self.theta.combiner, seeds=(int(seed),)))
+                op = EvaluationOperator(th)
+                self._seed_ops[int(seed)] = op
             try:
-                r = EvaluationOperator(th).evaluate(
-                    candidates, zoo_signals=zoo_signals, zoo_metrics=zoo_metrics)
+                r = op.evaluate(candidates, zoo_signals=zoo_signals,
+                                zoo_metrics=zoo_metrics)
                 deltas.append(r.get("m_delta_net_ir"))
             except Exception:
                 logger.exception("marginal contribution failed on seed %s", seed)

@@ -58,7 +58,28 @@ class FactorLibraryManager:
                     return json.load(f)
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning(f"Factor library file corrupted, recreating: {e}")
-        return {
+        return self._fresh()
+
+    @staticmethod
+    def _fresh() -> dict:
+        """A new library, seeded from Alpha158(20) when asked.
+
+        Seeding has to happen HERE rather than in a driver script. The library
+        filename carries the run's stamp (``all_factors_library_<arm>_<STAMP>``)
+        and the stamp does not exist until the run starts, so a script that
+        pre-writes a seeded file writes one nothing will ever open -- which is
+        exactly what an earlier attempt did.
+
+        This seeds the pool the *generator* sees, not the E_Θ repository: the
+        treatment arm rehydrates its repository from the ledger, so a seeded
+        factor still has to earn admission on its own contribution. That is the
+        intended split -- the pool is what the search starts from, not what it
+        is credited with.
+
+        Off unless ``QA_SEED_POOL=true``, and a failure to seed degrades to an
+        empty library rather than taking the run down with it.
+        """
+        base = {
             "metadata": {
                 "created_at": datetime.now().isoformat(),
                 "last_updated": datetime.now().isoformat(),
@@ -67,6 +88,31 @@ class FactorLibraryManager:
             },
             "factors": {},
         }
+        if os.environ.get("QA_SEED_POOL", "").lower() != "true":
+            return base
+        try:
+            import hashlib
+
+            from quantaalpha.factors.seed_pool import SEED_POOL
+
+            for name, expr in SEED_POOL.items():
+                fid = hashlib.md5(f"seed::{name}::{expr}".encode()).hexdigest()[:16]
+                base["factors"][fid] = {
+                    "factor_id": fid, "factor_name": name,
+                    "factor_expression": expr, "factor_implementation_code": "",
+                    "factor_description": f"Alpha158(20) seed factor {name}.",
+                    "factor_formulation": expr, "cache_location": {},
+                    "metadata": {"source": "alpha158_20_seed_pool",
+                                 "round_number": -1, "evolution_phase": "seed"},
+                    "backtest_results": {}, "feedback": "", "admitted": True,
+                }
+            base["metadata"]["total_factors"] = len(base["factors"])
+            base["metadata"]["seeded_from"] = "alpha158_20"
+            logger.info(f"Factor library seeded with {len(base['factors'])} "
+                        "Alpha158(20) factors")
+        except Exception as e:
+            logger.warning(f"Could not seed the factor library, starting empty: {e}")
+        return base
 
     def admitted_ids(self) -> list:
         """Factor ids that passed F_Theta, in insertion order."""
