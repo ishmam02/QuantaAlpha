@@ -112,6 +112,8 @@ class NetCostFactorRunner(QlibFactorRunner):
         # Last measured marginal contribution per admitted expression, so a full
         # repository knows which incumbent a candidate would have to displace.
         self._contributions: dict[str, float] = {}
+        # Cadence counter for contribution-based eviction.
+        self._rounds_since_evict = 0
         logger.info(
             "NetCostFactorRunner active: theta=%s protocol=%s ledger=%s",
             self.theta.hash, default_protocol_path(), self.ledger.path,
@@ -370,6 +372,9 @@ class NetCostFactorRunner(QlibFactorRunner):
         if not adm.enabled or len(self._repository) <= adm.min_size:
             return []
 
+        if adm.mode == "marginal_contribution":
+            return self._prune_by_contribution()
+
         entries = list(self._repository.items())
         scored = []
         for expr, (signal, metrics) in entries:
@@ -393,6 +398,70 @@ class NetCostFactorRunner(QlibFactorRunner):
                 "repository: EVICTED %d factor(s) with U < tau_evict=%.2f; |zoo| = %d",
                 len(evicted), adm.tau_evict, len(self._repository),
             )
+        return evicted
+
+    # ------------------------------------------------------------------
+    def _prune_by_contribution(self) -> list[str]:
+        """Evict on leave-one-out contribution, matching how admission decides.
+
+        Admission asks whether the book improves when a batch is added; this
+        asks whether it worsens when a member is removed. Both are marginal
+        contribution measured against the CURRENT repository, so the two agree
+        about what "behind" means -- the percentile ``_prune`` used does not,
+        and running them together meant admitting on one criterion and evicting
+        on another.
+
+        **Re-measurement is the whole point and it is not free.** A factor that
+        was additive at |zoo| = 12 can be redundant at 150, and nothing in its
+        own stored metrics changes to say so; the contribution recorded at
+        admission is exactly the stale number that cannot detect this. So each
+        surviving member is re-priced without itself, which costs one
+        evaluation per member. ``evict_every`` is the cadence, and 0 means
+        never -- with it off this returns nothing rather than falling back to
+        a stale figure or to a percentile that means something else.
+        """
+        adm = self.theta.admission
+        self._rounds_since_evict += 1
+        if not adm.evict_every or self._rounds_since_evict < adm.evict_every:
+            return []
+        self._rounds_since_evict = 0
+
+        from quantaalpha.eval.admission import should_evict
+
+        entries = list(self._repository.items())
+        base = self.op.evaluate({}, zoo_signals={e: s for e, (s, _) in entries},
+                                zoo_metrics=[m for _, (_, m) in entries])
+        base_ir = base.get("m_net_ir")
+        if base_ir is None or base_ir != base_ir:
+            logger.warning("eviction: repository has no net_ir; skipping this round")
+            return []
+
+        contributions: dict[str, float] = {}
+        for expr, _ in entries:
+            others = {e: s for e, (s, _) in entries if e != expr}
+            try:
+                without = self.op.evaluate(
+                    {}, zoo_signals=others,
+                    zoo_metrics=[m for e, (_, m) in entries if e != expr])
+                w_ir = without.get("m_net_ir")
+                if w_ir is not None and w_ir == w_ir:
+                    contributions[expr] = float(base_ir) - float(w_ir)
+            except Exception:
+                logger.exception("eviction: could not re-price %s", expr[:60])
+
+        ranked = sorted(contributions.items(), key=lambda kv: kv[1], reverse=True)
+        keep_floor = {e for e, _ in ranked[: adm.min_size]}
+        evicted = [e for e, c in ranked if should_evict(c, self.theta) and e not in keep_floor]
+        for expr in evicted:
+            self._repository.pop(expr, None)
+            self._contributions.pop(expr, None)
+        self._contributions.update(contributions)
+        if evicted:
+            self.ledger.append({"evicted_exprs": evicted, "n_factors": 0,
+                                "metrics": {}, "U": None})
+            logger.info("repository: EVICTED %d factor(s) contributing < %.4f "
+                        "on re-measurement; |zoo| = %d",
+                        len(evicted), adm.evict_below, len(self._repository))
         return evicted
 
     # ------------------------------------------------------------------

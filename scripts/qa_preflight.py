@@ -161,6 +161,37 @@ def main() -> int:
         return f"admit>={a.tau_admit} evict<{a.tau_evict} min_size={a.min_size}"
     check("admission thresholds have hysteresis", admission)
 
+    def admission_mode():
+        """The check the hysteresis one does not do: is the LIVE rule sane?
+
+        The thresholds above belong to the percentile rule. Under
+        marginal_contribution none of them decide anything, and the parameter
+        that does can be set to a value under which NOTHING is ever admitted:
+        a standard error needs at least two measurements, and with one seed
+        _mean_se returns inf so every batch fails the test. That would look
+        exactly like a search that cannot find anything, for days.
+        """
+        a = load_protocol(default_protocol_path()).admission
+        if a.mode not in ("utility_rank", "marginal_contribution"):
+            raise RuntimeError(f"unknown admission mode {a.mode!r}")
+        if a.mode == "utility_rank":
+            return "utility_rank (legacy percentile bar)"
+        if len(a.test_seeds) < 2:
+            raise RuntimeError(
+                f"marginal_contribution with {len(a.test_seeds)} test seed(s): a "
+                "standard error needs two, so se is infinite and NOTHING can be "
+                "admitted. Set admission.test_seeds to at least two seeds.")
+        if a.k_sigma <= 0:
+            raise RuntimeError(f"k_sigma={a.k_sigma} admits on noise alone")
+        if a.evict_every and a.evict_below > 0:
+            raise RuntimeError(
+                f"evict_below={a.evict_below} > 0 evicts members that still "
+                "contribute; it is a floor on being unhelpful, not on being weak")
+        return (f"marginal_contribution, {a.k_sigma:g} sigma over "
+                f"{len(a.test_seeds)} seeds, eviction "
+                f"{'every ' + str(a.evict_every) + ' rounds' if a.evict_every else 'off'}")
+    check("admission rule is usable", admission_mode)
+
     # --- the failure modes that cost whole runs --------------------------
     def no_recursion():
         import inspect
