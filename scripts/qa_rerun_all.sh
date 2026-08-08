@@ -127,13 +127,18 @@ QA_PARENT_PID=$$
         # every stamp, so the sweep would run and free nothing while the disk
         # filled anyway.
         for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
-            for tool in qa_compact_cache.py "qa_prune_cache.py --orphans" \
-                        qa_reap_scratch.py qa_prune_pickle_cache.py; do
-                # shellcheck disable=SC2086
-                PYTHONPATH="${SCRIPT_DIR}" \
-                FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
-                "${PY}" scripts/${tool} --yes \
-                    >> data/results/logs/compact_auto.log 2>&1
+            # Spelled out rather than looped over a variable holding
+            # "script --flag": that form relies on unquoted word-splitting,
+            # which bash does and zsh does not, so it works here only because
+            # of the shebang. Four explicit lines cannot break that way.
+            local_cache="${SCRIPT_DIR}/data/results/factor_cache_s${seed}"
+            for prog in \
+                "scripts/qa_compact_cache.py --yes" \
+                "scripts/qa_prune_cache.py --orphans --yes" \
+                "scripts/qa_reap_scratch.py --yes" \
+                "scripts/qa_prune_pickle_cache.py --yes"; do
+                PYTHONPATH="${SCRIPT_DIR}" FACTOR_CACHE_DIR="${local_cache}" \
+                    "${PY}" ${prog} >> data/results/logs/compact_auto.log 2>&1
             done
         done
         echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
