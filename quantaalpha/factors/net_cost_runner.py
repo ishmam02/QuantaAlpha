@@ -245,6 +245,16 @@ class NetCostFactorRunner(QlibFactorRunner):
                 "metrics": batch_metrics,
                 "e": {k[2:]: v for k, v in res.items() if k.startswith("e_")},
                 "U": res["U"],
+                # WHY the verdict fell as it did. The ledger built this dict from
+                # named keys, so decision.as_record() -- which is merged into
+                # `res` above -- never reached disk: every record carried
+                # admitted=True/False and nothing to explain it. That silently
+                # removed the only measurement that says whether the search is
+                # learning, since the delta slope is computed from these.
+                **{k: v for k, v in res.items()
+                   if k in ("reason", "delta_mean", "delta_se", "delta_t",
+                            "delta_per_seed", "displaced", "pathology",
+                            "population")},
             }
         )
 
