@@ -46,7 +46,10 @@ while true; do
         printf "         %-26s %s\n" "tracebacks"                "$(grep -c 'Traceback' "${newest}" 2>/dev/null)"
         printf "         %-26s %s\n" "HTTP 4xx/5xx"              "$(grep -cE 'HTTP (4|5)[0-9][0-9]' "${newest}" 2>/dev/null)"
         printf "         %-26s %s\n" "expression rejected"       "$(grep -c 'Expression has no nodes' "${newest}" 2>/dev/null)"
-        last_err=$(grep -iE "error|exception" "${newest}" 2>/dev/null | tail -1 | cut -c1-88)
+        # Anchored on log LEVELS, not the word: factor feedback routinely says
+        # "executed successfully, without errors", which a bare match reports as
+        # the most recent error.
+        last_err=$(grep -E "\| (ERROR|CRITICAL)|Traceback|^[A-Za-z]*Error:" "${newest}" 2>/dev/null | tail -1 | cut -c1-88)
         [ -n "${last_err}" ] && echo "         last error: ${last_err}"
     else
         echo "LOG      no run log yet"
