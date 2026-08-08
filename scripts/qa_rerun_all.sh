@@ -45,7 +45,12 @@ fi
 
 DIRECTION="${1:?usage: $0 \"<research direction>\"}"
 PRIMARY_SEED="${QA_PRIMARY_SEED:-42}"
-OTHER_SEEDS="${QA_OTHER_SEEDS:-7 13}"
+# One seed by default. Generation noise is roughly 9x combiner-seed noise, so
+# extra seeds are how a difference becomes resolvable -- but they triple a
+# multi-day run, and there is no point paying for resolution before knowing
+# whether the effect is there at all. Add them once seed 42 says something:
+#   QA_OTHER_SEEDS="7 13" ./scripts/qa_rerun_all.sh "..."
+OTHER_SEEDS="${QA_OTHER_SEEDS:-}"
 CONSTRUCTIONS="${QA_ARM_B_CONSTRUCTIONS:-topk_dropout mean_variance}"
 
 [ -f "${SCRIPT_DIR}/.env" ] && { set -a; . "${SCRIPT_DIR}/.env"; set +a; }
@@ -62,7 +67,7 @@ echo "========================================================================"
 echo "  RE-RUN after the evaluator + selection fixes"
 echo "------------------------------------------------------------------------"
 echo "  seed ${PRIMARY_SEED}    : $( [ -n "${QA_REUSE_A:-}" ] && echo "Arm B only (reusing ${QA_REUSE_A})" || echo "Arm A + Arm B" )"
-echo "  seeds ${OTHER_SEEDS} : Arm A + Arm B"
+echo "  seeds ${OTHER_SEEDS:-(none -- set QA_OTHER_SEEDS to add)}"
 echo "  Arm B g   : ${CONSTRUCTIONS}"
 echo "  config    : ${CONFIG}"
 echo ""
@@ -182,6 +187,11 @@ PYPROTO
                 echo "    Arm A mined -> reusing ${reuse_a} for the remaining constructions"
             fi
         fi
+        # The paired summary reads stamps, not libraries: it is the only figure
+        # that resolves across GENERATION seeds rather than combiner seeds, and
+        # generation noise is ~9x the combiner kind.
+        grep -oE 'stamp     : [0-9_]+' "${log}" | tail -1 | awk '{print $3}' \
+            >> data/results/stamps.txt 2>/dev/null || true
     done
 }
 
@@ -223,6 +233,30 @@ if [ -n "${LIB_A}" ] && [ -n "${LIB_B}" ]; then
         && echo "  -> data/results/cost_construction_matrix.md"
 else
     echo "  no finished libraries yet; skipping"
+fi
+
+# --- capacity, and the paired difference across generation seeds --------
+# Both were only ever wired into the old driver stack. Neither is redundant:
+# capacity_sweep answers "at what NAV does this die", which nothing else asks,
+# and paired_summary is the only figure that resolves across GENERATION seeds.
+# It needs more than one seed to say anything -- with a single seed it reports
+# that and stops, which is the honest output rather than a missing file.
+echo ""
+echo "========================================================================"
+echo "  CAPACITY and PAIRED DIFFERENCE"
+echo "========================================================================"
+LIBS_FOR_CAP="$(ls -t data/factorlib/all_factors_library_treatment_*_zoo.json 2>/dev/null | head -2)"
+if [ -n "${LIBS_FOR_CAP}" ]; then
+    # shellcheck disable=SC2086
+    PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_capacity_sweep.py \
+        ${LIBS_FOR_CAP} --navs "${QA_NAVS:-1e7,1e8,1e9,1e10}" \
+        --out data/results/capacity.md \
+        && echo "  -> data/results/capacity.md" || echo "  capacity sweep failed"
+fi
+if [ -s data/results/stamps.txt ]; then
+    PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_paired_summary.py \
+        --stamps data/results/stamps.txt --out data/results/paired_summary.md \
+        && echo "  -> data/results/paired_summary.md" || echo "  paired summary failed"
 fi
 
 # --- reference: the same engine, priced under a flat fee ----------------

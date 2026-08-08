@@ -34,7 +34,7 @@ LEDGER="$(ls -t "${ROOT}"/data/results/ledger_treatment_*.jsonl 2>/dev/null | he
     fi
     # One line on whether the run is even alive -- an unchanging admission
     # table means something very different if the process died an hour ago.
-    if pgrep -f "qa_paper_experiment|quantaalpha mine" >/dev/null 2>&1; then
+    if pgrep -f "qa_run_arms|quantaalpha mine" >/dev/null 2>&1; then
         echo "[run is alive]"
     else
         echo "[!! no mining process found -- the run has stopped]"
