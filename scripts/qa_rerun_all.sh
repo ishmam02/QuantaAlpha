@@ -90,14 +90,68 @@ from quantaalpha.factors.seed_pool import write_alphazoo_csv
 print("  alphazoo ->", write_alphazoo_csv("data/factorlib/alpha158_20_seed_pool.csv"))
 PYSEED
 
+# The alphazoo above only feeds the novelty gate. Seeding the LIBRARY is the
+# other half of "the initial seed factor pool is derived from Alpha158(20)":
+# without it the search starts from an empty repository and the seed pool is a
+# thing candidates are compared against rather than a thing they build on.
+# Applied per seed and to BOTH arms, since it is generation-side.
+if [ "${QA_SEED_LIBRARY:-true}" = "true" ]; then
+    for seed in ${PRIMARY_SEED} ${OTHER_SEEDS}; do
+        PYTHONPATH="${SCRIPT_DIR}" \
+        FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
+        "${PY}" scripts/qa_seed_library.py \
+            --library "data/factorlib/seed_pool_s${seed}.json" \
+            >> data/results/logs/seed_library.log 2>&1 \
+            && echo "  seed ${seed} library seeded" \
+            || echo "  seed ${seed} library seeding FAILED (see logs/seed_library.log)"
+    done
+fi
+
 mkdir -p data/results/logs
+
+# --- disk maintenance, for the whole run --------------------------------
+# NOT optional. A live arm writes ~14 GB/hour -- workspace result.h5 plus the
+# coder.factor.execute memo -- and this disk has filled mid-run twice. The
+# sweep compacts cached signals, drops orphans, prunes the running arm's memo
+# and reaps finished stamps; each refuses anything still in use.
+#
+# Gated on THIS script still being alive, not on an arm being mid-run: the
+# sweeper starts before the first arm does, so a `pgrep qa_run_arms.sh`
+# condition would find nothing and exit on its first evaluation.
+QA_PARENT_PID=$$
+(
+    while kill -0 "${QA_PARENT_PID}" 2>/dev/null; do
+        sleep "${QA_COMPACT_INTERVAL:-1800}"
+        for tool in qa_compact_cache.py "qa_prune_cache.py --orphans" \
+                    qa_reap_scratch.py qa_prune_pickle_cache.py; do
+            # shellcheck disable=SC2086
+            PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/${tool} --yes \
+                >> data/results/logs/compact_auto.log 2>&1
+        done
+        echo "[$(date '+%F %H:%M')] free: $(df -h . | awk 'NR==2{print $4}')" \
+            >> data/results/logs/compact_auto.log
+    done
+) &
+SWEEPER=$!
+trap 'kill "${SWEEPER}" 2>/dev/null || true' EXIT
+echo "  disk sweeper: pid ${SWEEPER}, every ${QA_COMPACT_INTERVAL:-1800}s"
+
 run_seed () {
     local seed="$1" arms="$2" label="$3"
+    # Arm A is mined ONCE per seed and reused for the remaining constructions.
+    # The control arm runs the stock Qlib runner and never touches Theta, so its
+    # library does not depend on Arm B's portfolio map -- mining it per
+    # construction produced two identical libraries at roughly five hours each.
+    local reuse_a="${QA_REUSE_A:-}"
     for construction in ${CONSTRUCTIONS}; do
+        local this_arms="${arms}"
+        if [ -n "${reuse_a}" ]; then
+            this_arms="treatment"
+        fi
         local tag="rerun_seed_${seed}_${construction}"
         local log="data/results/logs/${tag}.log"
         echo ""
-        echo "--- seed ${seed} | ${construction} | ${label} -> ${log}"
+        echo "--- seed ${seed} | ${construction} | arms='${this_arms}' | ${label} -> ${log}"
         local proto="${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml"
         if [ "${construction}" != "topk_dropout" ]; then
             proto="${SCRIPT_DIR}/data/results/protocol_${construction}_rerun.yaml"
@@ -112,11 +166,22 @@ PYPROTO
         fi
         QA_SEED="${seed}" QA_CHAT_SEED="${seed}" \
         CONFIG_PATH="${CONFIG}" QA_PROTOCOL="${proto}" \
-        QA_ARMS="${arms}" QA_REUSE_A="${QA_REUSE_A:-}" \
+        QA_ARMS="${this_arms}" QA_REUSE_A="${reuse_a}" \
         FACTOR_CACHE_DIR="${SCRIPT_DIR}/data/results/factor_cache_s${seed}" \
         QA_INSTANCE="s${seed}" \
         ./scripts/qa_run_arms.sh "${DIRECTION}" > "${log}" 2>&1 \
             && echo "    completed" || echo "    FAILED -- continuing"
+
+        # Capture Arm A once so the next construction reuses it rather than
+        # spending another five hours reproducing the same library.
+        if [ -z "${reuse_a}" ]; then
+            local stamp
+            stamp="$(grep -oE 'stamp     : [0-9_]+' "${log}" | tail -1 | awk '{print $3}')"
+            if [ -n "${stamp}" ] && [ -f "data/factorlib/all_factors_library_control_${stamp}.json" ]; then
+                reuse_a="data/factorlib/all_factors_library_control_${stamp}.json"
+                echo "    Arm A mined -> reusing ${reuse_a} for the remaining constructions"
+            fi
+        fi
     done
 }
 
@@ -128,6 +193,37 @@ fi
 for seed in ${OTHER_SEEDS}; do
     run_seed "${seed}" "control treatment" "full"
 done
+
+# --- the headline: full cost model, BOTH constructions, EVERY arm -------
+# qa_run_arms.sh compares the arms once per construction, so each run produces
+# one full-cost table for the construction it was given. Neither run produces
+# the grid, and the grid is the thing worth reading: it holds cost model and
+# construction as the only moving parts, from one set of fits, so top-k against
+# mean-variance is a like-for-like comparison rather than two tables that also
+# differ in when they were produced.
+echo ""
+echo "========================================================================"
+echo "  HEADLINE: full cost model x construction, all arms"
+echo "========================================================================"
+LIB_A="$(ls -t data/factorlib/all_factors_library_control_*.json 2>/dev/null | head -1)"
+LIB_B="$(ls -t data/factorlib/all_factors_library_treatment_*_zoo.json 2>/dev/null | head -1)"
+if [ -n "${LIB_A}" ] && [ -n "${LIB_B}" ]; then
+    for cfgk in baseline seed arm-a arm-b; do
+        PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_cost_construction_matrix.py \
+            --arm-a "${LIB_A}" --arm-b "${LIB_B}" \
+            --protocol "${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml" \
+            --seeds 42,1,7 --only "${cfgk}" \
+            --out data/results/cost_construction_matrix.md \
+            >> data/results/logs/cost_matrix.log 2>&1 \
+            && echo "  ${cfgk} priced" || echo "  ${cfgk} FAILED"
+    done
+    PYTHONPATH="${SCRIPT_DIR}" "${PY}" scripts/qa_cost_construction_matrix.py \
+        --protocol "${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300.yaml" \
+        --seeds 42,1,7 --render --out data/results/cost_construction_matrix.md \
+        && echo "  -> data/results/cost_construction_matrix.md"
+else
+    echo "  no finished libraries yet; skipping"
+fi
 
 # --- reference: the same engine, priced under a flat fee ----------------
 # Not a result, a reference point. The in-loop objective and the headline both
