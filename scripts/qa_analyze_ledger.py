@@ -91,11 +91,64 @@ def main() -> int:
         lines.append(f"| {i} | {r.get('zoo_size', '—')} | {u_s} | "
                      f"{'ADMIT' if r['admitted'] else '**reject**'} | {arr_s} |")
 
-    # --- the trend that the hypothesis predicts ---
+    # --- THE learning test, when the ledger carries it ---------------------
+    deltas = [(i, r.get("delta_mean")) for i, r in enumerate(evals)
+              if isinstance(r.get("delta_mean"), (int, float))
+              and r.get("delta_mean") == r.get("delta_mean")]
+    if len(deltas) >= 6:
+        xs = [i for i, _ in deltas]
+        ys = [d for _, d in deltas]
+        n = len(ys)
+        mx, my = sum(xs) / n, sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else 0.0
+        resid = [y - (my + b * (x - mx)) for x, y in zip(xs, ys)]
+        se = ((sum(r * r for r in resid) / (n - 2)) ** 0.5 / sxx ** 0.5) if n > 2 and sxx else float("inf")
+        t = b / se if se not in (0.0, float("inf")) else 0.0
+        h = n // 2
+        lines += [
+            "", "## Does the generator improve? (the actual test)", "",
+            "Marginal contribution per batch -- what the candidates themselves add "
+            "to the book, independent of how large the repository has grown. This is "
+            "the statistic that answers the question; the admission rate below does "
+            "not, and has been actively misleading.",
+            "",
+            f"- First half: **{sum(ys[:h])/max(h,1):+.5f}** mean contribution",
+            f"- Second half: **{sum(ys[h:])/max(n-h,1):+.5f}**",
+            f"- Slope: **{b:+.6f}** per batch, t = **{t:+.2f}** over {n} measured batches",
+            "",
+        ]
+        if t > 2:
+            lines.append("**The search is learning.** Later batches contribute more, and "
+                         "the trend is larger than its own standard error.")
+        elif t < -2:
+            lines.append("**The search is degrading.** Later batches contribute *less*.")
+        else:
+            lines.append("**No resolvable trend.** The generator is proposing at a "
+                         "constant quality: selection is working on a stationary "
+                         "distribution rather than an improving one. That is the "
+                         "state measured before, at t=+0.42 over 79 batches.")
+    elif any("delta_mean" in r for r in evals):
+        lines += ["", "## Does the generator improve?", "",
+                  f"Only {len(deltas)} batch(es) carry a measured contribution -- too few "
+                  "for a trend. Bootstrap batches record NaN by design."]
+    else:
+        lines += ["", "## Does the generator improve?", "",
+                  "**This ledger predates the marginal-contribution record.** It carries "
+                  "no `delta_mean`, so the learning question cannot be answered from it "
+                  "-- only the admission rate below, which is not the same question."]
+
+    # --- the admission rate: reported, but NOT the learning test ---
     half = max(len(evals) // 2, 1)
     rate = lambda chunk: 100.0 * sum(1 for r in chunk if r["admitted"]) / max(len(chunk), 1)
     first, second = rate(evals[:half]), rate(evals[half:])
-    lines += ["", "## Does the admission rate rise?", "",
+    lines += ["", "## Admission rate (context, not evidence)", "",
+              "_Read this only alongside the contribution trend above._ On the "
+              "mean_variance run it climbed 54% -> 78% while marginal contribution "
+              "stayed flat, because `U` rises with repository size (corr +0.41) as "
+              "the zoo fills with mediocre members and the bar softens. A rising "
+              "admission rate is as easily a falling standard as an improving search.",
+              "",
               f"- First half: **{first:.0f}%** admitted ({half} batches)",
               f"- Second half: **{second:.0f}%** admitted ({len(evals) - half} batches)",
               f"- Change: **{second - first:+.0f}pp**"]

@@ -417,8 +417,15 @@ class NetCostFactorRunner(QlibFactorRunner):
             del self._repository[expr]
         if evicted:
             # Persist the decision, or a sibling process undoes it.
-            self.ledger.append({"evicted_exprs": evicted, "n_factors": 0,
-                                "metrics": {}, "U": None})
+            self.ledger.append({
+                "evicted_exprs": evicted, "n_factors": 0, "metrics": {}, "U": None,
+                # Same omission the admission record had: which factors left was
+                # recorded and why was not, so an eviction could never be
+                # audited or second-guessed after the fact.
+                "eviction_rule": "utility_rank",
+                "eviction_bar": adm.tau_evict,
+                "eviction_scores": {e: u for u, e, _, _ in scored if e in set(evicted)},
+            })
             logger.info(
                 "repository: EVICTED %d factor(s) with U < tau_evict=%.2f; |zoo| = %d",
                 len(evicted), adm.tau_evict, len(self._repository),
@@ -482,8 +489,18 @@ class NetCostFactorRunner(QlibFactorRunner):
             self._contributions.pop(expr, None)
         self._contributions.update(contributions)
         if evicted:
-            self.ledger.append({"evicted_exprs": evicted, "n_factors": 0,
-                                "metrics": {}, "U": None})
+            self.ledger.append({
+                "evicted_exprs": evicted, "n_factors": 0, "metrics": {}, "U": None,
+                "eviction_rule": "marginal_contribution",
+                "eviction_bar": adm.evict_below,
+                # The leave-one-out contributions this round measured. They cost
+                # one evaluation per member to obtain and were being thrown
+                # away; kept, they are also the record of how the repository's
+                # value is distributed at this size.
+                "eviction_scores": {e: contributions[e] for e in evicted
+                                    if e in contributions},
+                "repository_contributions": dict(ranked),
+            })
             logger.info("repository: EVICTED %d factor(s) contributing < %.4f "
                         "on re-measurement; |zoo| = %d",
                         len(evicted), adm.evict_below, len(self._repository))
