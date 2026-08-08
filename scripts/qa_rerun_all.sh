@@ -135,7 +135,7 @@ QA_PARENT_PID=$$
             for prog in \
                 "scripts/qa_compact_cache.py --yes" \
                 "scripts/qa_prune_cache.py --orphans --yes" \
-                "scripts/qa_reap_scratch.py --yes" \
+                "scripts/qa_reap_scratch.py --live --yes" \
                 "scripts/qa_prune_pickle_cache.py --yes"; do
                 PYTHONPATH="${SCRIPT_DIR}" FACTOR_CACHE_DIR="${local_cache}" \
                     "${PY}" ${prog} >> data/results/logs/compact_auto.log 2>&1

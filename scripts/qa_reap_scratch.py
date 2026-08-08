@@ -94,10 +94,78 @@ def _result_h5(entry: dict) -> pathlib.Path | None:
     return None
 
 
+def _release_cached_h5(stamp, dirs, factor_cache_path, min_age_minutes, apply):
+    """Delete result.h5 inside a LIVE stamp, but only where it is redundant.
+
+    A finished stamp can be reaped wholesale; a running one cannot, and that
+    asymmetry is what makes disk the binding constraint on a long mine. The
+    workspace grows ~7 GB/hour and nothing may touch it until the arm exits, so
+    a 20-hour arm needs 141 GB of headroom that this machine does not have.
+
+    But "the process is alive" is not the same as "every byte is load-bearing".
+    Once a factor's signal is in factor_cache its result.h5 is redundant, and
+    every consumer says so: library.py syncs FROM it and has already done so,
+    runner.py treats a missing one as a recompute, and load_factor_signal only
+    falls back to h5 when the cache misses. So the same question the reap guard
+    asks -- would deleting this destroy anything -- has a per-file answer inside
+    a live stamp.
+
+    Two things keep it safe. A file is only released when its factor resolves in
+    factor_cache, verified per file rather than per stamp. And files younger
+    than ``min_age_minutes`` are left alone, because a factor written moments
+    ago may not have been synced yet and the miner may still be reading it.
+    """
+    import json
+    import time
+
+    released, n = 0, 0
+    cutoff = time.time() - min_age_minutes * 60.0
+    cached: set[str] = set()
+    for lib in (ROOT / "data/factorlib").glob(f"*{stamp}*.json"):
+        try:
+            factors = json.loads(lib.read_text()).get("factors", {})
+        except Exception:
+            continue
+        for v in factors.values():
+            e = v.get("factor_expression")
+            if e and factor_cache_path(e).exists():
+                loc = v.get("cache_location") or {}
+                h5 = loc.get("result_h5_path")
+                if not h5 and loc.get("workspace_path") and loc.get("factor_dir"):
+                    h5 = str(pathlib.Path(loc["workspace_path"]) / loc["factor_dir"] / "result.h5")
+                if h5:
+                    cached.add(h5)
+
+    for h5 in cached:
+        p = pathlib.Path(h5)
+        p = p if p.is_absolute() else ROOT / p
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        if not statmod.S_ISREG(st.st_mode) or st.st_mtime > cutoff:
+            continue
+        released += st.st_size
+        n += 1
+        if apply:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    verb = "released" if apply else "could release"
+    print(f"  {stamp}: LIVE -- {verb} {n} redundant result.h5 "
+          f"({released/1e9:.1f} GB); workspace kept, signals already cached")
+    return released / 1e9
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--live", action="store_true",
+                    help="also release cached result.h5 inside a RUNNING stamp")
+    ap.add_argument("--min-age-minutes", type=float, default=30.0,
+                    help="leave result.h5 files younger than this alone (default 30)")
     args = ap.parse_args()
 
     from quantaalpha.eval.data import factor_cache_path
@@ -120,7 +188,11 @@ def main() -> int:
     freed = 0.0
     for stamp, dirs in sorted(scratch.items()):
         if stamp in live:
-            print(f"  {stamp}: SKIP -- a process is still using it")
+            if args.live:
+                freed += _release_cached_h5(stamp, dirs, factor_cache_path,
+                                            args.min_age_minutes, args.yes)
+            else:
+                print(f"  {stamp}: SKIP -- a process is still using it")
             continue
 
         libs = list((ROOT / "data/factorlib").glob(f"*{stamp}*.json"))
