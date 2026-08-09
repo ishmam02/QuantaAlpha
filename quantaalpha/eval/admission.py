@@ -195,10 +195,20 @@ def decide(
     bar = float(adm.k_sigma)
 
     if t <= bar:
-        return Decision(False,
-                        f"contribution not resolved: mean {mean:+.5f} "
-                        f"<= {bar:g}x se {se:.5f} (t={t:.2f})",
-                        tuple(deltas), mean, se, t)
+        # One branch, two different failures, and the ledger should not conflate
+        # them now that ``reason`` is persisted and read as analysis input. A
+        # batch with mean < 0 and a large |t| is not unresolved -- it is
+        # resolvably HARMFUL, measured precisely enough to be sure the book gets
+        # worse. Calling that "not resolved" reads as a measurement problem when
+        # it is a clean negative result, and the two say opposite things about
+        # how the generator is doing. The verdict is identical either way.
+        if mean < 0 and t < -bar:
+            why = (f"contribution is resolvably NEGATIVE: mean {mean:+.5f} "
+                   f"(t={t:.2f}, se {se:.5f}) -- the book gets worse with this batch")
+        else:
+            why = (f"contribution not resolved: mean {mean:+.5f} "
+                   f"<= {bar:g}x se {se:.5f} (t={t:.2f})")
+        return Decision(False, why, tuple(deltas), mean, se, t)
 
     capacity = adm.capacity
     if capacity and zoo_size >= capacity:
