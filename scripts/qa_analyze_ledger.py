@@ -239,11 +239,53 @@ def main() -> int:
             gap = (_dt.datetime.fromisoformat(ts[-1])
                    - _dt.datetime.fromisoformat(last_adm[-1])).total_seconds() / 60
             lines.append(f"- Since the last admission: **{gap:.0f} min** of evaluated batches")
+    if streak >= 8:
+        # WHY it is stuck decides the fix, and the two causes want opposite
+        # remedies. A batch fails `mean > k*se` either because the mean is
+        # negative -- it really does make the book worse, which is a generation
+        # problem no threshold change should paper over -- or because the mean
+        # is positive but small against its own spread, which is a PRECISION
+        # problem and is fixed by measuring better, not by generating better.
+        # Treating the second as the first wastes a restart, and the first as
+        # the second lowers the bar until junk gets in.
+        tail = []
+        for r in reversed(evals):
+            if r["admitted"]:
+                break
+            m, se = r.get("delta_mean"), r.get("delta_se")
+            if isinstance(m, (int, float)) and m == m:
+                tail.append((float(m), float(se) if isinstance(se, (int, float)) else float("nan")))
+        pos = [m for m, _ in tail if m > 0]
+        neg = [m for m, _ in tail if m <= 0]
+        lines += ["", f"Of the {len(tail)} measured batches in the streak: "
+                  f"**{len(pos)} had a POSITIVE mean contribution** (helped, but not "
+                  f"resolvably), {len(neg)} negative."]
+        if tail and len(pos) >= max(2, len(tail) // 2):
+            lines += ["",
+                      "**Diagnosis: precision, not generation.** Most rejected batches "
+                      "improved the book; they failed because the improvement was small "
+                      "against its own standard error. Fix by measuring better -- more "
+                      "`admission.test_seeds` shrinks `se` as 1/sqrt(n) -- rather than by "
+                      "lowering `k_sigma`, which admits the unresolved instead of "
+                      "resolving it."]
+        elif tail:
+            lines += ["",
+                      "**Diagnosis: generation.** The rejected batches genuinely make the "
+                      "book worse, so the bar is doing its job and no threshold change "
+                      "should be used to get past it. The lever is what gets proposed: "
+                      "hypothesis diversity, the mutation parent pool, or the research "
+                      "direction."]
     if streak >= 15:
         lines += ["", "**STALLED.** The recorded stall ran 33 consecutive rejections "
                   "on a bootstrap-luck ratchet. Under marginal-contribution admission "
-                  "the bar cannot ratchet, so a streak this long means the generator "
-                  "is genuinely not producing batches that improve the book."]
+                  "the bar cannot ratchet, so a streak this long is about the batches "
+                  "themselves -- read the diagnosis above before changing anything.",
+                  "",
+                  "Note that eviction cannot rescue this: `_prune` runs only on an "
+                  "ADMITTED batch, so during a streak it never fires. That is fine "
+                  "here -- harmful incumbents LOWER the baseline and make admission "
+                  "easier, so they are not what is blocking it -- but it does mean the "
+                  "repository cannot self-clean while stalled."]
     elif streak >= 8:
         lines += ["", "Watch this. Not yet a stall, but the generator has not "
                   "improved the book in a while."]
