@@ -138,6 +138,118 @@ def main() -> int:
                   "no `delta_mean`, so the learning question cannot be answered from it "
                   "-- only the admission rate below, which is not the same question."]
 
+    # --- is the REPOSITORY improving, not just the candidates? -------------
+    # delta_mean above asks whether each new batch is good. This asks whether
+    # the thing being built is getting better, which is not the same question:
+    # a stream of mildly-positive batches raises the book, and a stream of
+    # rejected ones leaves it exactly where it was. base_net_ir is the book
+    # WITHOUT the candidates -- the repository's own quality at that moment.
+    books = [(i, (r.get("metrics") or {}).get("base_net_ir"))
+             for i, r in enumerate(evals)]
+    books = [(i, float(v)) for i, v in books
+             if isinstance(v, (int, float)) and v == v]
+    if len(books) >= 4:
+        ys = [v for _, v in books]
+        h = len(ys) // 2
+        first_b, last_b = ys[0], ys[-1]
+        lines += [
+            "", "## Is the repository itself improving?", "",
+            "`base_net_ir` is the book built from the repository ALONE, so this "
+            "tracks the asset being accumulated rather than the quality of any "
+            "one proposal.",
+            "",
+            f"- First measured: **{first_b:+.4f}**   latest: **{last_b:+.4f}**   "
+            f"change **{last_b - first_b:+.4f}**",
+            f"- First half mean **{sum(ys[:h])/max(h,1):+.4f}**, "
+            f"second half **{sum(ys[h:])/max(len(ys)-h,1):+.4f}**",
+            f"- Range over the run: {min(ys):+.4f} .. {max(ys):+.4f}",
+        ]
+        if last_b > first_b:
+            lines.append("")
+            lines.append("The book is better than it started. Accumulation is working.")
+        elif abs(last_b - first_b) < 1e-9:
+            lines += ["", "**The book has not moved.** Either nothing has been "
+                      "admitted since the first measurement, or admissions are "
+                      "cancelling out."]
+        else:
+            lines += ["", "**The book is WORSE than it started.** Admitted batches "
+                      "are not accumulating into a better repository -- check "
+                      "whether bootstrap admissions (which are untested by design) "
+                      "are still sitting in it."]
+
+    # --- is eviction doing its job? ----------------------------------------
+    lines += ["", "## Is eviction removing bad factors?", ""]
+    if not evictions:
+        adm_batches = sum(1 for r in evals if r["admitted"])
+        lines += [
+            f"No eviction has fired yet. `_prune` runs only on an ADMITTED batch, "
+            f"and {adm_batches} have been admitted so far.",
+            "",
+            "If `evict_every` is 0 this is not a cadence matter -- eviction is off "
+            "entirely and the repository can only grow.",
+        ]
+    else:
+        total_out = sum(len(r.get("evicted_exprs") or []) for r in evictions)
+        lines += [f"{len(evictions)} eviction event(s), {total_out} factor(s) removed.", ""]
+        wrong = []
+        for n, r in enumerate(evictions, 1):
+            scores = r.get("eviction_scores") or {}
+            allc = r.get("repository_contributions") or {}
+            bar = r.get("eviction_bar")
+            vals = [v for v in scores.values() if isinstance(v, (int, float))]
+            lines.append(
+                f"**Event {n}** — rule `{r.get('eviction_rule', '?')}`, bar "
+                f"{bar}, removed {len(r.get('evicted_exprs') or [])}"
+                + (f", contributions {min(vals):+.5f} .. {max(vals):+.5f}" if vals else ""))
+            # The check that matters: everything removed should be BELOW the bar.
+            if isinstance(bar, (int, float)):
+                bad = [v for v in vals if v >= bar]
+                if bad:
+                    wrong.append((n, bad))
+            if allc:
+                neg = sum(1 for v in allc.values()
+                          if isinstance(v, (int, float)) and v < 0)
+                lines.append(
+                    f"    repository at that moment: {len(allc)} members, {neg} with "
+                    f"negative contribution, {neg - len(vals)} of those KEPT by the "
+                    f"min_size floor." if neg >= len(vals) else
+                    f"    repository at that moment: {len(allc)} members, {neg} negative.")
+        lines.append("")
+        if wrong:
+            lines.append(f"**Eviction removed {sum(len(b) for _, b in wrong)} factor(s) "
+                         f"at or ABOVE the bar** — it is not removing what it claims to.")
+        else:
+            lines.append("Every evicted factor scored below the bar: eviction is "
+                         "removing measured-harmful members, not arbitrary ones.")
+
+    # --- is the search stuck? ----------------------------------------------
+    streak, longest, cur = 0, 0, 0
+    for r in evals:
+        cur = 0 if r["admitted"] else cur + 1
+        longest = max(longest, cur)
+    streak = cur
+    lines += ["", "## Is the search stuck?", "",
+              f"- Current consecutive rejections: **{streak}**",
+              f"- Longest streak this run: **{longest}**"]
+    ts = [r.get("ts") for r in evals if r.get("ts")]
+    if ts:
+        import datetime as _dt
+        last_adm = [r.get("ts") for r in evals if r["admitted"] and r.get("ts")]
+        if last_adm:
+            gap = (_dt.datetime.fromisoformat(ts[-1])
+                   - _dt.datetime.fromisoformat(last_adm[-1])).total_seconds() / 60
+            lines.append(f"- Since the last admission: **{gap:.0f} min** of evaluated batches")
+    if streak >= 15:
+        lines += ["", "**STALLED.** The recorded stall ran 33 consecutive rejections "
+                  "on a bootstrap-luck ratchet. Under marginal-contribution admission "
+                  "the bar cannot ratchet, so a streak this long means the generator "
+                  "is genuinely not producing batches that improve the book."]
+    elif streak >= 8:
+        lines += ["", "Watch this. Not yet a stall, but the generator has not "
+                  "improved the book in a while."]
+    else:
+        lines += ["", "Not stuck."]
+
     # --- the admission rate: reported, but NOT the learning test ---
     half = max(len(evals) // 2, 1)
     rate = lambda chunk: 100.0 * sum(1 for r in chunk if r["admitted"]) / max(len(chunk), 1)

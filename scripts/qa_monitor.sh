@@ -37,6 +37,38 @@ while true; do
     sweep=$(tail -1 data/results/logs/compact_auto.log 2>/dev/null | cut -c1-70)
     [ -n "${sweep}" ] && echo "         last sweep: ${sweep}"
 
+    # Will we make it? The sweeper already stamps free space once per cycle, so
+    # the drain rate is measurable rather than guessed -- and it is the NET rate,
+    # after reclamation, which is the only one that predicts anything. Gross
+    # write rate is ~2.5x higher and projecting from it cries wolf.
+    PYTHONPATH=. python - <<'PY' 2>/dev/null
+import re, pathlib, datetime as dt
+p = pathlib.Path("data/results/logs/compact_auto.log")
+if not p.exists():
+    raise SystemExit
+pts = []
+for line in p.read_text(errors="ignore").splitlines():
+    m = re.match(r"\[([\d-]+ [\d:]+)\] free: (\d+)Gi", line.strip())
+    if m:
+        pts.append((dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M"), int(m.group(2))))
+if len(pts) < 2:
+    print(f"         drain: need 2 sweep cycles to project ({len(pts)} so far)")
+    raise SystemExit
+hours = (pts[-1][0] - pts[0][0]).total_seconds() / 3600.0
+drop = pts[0][1] - pts[-1][1]
+if hours <= 0:
+    raise SystemExit
+rate = drop / hours
+free = pts[-1][1]
+if rate <= 0:
+    print(f"         drain: {rate:+.1f} GB/h net over {hours:.1f}h -- not shrinking")
+else:
+    hrs = free / rate
+    flag = "   <-- TIGHT, prune" if hrs < 24 else ""
+    print(f"         drain: {rate:.1f} GB/h net over {hours:.1f}h "
+          f"-> {hrs:.0f}h of headroom at {free} GB{flag}")
+PY
+
     # --- the LLM, where a run dies quietly ------------------------------
     newest=$(ls -t data/results/logs/rerun_seed_*.log 2>/dev/null | head -1)
     if [ -n "${newest}" ]; then
@@ -79,14 +111,26 @@ for r in reversed(ev):
     run+=1
 print("         last 12: " + "".join("A" if r["admitted"] else "." for r in tail)
       + f"   {run} consecutive rejections" + ("   <-- STALLED" if run>=15 else ""))
-d=[r.get("delta_mean") for r in ev if isinstance(r.get("delta_mean"),(int,float))]
+# NaN is a float, so an isinstance check alone lets bootstrap batches -- which
+# record delta_mean = NaN by design -- through, and one of them turns the mean
+# and the max into nan. The v==v test is what actually excludes them.
+num=lambda k:[float(r[k]) for r in ev
+              if isinstance(r.get(k),(int,float)) and r[k]==r[k]]
+d=num("delta_mean")
 if len(d)>=6:
     h=len(d)//2
     print(f"         delta_mean: first half {st.mean(d[:h]):+.5f}  "
           f"second half {st.mean(d[h:]):+.5f}   <- the learning signal")
-t=[r.get("delta_t") for r in ev if isinstance(r.get("delta_t"),(int,float))]
+elif d:
+    print(f"         delta_mean: {len(d)} measured ({', '.join(f'{v:+.4f}' for v in d[-6:])})"
+          f"; need 6 for a trend")
+t=num("delta_t")
 if t:
     print(f"         t-stat: median {st.median(t):+.2f}, max {max(t):+.2f} (bar 1.0)")
+ev_rows=[r for r in rows if r.get("evicted_exprs")]
+n_out=sum(len(r.get("evicted_exprs") or []) for r in ev_rows)
+print(f"         eviction: {len(ev_rows)} event(s), {n_out} factor(s) removed"
+      + ("" if ev_rows else "  (fires on every 20th ADMITTED batch)"))
 PY
     else
         echo "SEARCH   no ledger yet"
@@ -102,7 +146,16 @@ PY
 import json, sys, hashlib, os
 from pathlib import Path
 d=json.load(open(sys.argv[1])); fs=d.get("factors",{})
-cache=Path(os.environ.get("FACTOR_CACHE_DIR","data/results/factor_cache"))
+# The cache is PER SEED (factor_cache_s42), so the plain default finds an empty
+# directory and reports "0 cached" for a run whose signals are all present --
+# a monitor that reports total data loss on a healthy run.
+_env=os.environ.get("FACTOR_CACHE_DIR")
+if _env:
+    cache=Path(_env)
+else:
+    _per=sorted(Path("data/results").glob("factor_cache_s*"),
+                key=lambda q:q.stat().st_mtime, reverse=True)
+    cache=_per[0] if _per else Path("data/results/factor_cache")
 cached=sum(1 for v in fs.values() if v.get("factor_expression")
            and (cache/f"{hashlib.md5(v['factor_expression'].encode()).hexdigest()}.pkl").exists())
 nocode=sum(1 for v in fs.values() if not v.get("factor_implementation_code"))
