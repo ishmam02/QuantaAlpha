@@ -76,6 +76,21 @@ class FactorLibraryManager:
         intended split -- the pool is what the search starts from, not what it
         is credited with.
 
+        Which is why seeds are written ``admitted: False``. They used to be
+        written ``True``, and that quietly broke the split the paragraph above
+        describes: ``_zoo.json`` is ``write_admitted_subset()``, which selects
+        on exactly this flag rather than on the ledger, so all 20 public
+        Alpha158 factors were exported as part of the mined repository and
+        every figure computed from that file credited the search with them.
+        The repository was never affected -- it comes from the ledger -- so the
+        two disagreed about what had been admitted, and the file that gets
+        backtested was the one that was wrong.
+
+        ``False`` rather than ``None`` because the verdict is not missing: a
+        seed has not passed E_Θ. If the search later proposes the same
+        expression and it earns admission, the normal update path sets the flag
+        and the factor is credited then, on its own contribution.
+
         Off unless ``QA_SEED_POOL=true``, and a failure to seed degrades to an
         empty library rather than taking the run down with it.
         """
@@ -104,7 +119,7 @@ class FactorLibraryManager:
                     "factor_formulation": expr, "cache_location": {},
                     "metadata": {"source": "alpha158_20_seed_pool",
                                  "round_number": -1, "evolution_phase": "seed"},
-                    "backtest_results": {}, "feedback": "", "admitted": True,
+                    "backtest_results": {}, "feedback": "", "admitted": False,
                 }
             base["metadata"]["total_factors"] = len(base["factors"])
             base["metadata"]["seeded_from"] = "alpha158_20"

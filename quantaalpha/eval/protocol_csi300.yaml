@@ -270,9 +270,22 @@ admission:
   capacity: null
 
   # Re-scoring every incumbent against the current repository costs one
-  # evaluation each, so it is off for a 150-factor run. evict_below is the bar
-  # when it is on: a member must be actively unhelpful, not merely unproven.
-  evict_every: 0
+  # evaluation each. That is the reason this was off, and the reason it is now
+  # on at a cadence rather than every round: a factor that was additive at
+  # |zoo| = 12 can be redundant at 150, and NOTHING in its own stored metrics
+  # changes to say so. Without this the repository can only grow, so "the
+  # library improves with evolution" was not a property the run had.
+  #
+  # The cadence counts ADMITTED batches (_prune is called only on admission),
+  # and one fire costs 1 + |zoo| evaluations. At ~3 factors/batch, 150 factors
+  # is ~50 admitted batches, so evict_every: 20 fires twice -- at |zoo| ~= 60
+  # and ~= 120 -- for 61 + 121 = ~182 evaluations over the whole run. Every
+  # round instead would cost ~3,800, which is the run again.
+  evict_every: 20
+  # A member must be actively unhelpful, not merely unproven. Admission needs a
+  # resolvably POSITIVE contribution (t > k_sigma); eviction needs a NEGATIVE
+  # one. The gap between the two bars is what stops a factor oscillating in and
+  # out on measurement noise, and it is why a merely-redundant factor (0) stays.
   evict_below: 0.0
 
   # Legacy percentile eviction, still live: _prune runs on every admission and
