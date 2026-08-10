@@ -417,8 +417,9 @@ class Admission:
     # Combiner seeds used to measure the delta. delta_net_ir flipped 3 of 4
     # verdicts across seeds as a point estimate, which is why it needs a spread
     # rather than a single number. Fewer than two seeds leaves the standard
-    # error undefined and the test cannot pass.
-    test_seeds: tuple[int, ...] = (42, 1, 7)
+    # error undefined and the test cannot pass. Five seeds cut delta_mean se
+    # ~29% versus three at ~1.7x the marginal-decision cost (seconds).
+    test_seeds: tuple[int, ...] = (42, 1, 7, 13, 29)
 
     # Repository capacity. Once full, admission becomes replacement: a
     # candidate enters only by displacing the incumbent it beats, so the

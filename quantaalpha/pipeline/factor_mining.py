@@ -151,6 +151,19 @@ def _run_evolution_task(
     round_idx = task["round_idx"]
     parent_trajectories = task.get("parent_trajectories", [])
 
+    # Per-round deterministic LLM seed: base (CHAT_SEED env, immutable) + round
+    # index. Round 0 reproduces the old fixed-seed protocol exactly; later
+    # rounds draw from a different but reproducible seed. At CHAT_TEMPERATURE=0
+    # this is inert (the provider is deterministic regardless of seed); it only
+    # contributes diversity once the user opts in by raising the temperature,
+    # and then both arms stay reproducible because the seed is a function of the
+    # round, not of wall-clock randomness.
+    try:
+        _chat_seed_base = int(os.environ.get("CHAT_SEED", "42"))
+        LLM_SETTINGS.chat_seed = _chat_seed_base + int(round_idx)
+    except (TypeError, ValueError):
+        pass
+
     # Resolve direction by phase
     if phase == RoundPhase.ORIGINAL:
         direction = directions[direction_id] if direction_id < len(directions) else None

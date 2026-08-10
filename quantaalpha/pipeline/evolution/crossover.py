@@ -329,11 +329,12 @@ Please propose your fusion hypothesis based on the above crossover guidance.
         crossover_n: int = 3,
         prefer_diverse: bool = True,
         selection_strategy: str = "best",
-        top_percent_threshold: float = 0.3
+        top_percent_threshold: float = 0.3,
+        fitness_of: dict[str, float] | None = None,
     ) -> list[list[StrategyTrajectory]]:
         """
         Select parent groups for crossover.
-        
+
         Args:
             candidates: All available trajectories
             crossover_size: Number of parents per group
@@ -346,30 +347,44 @@ Please propose your fusion hypothesis based on the above crossover guidance.
                 - "weighted_inverse": Inverse performance-weighted (lower = higher weight)
                 - "top_percent_plus_random": Top N% guaranteed + random from rest
             top_percent_threshold: Threshold for top_percent_plus_random strategy (default 0.3)
-            
+            fitness_of: Optional {trajectory_id: shrunk fitness} map. When given,
+                parents are ranked/sampled on the shrunk marginal-contribution
+                estimate instead of the single-seed point estimate
+                ``get_primary_metric()``, so crossover selection stops chasing
+                combiner-seed noise. Falls back to the point estimate for any
+                id not present.
+
         Returns:
             List of parent groups
         """
         import itertools
         import random
-        
+
+        def _fit(t: StrategyTrajectory) -> float:
+            if fitness_of and t.trajectory_id in fitness_of:
+                v = fitness_of[t.trajectory_id]
+            else:
+                v = t.get_primary_metric()
+            return 0.0 if v is None else float(v)
+
         if len(candidates) < crossover_size:
             return []
-        
+
         # Pre-select candidates based on strategy
         selected_candidates = self._select_candidates_by_strategy(
-            candidates, 
-            selection_strategy, 
+            candidates,
+            selection_strategy,
             top_percent_threshold,
-            crossover_n * crossover_size  # Need enough for all groups
+            crossover_n * crossover_size,  # Need enough for all groups
+            score=_fit,
         )
-        
+
         # Generate all possible combinations from selected candidates
         all_combos = list(itertools.combinations(selected_candidates, crossover_size))
-        
+
         if not all_combos:
             return []
-        
+
         if prefer_diverse:
             # Score combinations by diversity
             scored = []
@@ -377,14 +392,14 @@ Please propose your fusion hypothesis based on the above crossover guidance.
                 # Higher score for different directions and phases
                 directions = len(set(t.direction_id for t in combo))
                 phases = len(set(t.phase for t in combo))
-                # Also consider performance
-                avg_metric = sum(t.get_primary_metric() or 0 for t in combo) / len(combo)
+                # Also consider performance (shrunk estimate when available)
+                avg_metric = sum(_fit(t) for t in combo) / len(combo)
                 score = directions * 2 + phases + avg_metric
                 scored.append((list(combo), score))
-            
+
             # Sort by score descending
             scored.sort(key=lambda x: x[1], reverse=True)
-            
+
             # Select top combinations
             selected = [combo for combo, _ in scored[:crossover_n]]
         else:
@@ -399,48 +414,57 @@ Please propose your fusion hypothesis based on the above crossover guidance.
         candidates: list[StrategyTrajectory],
         strategy: str,
         top_percent_threshold: float,
-        num_needed: int
+        num_needed: int,
+        score=None,
     ) -> list[StrategyTrajectory]:
         """
         Pre-select candidates based on selection strategy.
-        
+
         Args:
             candidates: All available trajectories
             strategy: Selection strategy
             top_percent_threshold: Threshold for top_percent_plus_random
             num_needed: Minimum number of candidates needed
-            
+            score: Callable t -> float ranking parents. Defaults to the
+                single-seed point estimate ``get_primary_metric``; the
+                controller passes the shrunk marginal-contribution estimate.
+
         Returns:
             List of selected candidates
         """
         import random
-        
+
+        if score is None:
+            def score(t):
+                v = t.get_primary_metric()
+                return 0.0 if v is None else float(v)
+
         if len(candidates) <= num_needed:
             return candidates
-        
-        # Sort by primary metric (descending)
+
+        # Sort by fitness (descending) -- shrunk estimate when provided
         sorted_candidates = sorted(
-            candidates, 
-            key=lambda t: t.get_primary_metric() or 0, 
+            candidates,
+            key=score,
             reverse=True
         )
-        
+
         if strategy == "best":
             # Return top performers
             return sorted_candidates[:num_needed]
-        
+
         elif strategy == "random":
             # Random selection
             return random.sample(candidates, min(num_needed, len(candidates)))
-        
+
         elif strategy == "weighted":
             # Performance-weighted sampling (higher performance = higher weight)
-            return self._weighted_sample(sorted_candidates, num_needed, inverse=False)
-        
+            return self._weighted_sample(sorted_candidates, num_needed, inverse=False, score=score)
+
         elif strategy == "weighted_inverse":
             # Inverse performance-weighted sampling (lower performance = higher weight)
             # Ref: EvoControl _weighted_select_labels strategy
-            return self._weighted_sample(sorted_candidates, num_needed, inverse=True)
+            return self._weighted_sample(sorted_candidates, num_needed, inverse=True, score=score)
         
         elif strategy == "top_percent_plus_random":
             # Top N% guaranteed + random from rest
@@ -467,26 +491,34 @@ Please propose your fusion hypothesis based on the above crossover guidance.
         self,
         sorted_candidates: list[StrategyTrajectory],
         num_needed: int,
-        inverse: bool = False
+        inverse: bool = False,
+        score=None,
     ) -> list[StrategyTrajectory]:
         """
         Weighted sampling based on performance.
-        
+
         Args:
             sorted_candidates: Candidates sorted by performance (descending)
             num_needed: Number to select
             inverse: If True, lower performance = higher weight (encourages exploration)
-            
+            score: Callable t -> float. Defaults to the point estimate; the
+                shrunk marginal-contribution estimate is passed through.
+
         Returns:
             List of selected candidates
         """
         import random
-        
+
+        if score is None:
+            def score(t):
+                v = t.get_primary_metric()
+                return 0.0 if v is None else float(v)
+
         if len(sorted_candidates) <= num_needed:
             return sorted_candidates
-        
+
         # Calculate weights
-        metrics = [t.get_primary_metric() or 0 for t in sorted_candidates]
+        metrics = [score(t) for t in sorted_candidates]
         
         # Normalize metrics to [0, 1] range
         min_m = min(metrics) if metrics else 0

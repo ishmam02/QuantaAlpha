@@ -861,7 +861,11 @@ class APIBackend:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=self.chat_stream,
-                seed=self.chat_seed,
+                # Read live from LLM_SETTINGS rather than the value cached at
+                # client init: factor_mining._run_evolution_task sets a
+                # per-round deterministic seed (base + round_idx), and a
+                # singleton client would otherwise keep serving the round-0 seed.
+                seed=LLM_SETTINGS.chat_seed,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
             )

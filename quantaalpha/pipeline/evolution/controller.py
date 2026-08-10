@@ -10,7 +10,9 @@ The controller orchestrates the evolutionary process:
 
 from __future__ import annotations
 
+import math
 import os
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -602,42 +604,148 @@ class EvolutionController:
             self._crossover_idx = 0
             return
         
+        # Rank crossover parents by the shrunk marginal-contribution estimate
+        # rather than the single-seed point estimate, so crossover pairing
+        # matches the mutation-parent ranking and both track the seed-averaged
+        # truth instead of a noise-dominated point estimate.
         self._crossover_groups = self.crossover_op.select_crossover_pairs(
             candidates=candidates,
             crossover_size=self.config.crossover_size,
             crossover_n=self.config.crossover_n,
             prefer_diverse=self.config.prefer_diverse_crossover,
             selection_strategy=self.config.parent_selection_strategy,
-            top_percent_threshold=self.config.top_percent_threshold
+            top_percent_threshold=self.config.top_percent_threshold,
+            fitness_of=self._shrunk_fitness(candidates),
         )
         self._crossover_idx = 0
         logger.info(f"Prepared {len(self._crossover_groups)} crossover groups from {len(candidates)} candidates")
     
+    def _shrunk_fitness(
+        self, trajectories: list[StrategyTrajectory]
+    ) -> dict[str, float]:
+        """Empirical-Bayes shrinkage of each parent's seed-averaged marginal
+        contribution toward the group mean, weighted by its own standard error.
+
+        Selection used to rank on ``m_delta_net_ir`` -- a single-seed point
+        estimate that flipped 3 of 4 verdicts across combiner seeds. With
+        ``delta_mean`` (averaged over ``test_seeds``) and ``delta_se`` now on
+        the trajectory, this shrinks each parent's estimate:
+
+            shrunk_i = mu + (tau^2 / (tau^2 + se_i^2)) * (delta_mean_i - mu)
+
+        where ``mu`` is the group mean and ``tau^2`` is the between-parent
+        signal variance, estimated as ``Var(delta_mean) - mean(se^2)`` (the
+        within-batch noise removed from the observed spread). When measurement
+        noise dominates (``se^2`` >> ``tau^2``) the shrinkage factor -> 0 and
+        parents pull to ``mu`` -- selection honestly admits it cannot tell them
+        apart, instead of breeding from the noise winner. When a parent is
+        well-measured and parents genuinely differ, the factor -> 1 and the raw
+        ``delta_mean`` stands.
+
+        Falls back to ``get_primary_metric()`` (the point estimate, e.g. U for
+        the control arm) for any trajectory without ``delta_mean``, so arms that
+        do not run marginal_contribution mode are untouched.
+        """
+        picks = []
+        for t in trajectories:
+            m = (t.backtest_metrics or {}).get("delta_mean")
+            s = (t.backtest_metrics or {}).get("delta_se")
+            picks.append((t, m, s))
+
+        have = [(t, float(m), s) for t, m, s in picks
+                if m is not None and m == m]
+        scores: dict[str, float] = {}
+
+        if len(have) >= 2:
+            means = [m for _, m, _ in have]
+            mu = statistics.fmean(means)
+            between = statistics.pvariance(means)
+            # A missing/non-finite se means we have no spread info for that
+            # parent. Exclude it from the within-batch variance (so it does not
+            # leak inf into `within`), and at the shrink step trust its
+            # seed-averaged delta_mean rather than pretend to shrink -- the
+            # average is already the improvement over the single-seed point.
+            def _se2(s):
+                if s is None or s != s:
+                    return None
+                try:
+                    sf = float(s)
+                except (TypeError, ValueError):
+                    return None
+                if math.isinf(sf):
+                    return None
+                return sf * sf
+            se2s = [_se2(s) for _, _, s in have]
+            known = [v for v in se2s if v is not None]
+            within = statistics.fmean(known) if known else 0.0
+            tau2 = max(0.0, between - within)
+            for (t, m, _), se2 in zip(have, se2s):
+                # No usable spread info (missing / inf se): trust the
+                # seed-averaged delta_mean rather than pretend to shrink.
+                if se2 is None or (tau2 + se2) <= 0.0:
+                    shrink = 1.0
+                else:
+                    shrink = tau2 / (tau2 + se2)
+                scores[t.trajectory_id] = mu + shrink * (m - mu)
+
+        # Anything without a delta_mean ranks on its primary metric (point
+        # estimate) so the population is not silently shrunk for a reason
+        # unrelated to quality.
+        for t, m, _ in picks:
+            scores.setdefault(t.trajectory_id, t.get_primary_metric() or 0.0)
+        return scores
+
     def _rank_by_fitness(
         self, trajectories: list[StrategyTrajectory]
     ) -> list[StrategyTrajectory]:
-        """Best first, on ``_PRIMARY_METRIC``, ties and misses last.
+        """Best first, on a shrunk estimate of marginal contribution, ties and
+        misses last.
 
-        Trajectories whose fitness is missing sort to the back rather than
-        being dropped: a metric that failed to extract is not evidence that the
-        trajectory was bad, and discarding it silently would shrink the
-        population for a reason unrelated to quality.
+        See ``_shrunk_fitness``. Trajectories whose fitness is missing sort to
+        the back rather than being dropped: a metric that failed to extract is
+        not evidence that the trajectory was bad, and discarding it silently
+        would shrink the population for a reason unrelated to quality.
         """
+        scores = self._shrunk_fitness(trajectories)
+
         def key(t):
-            v = t.get_primary_metric()
+            v = scores.get(t.trajectory_id)
+            if v is None:
+                v = t.get_primary_metric()
             return (v is not None, v if v is not None else 0.0)
 
         ranked = sorted(trajectories, key=key, reverse=True)
-        scored = [t for t in ranked if t.get_primary_metric() is not None]
-        if scored:
+
+        raw_means = [float(t.backtest_metrics["delta_mean"])
+                     for t in trajectories
+                     if (t.backtest_metrics or {}).get("delta_mean") is not None
+                     and t.backtest_metrics["delta_mean"]
+                     == t.backtest_metrics["delta_mean"]]
+        if raw_means:
+            shrunk_vals = [scores[t.trajectory_id] for t in trajectories
+                           if t.trajectory_id in scores
+                           and (t.backtest_metrics or {}).get("delta_mean") is not None]
+            shrunk_vals = [v for v in shrunk_vals if v is not None]
+            mu = statistics.fmean(raw_means)
+            best = max(shrunk_vals) if shrunk_vals else float("nan")
+            worst = min(shrunk_vals) if shrunk_vals else float("nan")
             logger.info(
-                f"parents ranked on {_PRIMARY_METRIC}: best "
-                f"{scored[0].get_primary_metric():.5f} worst "
-                f"{scored[-1].get_primary_metric():.5f} ({len(scored)}/{len(ranked)} scored)")
+                f"parents ranked on shrunk delta_mean: best {best:.5f} "
+                f"worst {worst:.5f} (group mean {mu:.5f}, "
+                f"{len(raw_means)}/{len(ranked)} seed-averaged)")
         else:
-            logger.warning(
-                f"no trajectory carries {_PRIMARY_METRIC} -- mutation parents fall back "
-                "to arrival order, which is not selection. Check the runner emits it.")
+            scored = [t for t in ranked if t.get_primary_metric() is not None]
+            if scored:
+                logger.info(
+                    f"parents ranked on {_PRIMARY_METRIC}: best "
+                    f"{scored[0].get_primary_metric():.5f} worst "
+                    f"{scored[-1].get_primary_metric():.5f} "
+                    f"({len(scored)}/{len(ranked)} scored)")
+            else:
+                logger.warning(
+                    f"no trajectory carries {_PRIMARY_METRIC} or delta_mean -- "
+                    "mutation parents fall back to arrival order, which is not "
+                    "selection. Check the runner emits it.")
         return ranked
 
     def _admissible_parents(
@@ -1010,8 +1118,11 @@ class EvolutionController:
     _NET_COST_FLOAT_KEYS = (
         "U", "rho_max", "turnover_book", "turnover_solo", "cx", "cost_bps", "zoo_size",
         # Marginal contribution -- the fitness that anchors selection to the
-        # book rather than to a percentile of a winners-only sample.
+        # book rather than to a percentile of a winners-only sample. delta_mean
+        # / delta_se are the seed-averaged estimate and its standard error that
+        # _rank_by_fitness shrinks; absent outside marginal_contribution mode.
         "delta_net_ir", "delta_net_arr", "base_net_ir",
+        "delta_mean", "delta_se",
         "e_effectiveness", "e_arr", "e_stability", "e_turnover", "e_diversity",
         "e_overfit", "e_decay",
     )

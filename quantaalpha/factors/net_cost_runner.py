@@ -658,6 +658,14 @@ class NetCostFactorRunner(QlibFactorRunner):
             "delta_net_ir": res.get("m_delta_net_ir"),
             "delta_net_arr": res.get("m_delta_net_arr"),
             "base_net_ir": res.get("m_base_net_ir"),
+            # Seed-averaged marginal contribution and its standard error, from
+            # decide() over admission.test_seeds (merged into res by
+            # decision.as_record()). Selection ranks on the shrunk form of
+            # delta_mean rather than the single-seed m_delta_net_ir point
+            # estimate, which flipped 3 of 4 verdicts and made ranking chase
+            # noise. Absent outside marginal_contribution mode -> None.
+            "delta_mean": res.get("delta_mean"),
+            "delta_se": res.get("delta_se"),
         }
         payload.update({k: v for k, v in res.items() if k.startswith("e_")})
         return pd.Series(payload)

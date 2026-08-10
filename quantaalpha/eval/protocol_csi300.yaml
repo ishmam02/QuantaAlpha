@@ -254,9 +254,10 @@ admission:
   # combiner seeds, which is a fact about the estimate rather than the quantity
   # -- so it is tested rather than thresholded. This makes the requirement
   # genuinely dynamic without anyone choosing a percentile, and it is the
-  # multiplier on in-loop cost: three seeds means three evaluations per batch.
+  # multiplier on in-loop cost: five seeds means five evaluations per batch
+  # (cuts delta_mean se ~29% vs three; the marginal-decision cost is seconds).
   k_sigma: 1.0
-  test_seeds: [42, 1, 7]
+  test_seeds: [42, 1, 7, 13, 29]
 
   # Pathology floor only -- too sparse to price, constant, or a near-duplicate.
   # Never weakness: an absolute quality floor is what starved the repository
