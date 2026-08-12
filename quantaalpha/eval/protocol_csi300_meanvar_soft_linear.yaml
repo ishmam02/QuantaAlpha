@@ -1,0 +1,383 @@
+# =====================================================================
+# SOFT-PENALTY MEAN-VARIANCE + ICIR (IC/σ_IC) LINEAR COMBINER VARIANT.
+#
+# Derived from protocol_csi300_meanvar_soft.yaml by switching the combiner
+# from LightGBM (procedure A / Eq. 2) to an ICIR-weighted LINEAR combiner --
+# the Ding-Martin (2017) Redux fix for a small factor zoo. Each factor is
+# weighted by its information ratio w_i = mean(IC_i)/std(IC_i) (not the mean
+# IC alone), so σ_IC -- the non-diversifiable "strategy risk" that bounds IR
+# -- enters the weights and volatile factors are suppressed at the source.
+# The weights are shrunk toward 1/N by a Ledoit-Wolf intensity (the
+# high-σ_IC limit / James-Stein null), and the composite is mapped to
+# expected-return units by Grinold α = IC_c·σ_i·s_i (operator._book) rather
+# than the empirical prediction_scale β. See combiner.py `_fit_predict_icir`
+# for the bootstrap-over-dates that gives the five test_seeds honest
+# finite-sample variance on the ICIR weights.
+#
+# This is NOT the frozen topk protocol (hash f4f03cd5e5013329), NOT the
+# hard-cap meanvar (a985ac912cbca561), and NOT the soft LightGBM meanvar
+# (0919959dbe69945b); it carries its own hash. Used only by the linear-
+# combiner replay to answer "how many of the 122 produced factors would have
+# been admitted under soft-penalty construction + an ICIR linear combiner".
+# No edit to portfolio.py -- the costed path (mv_weights_costed) already
+# exists and skips the cap clamp (portfolio.py:492).
+# =====================================================================
+# Θ — the frozen evaluation protocol (problem_formulation.tex, Eq. 13)
+#
+# Every value here was read off the existing configs so that E_Θ *nests*
+# the published baseline:
+#   - splits          <- factor_template/conf_combined_factors.yaml:107-109
+#   - final_test      <- configs/backtest.yaml:85
+#   - combiner params <- conf_combined_factors.yaml:86-96 (post Task 1)
+#   - topk / n_drop   <- conf_combined_factors.yaml:66-67, backtest.yaml:120-121
+#   - kappa0          <- open_cost 0.0005 + close_cost 0.0015
+#
+# Property 1 (Immutability): this file is loaded ONCE per run and hashed.
+# Editing it mid-run has no effect on a resumed session (LoopBase.run pickles
+# the whole loop). The logged theta_hash is what makes that visible.
+# =====================================================================
+
+protocol_id: csi300_v1_meanvar_soft_linear
+market: csi300
+benchmark: SH000300 # conf_combined_factors.yaml:14, backtest.yaml:127
+periods_per_year: 252
+
+splits:
+  # ALIGNED WITH configs/backtest.yaml:82-85 -- the backtest v2 run is the
+  # primary point of comparison between arms, so E_Theta's combiner must train
+  # on the same data its model does. Previously these mirrored the in-loop qlib
+  # template (2016-2019 / 2020 / 2021), which meant Arm B was fitted on a
+  # different window than the backtest that judges both arms.
+  train: ["2016-01-01", "2020-12-31"]
+  valid: ["2021-01-01", "2021-12-31"]
+  final_test: ["2022-01-01", "2025-12-26"]
+  search_is: train # IS during search
+  search_oos: valid # 2021; final_test is reached only via the explicit report mode
+
+execution: # Eq. 4-5
+  delta: 1
+  fill_rule: open_next # Φ = open(t+1); matches deal_price:open everywhere
+  # OPEN-to-open, matching the fill rule. It was close-to-close while the book
+  # fills open[t+1] -> open[t+2], so the model was trained to predict a return
+  # the book never earns -- the same day, measured between different endpoints.
+  #
+  # That mismatch is also why the benchmark-alignment fix could only reach
+  # corr(book, bench) = 0.689 rather than ~0.9: an open-to-open book cannot
+  # track a close-to-close index any better than the overnight/intraday
+  # decomposition allows.
+  #
+  # COST OF THIS CHANGE: IC now measures open-to-open predictability. That is
+  # the quantity the book actually trades, but it is NOT comparable to the
+  # paper's +0.0459 or to any other close-to-close IC. Quote it as such.
+  label_expr: "Ref($open, -2) / Ref($open, -1) - 1"
+
+combiner: # procedure A — Eq. 2; FROZEN, seed included
+  # ICIR LINEAR COMBINER (Ding-Martin Redux). mu = sum_i w_i * x_i with
+  # w_i = mean(IC_i)/std(IC_i) -- the factor information ratio, not the mean
+  # IC -- so σ_IC enters the weights and volatile factors are suppressed.
+  # The weights shrink toward 1/N by a Ledoit-Wolf intensity (params.shrinkage
+  # below; "auto" = data-adaptive). `seeds` here drive a BOOTSTRAP over train
+  # dates (see combiner.py `_fit_predict_icir`): each seed resamples the train
+  # dates with replacement before computing that sample's ICIR, so the five
+  # test_seeds give five slightly different weight vectors -- the honest
+  # finite-sample σ_IC the admission gate's t-test measures. In the replay
+  # the per-seed operator overrides `seeds` to a single test seed, so this
+  # list is only the throwaway panel-build default.
+  model: icir
+  seeds: [42]
+  params:
+    # Ledoit-Wolf shrinkage of the ICIR weights toward 1/N. "auto" = the
+    # data-adaptive intensity delta = clip(Σσ_IC²/Σ(w-w̄)², 0, 1) per bootstrap
+    # sample; a float fixes it (0 = raw ICIR, 1 = equal weight). The LightGBM
+    # keys below are INERT under model:icir (the icir path reads only this one)
+    # and are kept so the file can be flipped back to the boosted path.
+    shrinkage: auto
+    loss: mse
+    learning_rate: 0.05 # ← unified in Task 1
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 20
+    early_stopping_round: 50
+    num_boost_round: 500
+  # Preprocessing pipeline. "backtest_v2" ports the published path exactly
+  # (backtest/runner.py::_create_dataset_with_computed_factors) rather than
+  # approximating it. Measured against the native path on the 153-factor Arm B
+  # library: the IS->OOS RankIC gap falls from +0.2826 to +0.0770 -- a 3.7x
+  # reduction in over-fitting -- and net ARR rises from +1.55% to +2.19%.
+  #
+  # The IC combiner reads its IC off these SAME rank-normalised features, so
+  # Pearson correlation per date IS the Spearman rank IC. Three things differ
+  # and all three matter in that direction: ProcessInf is applied (infinities
+  # are real here -- the Alpha158(20) seed SHADOW_RATIO has sd 1.8e11),
+  # features are rank-normalised BEFORE label-NaN rows are dropped rather than
+  # after, and the 3.46 unit-variance scaling is omitted.
+  engine: backtest_v2
+  base_features: # conf_combined_factors.yaml:28-29
+    - "($close-$open)/$open"
+    - "$volume/Mean($volume, 20)"
+    - "($high-$low)/Ref($close, 1)"
+    - "$close/Ref($close, 1)-1"
+  fit_split: train
+
+portfolio:
+  # Turnover must be a decision, not a constant. With this off the book always
+  # swaps n_drop names, so turnover is pinned at n_drop/topk (measured 0.105
+  # across every configuration) and the cost model cannot influence what is
+  # traded -- a capacity-aware objective then has nothing to express itself
+  # through. See eval/portfolio.py and execution.prediction_scale.
+  cost_aware_dropout: true
+  swap_hurdle: 1.0 # g — Eq. 6; the baseline's construction
+  # DERIVED from protocol_csi300.yaml: the only difference is this field. The
+  # frozen topk_dropout protocol (hash 92abe9959bdd728d) is the comparability
+  # baseline and is left byte-identical; this file selects the mean_variance
+  # member of the admissible family (turnover_cap/risk_aversion/max_weight/
+  # covariance below) for the "arm b mean" run. Selected via QA_PROTOCOL.
+  construction: mean_variance
+  # Which split the composite→return scaling is fit on. Under model:icir the
+  # operator builds Grinold α = IC_c·σ_i·s_i with IC_c = mean per-date corr on
+  # this window, so it MUST be the valid split -- fitting it on train (the
+  # combiner's own fit_split) would scale the signal on the same data that
+  # produced it, the in-sample inflation the empirical β suffered.
+  scale_split: valid
+  topk: 50 # conf_combined_factors.yaml:66, backtest.yaml:120
+  n_drop: 5 # :67, :121
+  signed: false # long-only + benchmark excess (baseline-comparable)
+  gross_leverage: 1.0 # Σ|w| ≤ 1
+
+  # --- mean_variance member of the admissible family ---
+  # Explicit rather than left to the dataclass defaults: turnover_cap defaulted
+  # to 0.10, exactly equal to n_drop/topk, so the mean-variance budget bound at
+  # the same level the top-k construction is structurally capped at. Both arms
+  # then traded the same amount (measured 0.0989 vs 0.1063) and the construction
+  # comparison tested nothing.
+  #
+  # 0.02 is 5x tighter than top-k can go, which is the point: it is the only
+  # setting under which "turnover is a budget" differs from "turnover is a
+  # by-product". Measured on a real library: cap 0.02 gave net IR -0.0354 at
+  # 0.66 bps/day, against -0.2738 at 4.31 bps/day for top-k dropout.
+  # Chosen by sweeping 54 configurations on the 2021 VALIDIDATION split and
+  # priced on final_test exactly once afterwards -- selecting a construction by
+  # its performance on the window it is then reported on consumes the split the
+  # design exists to protect. risk_aversion 10 -> 25 and max_weight 0.05 -> 0.03
+  # came out of that sweep; the tighter position cap also cut combiner-seed
+  # dispersion from 0.45pp to 0.16pp, which is what made the Arm A/Arm B gap
+  # resolvable at all. Both winners sat on the edge of the grid, so the optimum
+  # is not yet bracketed -- widen it before treating these as settled.
+  turnover_cap: 0.02      # VESTIGIAL under cost_in_objective: the cap clamp
+                          # (portfolio.py:493-494) is skipped on the costed path
+                          # (portfolio.py:492, w_new = w_full). Kept only so the
+                          # hash diff vs the hard-cap meanvar is exactly the soft
+                          # fields below, nothing else.
+  risk_aversion: 25.0
+  max_weight: 0.03
+  # "factor" fits a k-factor statistical risk model; it LOST to diagonal in 28
+  # of 36 matched pairs on validation, plausibly because a long-only book capped
+  # at 3% per name is already forced to diversify. Available, not default.
+  covariance: diagonal
+
+  # --- SOFT-PENALTY KNOBS (the only structural change vs the hard-cap meanvar) ---
+  # Turnover priced in the objective, not clamped. cost_in_objective routes to
+  # mv_weights_costed (riskmodel.py:172), which charges each name its own
+  # gamma_i = kappa0 + kappa1*sigma_i to move AND a kappa-inertia
+  # (kappa/2)*lambda*dw'Sigma*dw, then portfolio.py:492 takes w_new = w_full
+  # (no cap clamp). The optimizer CHOOSES turnover as an outcome of whether
+  # trading pays -- the regime in which a net-of-cost objective can express an
+  # advantage over a gross one, and the fix for the cornering that froze the
+  # hard-cap run at 23/150.
+  cost_in_objective: true
+  cost_hurdle: 1.0        # margin of safety on the modelled cost (default 1.0)
+  # kappa -- dimensionless inertia. w = 1/(1+kappa)*w_markowitz + kappa/(1+kappa)
+  # *w_prev, so kappa sets the FRACTION of the way the book moves toward target,
+  # free of the scale of mu and Sigma (Garleanu-Pedersen). The soft LightGBM
+  # YAML's docstring claims kappa=5 calibrates turnover to ~0.02; the
+  # riskmodel.py:245-248 table has no kappa=5 column and the measured turnover
+  # is ~0.05-0.06 (~2-3x the hard cap's 0.0198), NOT ~0.02. Kept at 5.0 here for
+  # parity with the soft LightGBM variant so the ONLY diff is the combiner.
+  trade_penalty: 5.0
+
+costs: # Eq. 7
+  kappa0: 0.0020 # = open_cost 0.0005 + close_cost 0.0015 → nests Qlib's flat fee
+  # Slippage as a fraction of daily volatility per unit traded weight.
+  # 0.10 implied 19.7bps one-way (kappa1 * median sigma 1.97%/day), ~3-5x too
+  # high for CSI 300 large caps at this book's 0.167% participation of ADV,
+  # where cost is spread-dominated. 0.03 implies ~5.9bps, in the credible range.
+  # Cuts modelled cost 18.0%/yr -> ~10.6%/yr. Ranking is barely affected: under
+  # top-k dropout turnover is structurally pinned, so cost_bps spans only
+  # 0.45bps across factors while net_arr spans ~9pp.
+  kappa1: 0.03
+  kappa2: 0.01 # calibrated: 1% of ADV ⇒ 10 bps of traded notional (see costs.py)
+  impact_exponent: 1.5 # φ ∝ |Δw|^{3/2}/√ADV
+  beta_per_day: 0.0004 # ≈10%/yr borrow; inert while signed:false
+  beta_offlist: .inf # unshortable names
+  vol_window: 20
+  adv_window: 20
+  nav: 100000000.0 # `account:` in all three Qlib configs; normalizes ADV → adv_w
+  adv_scale: 1000.0 # Qlib cn_data `$amount` → CNY: true_CNY = $amount*1000/$factor
+
+
+gates: # F_Theta -- DISABLED
+  # Hard admissibility gates are removed. Two measured reasons:
+  #  1. Stand-alone IC was anti-correlated with marginal contribution (the best
+  #     contributor had rank_ic +0.0004; the best-IC factor was the worst).
+  #  2. The replacement, delta_net_ir >= 0, was not reproducible: 3 of 4 sampled
+  #     factors flipped their verdict across combiner seeds, because subtracting
+  #     two independently-noisy books compounds variance rather than cancelling
+  #     it (level sd 0.026-0.060 -> delta sd 0.038-0.071).
+  # A gate that returns a different answer for the same factor on the same data
+  # is sampling a decision, not computing one. Both arms now accumulate every
+  # mined factor, exactly as the published baseline does, and the objective U
+  # differentiates them by SCORE rather than by admission.
+  # Set any threshold to a float to re-enable that gate.
+  gamma_delta: null
+  gamma_ic: null
+  gamma_ir: null
+  tau_max: null
+  # rho_bar is BACK, alone among the six. The two gates that were measured to
+  # fail were gamma_ic (stand-alone IC anti-correlated with contribution) and
+  # gamma_delta (not reproducible across combiner seeds). rho_bar was never
+  # shown to fail; it was removed as collateral when they were.
+  #
+  # It is also the one gate whose job is catching a pathology rather than
+  # ranking quality. A candidate correlated 0.95+ with something already in the
+  # repository is a duplicate, not a weak factor, and rejecting duplicates
+  # cannot starve the repository the way an absolute quality floor did -- which
+  # is the failure the other four are still disabled for.
+  rho_bar: 0.95
+  gamma_cx: null
+  turnover_basis: book
+
+decay: # §3.4 item 7
+  K: 4
+  lambda_d: 0.5
+
+overfit:
+  # Reference IS->OOS RankIC gap at which e_overfit reaches 0.
+  #
+  # Was 0.02, which is far below anything the search actually produces: the
+  # measured gap is +0.3015 for Arm A and +0.2824 for Arm B against +0.0332 for
+  # the un-mined baseline. Every mined factor therefore saturated the term at
+  # exactly 0.0 and the dimension could not order them -- it distinguished
+  # "mined" from "not mined" and nothing finer. 0.40 sits above the observed
+  # arm level so that typical candidates land mid-range and better and worse
+  # over-fitting is actually separable.
+  delta_ref: 0.40
+
+utility:
+  mode: weighted_rank # net_ir | net_arr | weighted_rank
+  omega: # must sum to 1
+    effectiveness: 0.30
+    arr: 0.10
+    stability: 0.15
+    turnover: 0.10
+    diversity: 0.15
+    overfit: 0.10
+    # Was 0.00 -- computed on every candidate, reported, and weighted out of
+    # the objective entirely. The measured behaviour of both arms is that they
+    # earn money in 2022-2023 and lose it in 2024-2025, so decay is the failure
+    # mode the search most needs to price, and it was the one term U ignored.
+    #
+    # The weight comes out of `arr` rather than off the top. `effectiveness`
+    # ranks net_ir and `arr` ranks net_arr; both are net-return quantities on
+    # the same book, so 0.50 of the weight sat on one thing under two names.
+    # Moving 0.10 of it to decay reduces that double-count and prices
+    # persistence at the same time.
+    decay: 0.10
+
+# ---------------------------------------------------------------------------
+# Admission: when U admits a candidate batch to the repository, and when a
+# member that has fallen behind is evicted (Eq. 12 / section 3.4).
+#
+# U is a weighted mean of percentile complements, so 0.5 is "better than the
+# median incumbent" -- the adaptive bar the formulation describes: constant in
+# value, rising in the standard it encodes as the repository improves.
+#
+# tau_evict sits below tau_admit deliberately. About half of any repository is
+# below its own median by construction, so evicting at the admission bar would
+# drop half the members every round and cascade toward empty. The gap is
+# hysteresis: a factor must fall clearly behind, not merely below average.
+#
+# min_size spans two batches rather than one. Factors evaluated together share
+# a metric vector, so a repository bootstrapped from a single batch holds one
+# distinct point and every percentile collapses to 0 or 1; two batches give the
+# ranking something to interpolate between.
+admission:
+  enabled: true
+
+  # marginal_contribution, NOT utility_rank. The percentile bar failed in a
+  # recorded way: the first two batches are admitted unconditionally to
+  # bootstrap the ranking and then ARE the yardstick, so a lucky pair sets a
+  # bar nothing clears -- the top-k re-mine froze at 18 factors and rejected 33
+  # consecutive batches while factor quality was statistically identical to the
+  # run that reached 174. It fails the other way too: on the mean_variance run
+  # U rose with repository SIZE (corr +0.409) as the zoo filled with mediocre
+  # members, so the admission rate climbed 54% -> 78% purely because the bar
+  # softened. Marginal contribution is measured against the CURRENT book and is
+  # near-orthogonal to zoo size (corr +0.039), so it can drift neither way.
+  mode: marginal_contribution
+
+  # The bar: the improvement must clear k_sigma standard errors, measured over
+  # test_seeds. delta_net_ir as a POINT estimate flipped 3 of 4 verdicts across
+  # combiner seeds, which is a fact about the estimate rather than the quantity
+  # -- so it is tested rather than thresholded. This makes the requirement
+  # genuinely dynamic without anyone choosing a percentile, and it is the
+  # multiplier on in-loop cost: five seeds means five evaluations per batch
+  # (cuts delta_mean se ~29% vs three; the marginal-decision cost is seconds).
+  # Under the IC combiner the five seeds are five bootstrap samples of the IC
+  # weights (see combiner.py `_fit_predict_ic`), not five LightGBM subsamples.
+  k_sigma: 1.0
+  test_seeds: [42, 1, 7, 13, 29]
+
+  # Pathology floor only -- too sparse to price, constant, or a near-duplicate.
+  # Never weakness: an absolute quality floor is what starved the repository
+  # when gamma_ic was enabled.
+  min_coverage: 0.30
+
+  # Unbounded for this run. QA_TARGET_ZOO stops mining at 150 admitted, so a
+  # capacity of 150 would be reached and never exercised. Capacity is the knob
+  # for the continuous setting, where admission becomes replacement and the
+  # library improves instead of merely growing.
+  capacity: null
+
+  # Re-scoring every incumbent against the current repository costs one
+  # evaluation each. That is the reason this was off, and the reason it is now
+  # on at a cadence rather than every round: a factor that was additive at
+  # |zoo| = 12 can be redundant at 150, and NOTHING in its own stored metrics
+  # changes to say so. Without this the repository can only grow, so "the
+  # library improves with evolution" was not a property the run had.
+  #
+  # The cadence counts ADMITTED batches (_prune is called only on admission),
+  # and one fire costs 1 + |zoo| evaluations. At ~3 factors/batch, 150 factors
+  # is ~50 admitted batches, so evict_every: 20 fires twice -- at |zoo| ~= 60
+  # and ~= 120 -- for 61 + 121 = ~182 evaluations over the whole run. Every
+  # round instead would cost ~3,800, which is the run again.
+  evict_every: 20
+  # A member must be actively unhelpful, not merely unproven. Admission needs a
+  # resolvably POSITIVE contribution (t > k_sigma); eviction needs a NEGATIVE
+  # one. The gap between the two bars is what stops a factor oscillating in and
+  # out on measurement noise, and it is why a merely-redundant factor (0) stays.
+  evict_below: 0.0
+
+  # Legacy percentile eviction, still live: _prune runs on every admission and
+  # ranks members by U. See the note in net_cost_runner._prune -- under
+  # marginal_contribution these two disagree about what "behind" means, and
+  # reconciling them is outstanding.
+  tau_admit: 0.50
+  tau_evict: 0.25
+  min_size: 6
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation for the IN-LOOP evaluation only. A single
+# train/validate block can sit inside one market regime, so a factor is
+# selected on a market that no longer exists by the time the test window
+# starts. Folds expand from a common start date and end at the configured
+# split, so folds=1 reproduces the fixed split exactly. final_test is never
+# involved -- progressive retraining changes how the search SELECTS, not how
+# results are reported.
+walk_forward:
+  enabled: true
+  folds: 3

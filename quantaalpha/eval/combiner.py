@@ -160,6 +160,113 @@ def zoo_hash(zoo_signals: dict[str, pd.DataFrame]) -> str:
 _PREDICTION_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
 
 
+def _per_date_ic(x: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """Per-date cross-sectional rank IC of each feature with the label.
+
+    Inputs are already cross-sectionally rank-normalised (``_preprocess_v2`` or
+    ``_cs_rank_norm``), so Pearson correlation here *is* the Spearman rank IC.
+    Returns a ``(n_dates, n_features)`` frame -- one IC row per training date --
+    which the bootstrap in :func:`_fit_predict_icir` re-averages per seed.
+    """
+    label_name = "__ic_label__"
+    df = x.assign(**{label_name: y})
+    feats = list(x.columns)
+    ic = df.groupby(level="datetime", group_keys=False).apply(
+        lambda g: g[feats].corrwith(g[label_name])
+    )
+    return ic
+
+
+def _icir_weights(ic_arr_sample: np.ndarray, shrink) -> tuple[np.ndarray, float]:
+    """ICIR (IC/σ_IC) weights for one bootstrap sample, shrunk toward 1/N.
+
+    ``ic_arr_sample`` is the ``(n_dates, n_feats)`` per-date IC matrix for one
+    bootstrap resample. Returns ``(weights, delta)`` where ``delta`` is the
+    Ledoit-Wolf shrinkage intensity actually applied (useful for diagnostics).
+
+    Pure function -- no Θ, no panel -- so the Ding-Martin Redux math is unit
+    testable without standing up Qlib. See :func:`_fit_predict_icir` for the
+    rationale.
+    """
+    n_feats = ic_arr_sample.shape[1]
+    ic_mean = np.nanmean(ic_arr_sample, axis=0)        # mean IC per factor
+    ic_std = np.nanstd(ic_arr_sample, axis=0, ddof=1)  # σ_IC per factor
+    icir = ic_mean / (ic_std + 1e-8)                   # IC/σ_IC (Ding-Martin IR)
+    if shrink == "auto":
+        # Ledoit-Wolf: ratio of estimation-error variance to weight dispersion.
+        # →1 (equal weight) when ICs are noisy; →0 (raw ICIR) when precise & spread.
+        disp = np.nansum((icir - np.nanmean(icir)) ** 2)
+        delta = float(np.clip(np.nansum(ic_std ** 2) / (disp + 1e-12), 0.0, 1.0))
+    else:
+        delta = float(np.clip(shrink, 0.0, 1.0))
+    equal = np.full(n_feats, 1.0 / n_feats)
+    weights = (1.0 - delta) * icir + delta * equal     # shrink toward 1/N
+    weights = np.nan_to_num(weights, nan=0.0)
+    return weights, delta
+
+
+def _fit_predict_icir(
+    features: pd.DataFrame,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    theta: Protocol,
+    panel: PanelBundle,
+) -> pd.DataFrame:
+    """ICIR + shrinkage linear combiner (Ding-Martin Redux).
+
+    The composite prediction is ``μ = Σᵢ wᵢ · xᵢ`` where the weights are the
+    **information ratio** of each factor's cross-sectional rank IC --
+    ``wᵢ = mean(ICᵢ) / std(ICᵢ)`` -- not the mean IC alone. This is the
+    Ding-Martin (2017) Redux fix: IR = IC/σ_IC asymptotically, and σ_IC
+    ("strategy risk") is non-diversifiable and bounds IR, so a factor whose IC
+    is positive but volatile must weight *less* than one whose IC is the same
+    on average but stable. Mean-IC weighting ignores σ_IC and lets noisy
+    factors dominate the composite; the replay bore this out -- plain
+    IC-weighting admitted 9/125 where LightGBM's ``se≈0`` auto-admit gave 26,
+    three of which were resolvably *negative* under honest variance.
+
+    The weights are then **shrunk toward equal weight** by a Ledoit-Wolf
+    intensity δ (James-Stein / DeMiguel; equal-weight is the high-σ_IC limit
+    and the null model that needs no estimation). ``shrinkage`` is read from
+    ``theta.combiner.params``:
+
+      * ``"auto"`` (default): δ = clip( Σσ_ICᵢ² / Σ(wᵢ - w̄)², 0, 1 ) per
+        bootstrap sample -- →1 when the ICs are noisy (estimation error
+        dominates dispersion), →0 when they are precise and spread.
+      * a float f: δ = f (fixed intensity, 0 = raw ICIR, 1 = equal weight).
+
+    The five ``test_seeds`` BOOTSTRAP the train dates (resample with
+    replacement) before computing each sample's ICIR, so five seeds give five
+    different weight vectors, ``μ``s, books, and marginal contributions -- the
+    honest finite-sample σ_IC the admission gate's t-test measures. A
+    deterministic combiner would return five identical deltas (``se = 0``) and
+    collapse the gate; LightGBM's ``se≈0`` is exactly that failure, and is what
+    inflated its admission count.
+
+    Returns the **raw composite score** (wide T×N). The operator maps it to
+    expected-return units via Grinold α (``α = IC_c · σ_i · s_i``) rather than
+    the empirical ``prediction_scale`` β, so the raw scale of ``μ`` is
+    irrelevant -- only the *relative* weighting the ICIR+shrinkage induces.
+    """
+    ic_by_date = _per_date_ic(x_train, y_train)
+    ic_arr = ic_by_date.to_numpy(dtype=float)          # (n_dates, n_feats)
+    n_dates = ic_arr.shape[0]
+    feat_mat = features.to_numpy(dtype=float)          # (n_rows, n_feats), full window
+    shrink = theta.combiner.params.get("shrinkage", "auto")
+    preds = []
+    for seed in theta.combiner.seeds:
+        rng = np.random.default_rng(int(seed))
+        samp = rng.integers(0, n_dates, size=n_dates)  # bootstrap date indices
+        weights, _delta = _icir_weights(ic_arr[samp], shrink)
+        preds.append(feat_mat @ weights)               # (n_rows,)
+    raw_pred = pd.Series(np.mean(preds, axis=0), index=features.index, name="score")
+    wide = raw_pred.unstack(level="instrument")
+    wide.index = pd.to_datetime(wide.index)
+    prediction = wide.sort_index().reindex(index=panel.dates, columns=panel.instruments)
+    prediction = prediction.where(panel.universe)
+    return prediction
+
+
 def fit_predict(
     zoo_signals: dict[str, pd.DataFrame],
     candidate_signal: pd.DataFrame | None,
@@ -184,8 +291,6 @@ def fit_predict(
     cached = _PREDICTION_CACHE.get(key)
     if cached is not None:
         return cached.reindex(index=panel.dates, columns=panel.instruments)
-
-    import lightgbm as lgb
 
     # ---- design matrix: base features + every zoo signal + the candidate ----
     columns: dict[str, pd.Series] = {}
@@ -223,6 +328,26 @@ def fit_predict(
             f"combiner: no rows in fit split {theta.combiner.fit_split} "
             f"({train_start}..{train_end}) within the loaded panel"
         )
+
+    # ---- model dispatch: ICIR+shrinkage linear combiner (Ding-Martin Redux) ----
+    # The frozen LightGBM procedure (model="lightgbm") is the default and is
+    # what the frozen / soft protocols select. model="icir" routes here
+    # instead: same design matrix and preprocessing, but μ is an ICIR-weighted
+    # (IC/σ_IC) linear sum of the factor signals, shrunk toward equal weight,
+    # rather than a 500-round boosted fit. No threads, no over-fitting,
+    # milliseconds not minutes. See _fit_predict_icir for why each combiner
+    # seed bootstraps the train dates.
+    model = getattr(theta.combiner, "model", "lightgbm")
+    if model == "icir":
+        prediction = _fit_predict_icir(features, x_train, y_train, theta, panel)
+        _PREDICTION_CACHE[key] = prediction
+        logger.debug(
+            "combiner refit (icir): zoo=%s cand=%s theta=%s rows=%d feats=%d seeds=%d",
+            key[0], key[1][:8], key[2], len(x_train), features.shape[1], len(theta.combiner.seeds),
+        )
+        return prediction
+
+    import lightgbm as lgb  # just-in-time: the icir path above never imports it
 
     params = dict(theta.combiner.params)
     # QA_THREADS caps LightGBM to one instance's fair share of the machine.

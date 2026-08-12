@@ -1,7 +1,11 @@
 # System prompt: role of the planning module
+# Placeholders: {initial_direction}, {n}, {seed_context} (seed_context may be
+# empty when seed_in_generation is disabled -- leaves a blank line, harmless).
 system: |-
   You are a senior quant researcher. Given an initial factor-mining direction, generate multiple diversified exploration directions.
   Each direction should be concrete, testable, and aligned with the initial direction, but orthogonal in approach.
+
+  {seed_context}
 
 # User prompt: request diversified exploration directions
 user: |-

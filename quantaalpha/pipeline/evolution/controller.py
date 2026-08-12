@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 import threading
@@ -26,6 +26,7 @@ from .trajectory import (
     _PRIMARY_METRIC,
     _REQUIRE_FEASIBLE,
     is_admissible,
+    format_metric,
 )
 from .mutation import MutationOperator
 from .crossover import CrossoverOperator
@@ -115,6 +116,18 @@ class EvolutionConfig:
     # Start with empty trajectory pool (ignore existing data)
     fresh_start: bool = True
 
+    # Learning-aware reseed: rounds of NO repository growth before the search
+    # regenerates NEW, outcome-informed directions (treatment arm only; the
+    # control arm has no ledger and the gate no-ops). NOT a Theta field -- the
+    # frozen protocol hash must not move.
+    reseed_after_stale_rounds: int = 2
+    # The controller owns the live direction list so it can GROW it on a reseed.
+    # Seeded from the initial planning output; ``num_directions`` is the frozen
+    # initial count (also the reseed batch size).
+    directions: list[str] = field(default_factory=list)
+    initial_direction: str = ""
+    informed_prompt_path: Optional[str] = None
+
 
 class EvolutionController:
     """
@@ -168,7 +181,31 @@ class EvolutionController:
         # Track trajectories to mutate in current mutation round
         self._mutation_targets: list[StrategyTrajectory] = []
         self._mutation_idx = 0  # Current index in mutation targets
-    
+
+        # Learning-aware reseed state. The controller owns the live direction
+        # list (grown on reseed) and a per-direction outcome tally used to mark
+        # saturated directions and to build the digest fed to the LLM.
+        self._directions: list[str] = list(getattr(config, "directions", []) or [])
+        self._direction_status: list[dict] = [
+            self._blank_direction_status(i, "initial")
+            for i in range(len(self._directions))
+        ]
+        self._best_zoo_size = -1
+        self._stale_rounds = 0
+        self._reseed_count = 0
+
+    @staticmethod
+    def _blank_direction_status(direction_id: int, source: str) -> dict:
+        return {
+            "direction_id": direction_id,
+            "admitted_count": 0,
+            "rejected_count": 0,
+            "last_admit_round": -1,
+            "attempts": 0,
+            "saturated": False,
+            "source": source,
+        }
+
     def get_current_state(self) -> dict[str, Any]:
         """Get current evolution state."""
         return {
@@ -230,11 +267,12 @@ class EvolutionController:
         
         # Phase: ORIGINAL - collect all remaining original tasks
         if self._current_phase == RoundPhase.ORIGINAL:
-            for d in range(self.config.num_directions):
+            for d in range(len(self._directions)):
                 if d not in self._directions_completed:
                     tasks.append({
                         "phase": RoundPhase.ORIGINAL,
                         "direction_id": d,
+                        "direction": self._directions[d],
                         "parent_trajectories": [],
                         "strategy_suffix": "",
                         "round_idx": self._current_round,
@@ -281,6 +319,9 @@ class EvolutionController:
                     continue
                 
                 suffix = self.mutation_op.generate_mutation_prompt_suffix(parent)
+                zc = self._build_zoo_context()
+                if zc:
+                    suffix = suffix + "\n" + zc
                 tasks.append({
                     "phase": RoundPhase.MUTATION,
                     "direction_id": idx,
@@ -316,6 +357,9 @@ class EvolutionController:
             for idx in range(self._crossover_idx, len(self._crossover_groups)):
                 parents = self._crossover_groups[idx]
                 suffix = self.crossover_op.generate_crossover_prompt_suffix(parents)
+                zc = self._build_zoo_context()
+                if zc:
+                    suffix = suffix + "\n" + zc
                 tasks.append({
                     "phase": RoundPhase.CROSSOVER,
                     "direction_id": idx,
@@ -359,7 +403,7 @@ class EvolutionController:
                 self._directions_completed.add(task["direction_id"])
             
             # Transition based on enabled phases
-            if len(self._directions_completed) >= self.config.num_directions:
+            if len(self._directions_completed) >= len(self._directions):
                 self._current_round += 1
                 if self.config.mutation_enabled:
                     self._current_phase = RoundPhase.MUTATION
@@ -402,15 +446,24 @@ class EvolutionController:
                 self._prepare_crossover_groups()
                 self._current_phase = RoundPhase.CROSSOVER
                 logger.info(f"All crossover rounds complete, continuing with crossover (round {self._current_round})")
+
+        # Learning-aware reseed (parallel path): after a breeding round that did
+        # not grow the repository, regenerate informed directions. The caller
+        # re-asks get_all_tasks_for_current_phase, which now emits ORIGINAL tasks
+        # for the new (and re-opened) directions. Dormant under
+        # QA_SEQUENTIAL_EVOLUTION=true (the default) but covers the parallel path.
+        if phase in (RoundPhase.MUTATION, RoundPhase.CROSSOVER):
+            self._reseed_if_stale()
     
     def _get_original_task(self) -> Optional[dict[str, Any]]:
         """Get next original round task."""
         # Find a direction that hasn't completed original
-        for d in range(self.config.num_directions):
+        for d in range(len(self._directions)):
             if d not in self._directions_completed:
                 return {
                     "phase": RoundPhase.ORIGINAL,
                     "direction_id": d,
+                    "direction": self._directions[d],
                     "parent_trajectories": [],
                     "strategy_suffix": "",  # No guidance for original
                     "round_idx": self._current_round,
@@ -481,6 +534,9 @@ class EvolutionController:
             
             # Generate mutation guidance
             suffix = self.mutation_op.generate_mutation_prompt_suffix(parent)
+            zc = self._build_zoo_context()
+            if zc:
+                suffix = suffix + "\n" + zc
             
             task = {
                 "phase": RoundPhase.MUTATION,
@@ -497,6 +553,12 @@ class EvolutionController:
         self._mutation_targets = []  # Reset for next mutation round
         self._mutation_idx = 0
         self._current_round += 1
+
+        # Learning-aware reseed: if breeding has stalled, regenerate informed
+        # directions and return to ORIGINAL with new material instead of
+        # transitioning into yet more breeding of the same saturated space.
+        if self._reseed_if_stale():
+            return self._get_original_task()
         
         # Determine next phase based on config
         if self.config.crossover_enabled:
@@ -900,6 +962,11 @@ class EvolutionController:
         if self._crossover_idx >= len(self._crossover_groups):
             # All crossover tasks complete, transition to next phase
             self._current_round += 1
+
+            # Learning-aware reseed: if breeding has stalled, regenerate informed
+            # directions and return to ORIGINAL with new material.
+            if self._reseed_if_stale():
+                return self._get_original_task()
             
             if self.config.mutation_enabled:
                 self._current_phase = RoundPhase.MUTATION
@@ -917,6 +984,9 @@ class EvolutionController:
         
         # Generate crossover guidance
         suffix = self.crossover_op.generate_crossover_prompt_suffix(parents)
+        zc = self._build_zoo_context()
+        if zc:
+            suffix = suffix + "\n" + zc
         
         task = {
             "phase": RoundPhase.CROSSOVER,
@@ -950,14 +1020,39 @@ class EvolutionController:
         
         if phase == RoundPhase.ORIGINAL:
             self._directions_completed.add(direction_id)
+            self._update_direction_status(direction_id, trajectory)
             logger.info(f"Original round complete for direction {direction_id}")
-        
+
         elif phase == RoundPhase.MUTATION:
             logger.info(f"Mutation round complete for direction {direction_id}")
-        
+
         elif phase == RoundPhase.CROSSOVER:
             logger.info(f"Crossover round complete (group {direction_id})")
-    
+
+    def _update_direction_status(self, direction_id: int, trajectory: StrategyTrajectory) -> None:
+        """Tally one ORIGINAL outcome onto the per-direction status.
+
+        Only ORIGINAL tasks carry a real direction index (mutation/crossover
+        use a task index), so this is called from the ORIGINAL branch only.
+        ``admitted`` is surfaced by ``_extract_net_cost_metrics`` (Part E); the
+        ``feasible`` fallback keeps control-arm trajectories readable, though
+        the reseed gate (_has_treatment_data) means this tally only matters for
+        the treatment arm.
+        """
+        if direction_id < 0 or direction_id >= len(self._direction_status):
+            return
+        st = self._direction_status[direction_id]
+        st["attempts"] += 1
+        metrics = trajectory.backtest_metrics or {}
+        if bool(metrics.get("admitted", metrics.get("feasible", True))):
+            st["admitted_count"] += 1
+            try:
+                st["last_admit_round"] = max(st["last_admit_round"], int(trajectory.round_idx))
+            except (TypeError, ValueError):
+                pass
+        else:
+            st["rejected_count"] += 1
+
     def create_trajectory_from_loop_result(
         self,
         task: dict[str, Any],
@@ -1123,10 +1218,21 @@ class EvolutionController:
         # _rank_by_fitness shrinks; absent outside marginal_contribution mode.
         "delta_net_ir", "delta_net_arr", "base_net_ir",
         "delta_mean", "delta_se",
+        # Realized per-factor outcome + the admission bar that judged it.
+        # Surfaced so the evolution prompts (format_objective_note) and the
+        # reseed digest can read the verdict off the trajectory instead of
+        # falling back to ``feasible`` (which the net-cost runner never sets,
+        # so rejected batches used to render as ADMITTED).
+        "net_ir", "net_arr", "tau_admit",
         "e_effectiveness", "e_arr", "e_stability", "e_turnover", "e_diversity",
         "e_overfit", "e_decay",
     )
-    _NET_COST_STR_KEYS = ("theta_hash", "zoo_hash", "failed_gates")
+    _NET_COST_STR_KEYS = ("theta_hash", "zoo_hash", "failed_gates", "weakest_dimensions")
+    # Bool flags from the net-cost runner. ``admitted`` is the live verdict the
+    # digest and format_objective_note key on; ``in_zoo`` is its persistence
+    # counterpart. The control arm's Qlib Series carries neither, so these stay
+    # absent and its trajectories read exactly as before.
+    _NET_COST_BOOL_KEYS = ("admitted", "in_zoo")
 
     def _extract_net_cost_metrics(self, result: Any) -> dict[str, Any]:
         """Pull the E_theta metric vector off a result, when present."""
@@ -1155,8 +1261,238 @@ class EvolutionController:
                 extras[key] = str(series[key])
         if "feasible" in series.index and pd.notna(series["feasible"]):
             extras["feasible"] = bool(series["feasible"])
+        for key in self._NET_COST_BOOL_KEYS:
+            if key in series.index and pd.notna(series[key]):
+                extras[key] = bool(series[key])
         return extras
     
+    # ------------------------------------------------------------------
+    # Learning-aware reseed: when breeding stops growing the repository,
+    # regenerate NEW directions informed by the run's trial history.
+    # ------------------------------------------------------------------
+
+    def _has_treatment_data(self) -> bool:
+        """True when any trajectory carries the net-of-cost objective vector.
+
+        The A/B gate for every reseed behaviour. The control arm (RankIC, no
+        ledger) never produces a ``U`` metric, so this returns False and the
+        whole reseed path is a no-op, keeping the arms comparable. Gating on
+        data presence rather than an env var is what makes the control arm
+        byte-for-byte unchanged.
+        """
+        for t in self.pool.get_all():
+            if "U" in (t.backtest_metrics or {}):
+                return True
+        return False
+
+    def _zoo_size(self) -> int | None:
+        """How many factors the repository holds, or None if unknowable here.
+
+        The same source ``_rounds_exhausted`` sizes the target from, so the two
+        cannot disagree about whether progress is being made. A missing ledger
+        yields 0 (``replay_repository`` returns {} rather than raising), which is
+        why ``_has_treatment_data`` is checked first: a control arm with an empty
+        default ledger path must not read as "stuck at 0" and trigger a reseed.
+        """
+        try:
+            from quantaalpha.eval.ledger import replay_repository
+
+            return len(replay_repository(os.environ.get("QA_LEDGER")))
+        except Exception:
+            return None
+
+    def _reseed_if_stale(self) -> bool:
+        """Regenerate informed directions when the repository stops growing.
+
+        Returns True when the phase was reset to ORIGINAL, so the caller returns
+        an original task instead of its own transition. Keyed on repository
+        GROWTH rather than on rejections: a round can legitimately reject
+        everything while the repository is still climbing, and reseeding then
+        would discard parents that are working. Silent no-op for the control arm
+        (no ``U``) and when ``reseed_after_stale_rounds`` <= 0.
+        """
+        if not self._has_treatment_data():
+            return False
+        n = int(getattr(self.config, "reseed_after_stale_rounds", 0) or 0)
+        if n <= 0:
+            return False
+        size = self._zoo_size()
+        if size is None:
+            return False
+        if size > self._best_zoo_size:
+            self._best_zoo_size = size
+            self._stale_rounds = 0
+            return False
+        self._stale_rounds += 1
+        if self._stale_rounds < n:
+            return False
+        # Stalled for n rounds: build the digest and ask for new directions.
+        self._stale_rounds = 0
+        digest = self._build_reseed_digest()
+        if not digest:
+            logger.warning(
+                "Repository stuck but no digestible trial history; skipping reseed"
+            )
+            return False
+        new_dirs = self._generate_informed_directions(digest)
+        if not new_dirs:
+            logger.warning(
+                f"Repository stuck at {size} factor(s) for {n} round(s): "
+                "informed-direction generation returned nothing; retrying next stale window"
+            )
+            return False
+        # Mark saturated directions: explored and no admission within the last n
+        # rounds. A direction that admitted recently keeps its headroom and
+        # stays eligible; a never-admitted or long-dormant one is skipped so the
+        # ORIGINAL phase spends its budget on the new directions instead.
+        for st in self._direction_status:
+            recent = (
+                st["last_admit_round"] >= 0
+                and (self._current_round - st["last_admit_round"]) < n
+            )
+            st["saturated"] = bool(st["attempts"] >= 1 and not recent)
+        # Grow the direction list (never replace -- working parents stay).
+        self._reseed_count += 1
+        src = f"reseed_{self._reseed_count}"
+        for d in new_dirs:
+            self._directions.append(d)
+            self._direction_status.append(
+                self._blank_direction_status(len(self._directions) - 1, src)
+            )
+        # Re-open eligible directions: keep saturated ids completed (skip them),
+        # drop non-saturated ones so they get another ORIGINAL pass; the new ids
+        # were never completed.
+        self._directions_completed = {
+            d for d in self._directions_completed
+            if d < len(self._direction_status) and self._direction_status[d]["saturated"]
+        }
+        self._current_phase = RoundPhase.ORIGINAL
+        logger.warning(
+            f"Repository stuck at {size} factor(s) for {n} round(s): generated "
+            f"{len(new_dirs)} informed direction(s) (reseed #{self._reseed_count}); "
+            "returning to ORIGINAL with new material. Mutation and crossover can "
+            "only recombine what already exists, so a stalled search needs new "
+            "directions, not more breeding."
+        )
+        return True
+
+    def _build_reseed_digest(self) -> str:
+        """Per-direction outcome summary fed to the informed-direction LLM.
+
+        Groups ORIGINAL trajectories by ``direction_id`` (a real index only
+        there), mapped to their direction string via ``self._directions``. For
+        each direction: the verdict tally (admitted vs rejected, binned
+        redundant / net-harmful / marginal from ``failed_gates`` + ``delta_mean``
+        -- the reason string lives only in the ledger, not on the trajectory),
+        the top admitted factors' signatures, last-admit round, and a SATURATED
+        flag. Returns "" when there is no digestible history.
+        """
+        if not self._directions:
+            return ""
+        by_dir: dict[int, list[StrategyTrajectory]] = {}
+        for t in self.pool.get_by_phase(RoundPhase.ORIGINAL):
+            did = getattr(t, "direction_id", None)
+            if isinstance(did, int) and 0 <= did < len(self._directions):
+                by_dir.setdefault(did, []).append(t)
+        if not by_dir:
+            return ""
+
+        lines: list[str] = []
+        for did in sorted(by_dir):
+            trajs = by_dir[did]
+            st = self._direction_status[did]
+            direction_text = (self._directions[did] or "")[:200]
+            admitted = [
+                t for t in trajs
+                if bool((t.backtest_metrics or {}).get(
+                    "admitted", (t.backtest_metrics or {}).get("feasible", True)))
+            ]
+            redundant = net_harmful = marginal = 0
+            for t in trajs:
+                if t in admitted:
+                    continue
+                m = t.backtest_metrics or {}
+                fg = str(m.get("failed_gates") or "")
+                dm = m.get("delta_mean")
+                if "rho_max" in fg:
+                    redundant += 1
+                elif isinstance(dm, (int, float)) and dm < 0:
+                    net_harmful += 1
+                else:
+                    marginal += 1
+            parts = [
+                f'- Direction {did} ("{direction_text}"):',
+                f"  attempts={st['attempts']} admitted={st['admitted_count']} "
+                f"rejected={st['rejected_count']} "
+                f"(redundant={redundant}, net_harmful={net_harmful}, marginal={marginal})",
+                f"  last_admit_round={st['last_admit_round']}",
+            ]
+            for t in admitted[:3]:
+                m = t.backtest_metrics or {}
+                exprs = [f.get("expression", "")[:80] for f in (t.factors or [])[:2]]
+                parts.append(
+                    f"  admitted: [{' | '.join(exprs)}] U={format_metric(m.get('U'))} "
+                    f"delta_mean={format_metric(m.get('delta_mean'))} "
+                    f"rho_max={format_metric(m.get('rho_max'))}"
+                )
+            parts.append(f"  SATURATED={'yes' if st['saturated'] else 'no'}")
+            lines.append("\n".join(parts))
+        return "\n".join(lines)
+
+    def _generate_informed_directions(self, digest: str) -> list[str]:
+        """Ask the LLM for new orthogonal directions from the digest."""
+        prompt_path = getattr(self.config, "informed_prompt_path", None)
+        if not prompt_path or not Path(prompt_path).exists():
+            logger.warning("No informed-planning prompt path configured; cannot reseed")
+            return []
+        from quantaalpha.pipeline.planning import generate_informed_directions
+
+        n = max(1, int(getattr(self.config, "num_directions", 2) or 2))
+        try:
+            return generate_informed_directions(
+                initial_direction=getattr(self.config, "initial_direction", "") or "",
+                n=n,
+                prompt_file=Path(prompt_path),
+                history_summary=digest,
+                use_llm=True,
+                allow_fallback=False,
+            )
+        except Exception as exc:
+            logger.warning(f"Informed direction generation failed: {exc}")
+            return []
+
+    def _build_zoo_context(self) -> str:
+        """Cumulative repository summary appended to mutation/crossover guidance.
+
+        Tells the breeder what the book already captures so mutations and
+        crossovers aim at ORTHOGONAL signal rather than re-saturating the same
+        space. Empty for the control arm (no ``U``), so its ``strategy_suffix``
+        and the resulting ``effective_direction`` (loop.py) are byte-identical to
+        today. Capped at 8 admitted trajectories to bound the token cost.
+        """
+        if not self._has_treatment_data():
+            return ""
+        admitted = [
+            t for t in self.pool.get_all()
+            if bool((t.backtest_metrics or {}).get(
+                "admitted", (t.backtest_metrics or {}).get("feasible", True)))
+        ][:8]
+        if not admitted:
+            return ""
+        lines = ["## Repository Context (what the book already captures)"]
+        for t in admitted:
+            m = t.backtest_metrics or {}
+            exprs = [f.get("expression", "")[:60] for f in (t.factors or [])[:2]]
+            lines.append(
+                f"- [{' | '.join(exprs)}] U={format_metric(m.get('U'))} "
+                f"rho_max={format_metric(m.get('rho_max'))}"
+            )
+        lines.append(
+            "Aim for ORTHOGONAL signal not already in the book; do not duplicate "
+            "the admitted factor logic above."
+        )
+        return "\n".join(lines)
+
     def _rounds_exhausted(self) -> bool:
         """Should evolution stop?
 
@@ -1245,6 +1581,13 @@ class EvolutionController:
             "active_branch_count": self._active_branch_count,
             "mutation_idx": self._mutation_idx,
             "mutation_target_ids": [t.trajectory_id for t in self._mutation_targets],
+            # Learning-aware reseed state: the grown direction list and the
+            # per-direction outcome tally must survive a restart or a resumed
+            # run would forget it had already saturated those directions.
+            "directions": list(self._directions),
+            "direction_status": list(self._direction_status),
+            "best_zoo_size": self._best_zoo_size,
+            "stale_rounds": self._stale_rounds,
             "config": {
                 "num_directions": self.config.num_directions,
                 "max_rounds": self.config.max_rounds,
@@ -1278,7 +1621,23 @@ class EvolutionController:
         self._crossover_idx = state.get("crossover_idx", 0)
         self._active_branch_count = state.get("active_branch_count", self.config.num_directions)
         self._mutation_idx = state.get("mutation_idx", 0)
-        
+
+        # Restore learning-aware reseed state. Fall back to the config-seeded
+        # values for state files written before this feature existed.
+        saved_dirs = state.get("directions")
+        if isinstance(saved_dirs, list) and saved_dirs:
+            self._directions = list(saved_dirs)
+        saved_status = state.get("direction_status")
+        if isinstance(saved_status, list) and len(saved_status) == len(self._directions):
+            self._direction_status = list(saved_status)
+        else:
+            self._direction_status = [
+                self._blank_direction_status(i, "initial")
+                for i in range(len(self._directions))
+            ]
+        self._best_zoo_size = int(state.get("best_zoo_size", -1))
+        self._stale_rounds = int(state.get("stale_rounds", 0))
+
         # Restore mutation targets from IDs
         mutation_target_ids = state.get("mutation_target_ids", [])
         self._mutation_targets = []

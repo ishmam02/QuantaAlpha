@@ -132,6 +132,62 @@ def prediction_scale(
     return beta
 
 
+def grinold_alpha(
+    pred: pd.DataFrame,
+    y_tilde: pd.DataFrame,
+    sigma: pd.DataFrame,
+    window: tuple[str, str],
+) -> pd.DataFrame:
+    """Grinold (1994) structural α = IC_c · σ_i · s_i, in return units.
+
+    The canonical composite→expected-return mapping (``Active Portfolio
+    Management`` Ch.6) used on the ``model:icir`` path in place of the OLS
+    ``prediction_scale`` β. The composite score is standardised
+    cross-sectionally per date into ``s`` (Grinold's score), the conditional IC
+    ``IC_c = mean per-date cross-sectional corr(s, y)`` is estimated over
+    ``window`` (the valid split, not the train split the combiner saw), and
+    ``α = IC_c · σ_i · s_i`` elementwise.
+
+    Two properties the empirical β lacks:
+
+      * **Sign-guaranteed.** A negative IC_c flips the book correctly -- there
+        is no ``β ≤ 0 → 1.0`` fallback that would silently flatten a signal
+        whose in-sample relation inverted (the ``prediction_scale`` guard).
+      * **Per-name vol-scaled.** σ_i puts each name's alpha onto its own
+        return scale, so the optimiser's risk term sees a dimensionally
+        consistent expected return.
+
+    Magnitude ``IC_c · σ ≈ 0.03 · 0.02 ≈ 6e-4`` matches empirical ``β·μ``, so
+    the optimiser's λ=25 is preserved.
+    """
+    # s: cross-sectional z-score per date (Grinold's standardised score).
+    s = pred.sub(pred.mean(axis=1), axis=0).div(
+        pred.std(axis=1, ddof=0).replace(0.0, np.nan), axis=0
+    )
+    start, end = window
+    s_win = s.loc[str(start):str(end)]
+    y_win = y_tilde.reindex(index=s_win.index, columns=s_win.columns)
+    # IC_c: mean per-date cross-sectional Pearson corr of s with realised return.
+    ic_vals = []
+    for d in s_win.index:
+        sv, yv = s_win.loc[d].to_numpy(), y_win.loc[d].to_numpy()
+        m = np.isfinite(sv) & np.isfinite(yv)
+        if m.sum() >= 5:
+            sv, yv = sv[m] - sv[m].mean(), yv[m] - yv[m].mean()
+            denom = np.sqrt((sv**2).sum() * (yv**2).sum())
+            if denom > 0:
+                ic_vals.append(float((sv * yv).sum() / denom))
+    ic_c = float(np.mean(ic_vals)) if ic_vals else 0.0
+    alpha = ic_c * sigma * s
+    alpha = alpha.where(pred.notna())
+    logger.info(
+        "grinold_alpha: IC_c=%.4f (n_dates=%d) -> |alpha|~%.2e",
+        ic_c, len(ic_vals),
+        float(np.nanmean(np.abs(alpha.to_numpy()))) if alpha.size else np.nan,
+    )
+    return alpha
+
+
 def turnover(w: pd.Series, w_drift: pd.Series) -> float:
     """TO_t (Eq. 6) — one-way turnover, in [0, 1].
 

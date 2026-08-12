@@ -38,7 +38,7 @@ import pandas as pd
 from quantaalpha.eval import combiner as combiner_mod
 from quantaalpha.eval import costs as costs_mod
 from quantaalpha.eval.data import PanelBundle, align_signal, load_benchmark, load_panel
-from quantaalpha.eval.execution import fill_prices, prediction_scale, realized_return
+from quantaalpha.eval.execution import fill_prices, grinold_alpha, prediction_scale, realized_return
 from quantaalpha.eval.metrics import (
     cx,
     prediction_metrics,
@@ -51,6 +51,30 @@ from quantaalpha.eval.tradability import trade_mask
 from quantaalpha.eval.scoring import dimension_scores, utility
 
 logger = logging.getLogger(__name__)
+
+
+def _transfer_coefficient(alpha: pd.DataFrame, w: pd.DataFrame) -> tuple[float, int]:
+    """Clarke-de Silva-Thorley (2002) transfer coefficient: the mean per-rebalance
+    cross-sectional ``corr(α, w*)`` -- the fraction of the alpha vector the
+    portfolio constraints (long-only, position cap, κ-inertia) let through.
+
+    ``alpha`` and ``w`` are wide T×N frames aligned on the evaluation window.
+    Returns ``(mean_tc, n_dates)``; ``mean_tc`` is NaN if no date had enough
+    paired names. ``IR = TC·IC·√N``, so a low TC flags the position cap as the
+    binding constraint rather than factor quality. Pure function -- no Θ -- so
+    the diagnostic is unit-testable without standing up Qlib.
+    """
+    tc_vals = []
+    for d in w.index:
+        av, wv = alpha.loc[d].to_numpy(), w.loc[d].to_numpy()
+        m = np.isfinite(av) & np.isfinite(wv)
+        if m.sum() >= 5:
+            av, wv = av[m] - av[m].mean(), wv[m] - wv[m].mean()
+            denom = np.sqrt((av**2).sum() * (wv**2).sum())
+            if denom > 0:
+                tc_vals.append(float((av * wv).sum() / denom))
+    mean_tc = float(np.mean(tc_vals)) if tc_vals else float("nan")
+    return mean_tc, len(tc_vals)
 
 
 class EvaluationOperator:
@@ -318,12 +342,24 @@ class EvaluationOperator:
         # compares it with a cost. Never the evaluation window -- that would leak
         # realised returns into the trading rule -- but WHICH earlier window
         # matters: see Portfolio.scale_split for why the fit split flatters it.
+        model = getattr(theta.combiner, "model", "lightgbm")
         beta = 1.0
         if theta.portfolio.cost_aware_dropout or theta.portfolio.construction == "mean_variance":
             scale_window = theta.splits.window(
                 getattr(theta.portfolio, "scale_split", None) or theta.combiner.fit_split
             )
-            beta = prediction_scale(prediction, y_tilde, scale_window)
+            if model == "icir":
+                # Grinold (1994) structural α = IC_c · σ_i · s_i: sign-guaranteed
+                # and per-name vol-scaled, replacing the OLS β (prediction_scale)
+                # that falls back to 1.0 when the in-sample slope is ≤0. IC_c is
+                # the mean per-date cross-sectional corr on the scale window
+                # (valid, not train). α is already in return units -> pred_scale=1.0;
+                # its ~6e-4 magnitude matches empirical β·μ so λ=25 is preserved.
+                prediction = grinold_alpha(prediction, y_tilde, sigma, scale_window)
+                window_pred = prediction.loc[str(start) : str(end)]
+                beta = 1.0
+            else:
+                beta = prediction_scale(prediction, y_tilde, scale_window)
 
         # The FULL close history, not the evaluation slice: the risk model
         # estimates from a trailing window that reaches back before the window
@@ -332,6 +368,17 @@ class EvaluationOperator:
             window_pred, theta, y_tilde=y_tilde, universe=universe,
             mask=mask, sigma=sigma, pred_scale=beta, close=panel.close, adv=adv,
         )
+
+        # Transfer coefficient (Clarke-de Silva-Thorley 2002): corr(α, w*) per
+        # rebalance -- the fraction of the alpha the long-only + 3% cap + κ
+        # constraints let through. IR = TC·IC·√N, so a low TC flags the position
+        # cap as the binding constraint (a max_weight decision, not a factor
+        # one). Gated to the icir path; the LightGBM path is byte-identical
+        # without it.
+        mean_tc = float("nan")
+        if model == "icir":
+            mean_tc, n_tc = _transfer_coefficient(window_pred, w)
+            logger.info("transfer_coefficient mean=%.3f n=%d", mean_tc, n_tc)
 
         charges = pd.Series(
             [
@@ -351,7 +398,10 @@ class EvaluationOperator:
         bench = self._benchmark(str(start), str(end))
         r_net = costs_mod.net_return(w, y_tilde, bench, charges,
                                      delta=int(theta.execution.delta))
-        return strategy_metrics(w, w_drift, r_net, charges, theta)
+        metrics = strategy_metrics(w, w_drift, r_net, charges, theta)
+        if model == "icir":
+            metrics["transfer_coefficient"] = mean_tc
+        return metrics
 
 
 __all__ = ["EvaluationOperator"]

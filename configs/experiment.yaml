@@ -29,6 +29,11 @@ planning:
   allow_fallback: true
   # Planning prompts file path (relative to qlib_rd_loop directory)
   prompt_file: planning_prompts.yaml
+  # Inject the Alpha158(20) seed library as orthogonal-signal context into the
+  # LLM direction prompt (common-mode, both arms; user decision 2026-08-12).
+  # Seeds stay admitted:False and never enter the zoo -- this only steers what
+  # the generator proposes. Set false to disable without a code edit.
+  seed_in_generation: true
 
 # ============================================================
 # EXECUTION CONFIGURATION
@@ -103,6 +108,10 @@ evolution:
 
   # Cleanup on finish: true=delete trajectory pool file after experiment; false=keep for analysis
   cleanup_on_finish: false
+
+  # Learning-aware reseed (treatment arm only): rounds of NO repository growth
+  # before the search regenerates NEW, outcome-informed directions. 0 disables.
+  reseed_after_stale_rounds: 2
 
 # ============================================================
 # QUALITY GATE CONFIGURATION

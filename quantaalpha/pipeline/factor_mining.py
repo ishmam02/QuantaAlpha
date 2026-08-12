@@ -164,13 +164,17 @@ def _run_evolution_task(
     except (TypeError, ValueError):
         pass
 
-    # Resolve direction by phase
-    if phase == RoundPhase.ORIGINAL:
-        direction = directions[direction_id] if direction_id < len(directions) else None
-    elif phase == RoundPhase.MUTATION:
-        direction = directions[direction_id] if direction_id < len(directions) else None
-    else:  # CROSSOVER
-        direction = None
+    # Resolve direction by phase. Prefer the controller-attached string
+    # (task["direction"]) so a reseed-grown direction reaches the loop even
+    # though the local `directions` list was frozen at round 0; fall back to
+    # that list to keep the control arm (which seeds the controller from the
+    # same list) byte-identical.
+    direction = task.get("direction")
+    if direction is None:
+        if phase in (RoundPhase.ORIGINAL, RoundPhase.MUTATION):
+            direction = directions[direction_id] if direction_id < len(directions) else None
+        else:  # CROSSOVER
+            direction = None
 
     trajectory_id = StrategyTrajectory.generate_id(direction_id, round_idx, phase)
     parent_ids = [p.trajectory_id for p in parent_trajectories] or task.get(
@@ -422,6 +426,7 @@ def run_evolution_loop(
             max_attempts=int(planning_cfg.get("max_attempts", 5)),
             use_llm=bool(planning_cfg.get("use_llm", True)),
             allow_fallback=bool(planning_cfg.get("allow_fallback", True)),
+            seed_in_generation=bool(planning_cfg.get("seed_in_generation", True)),
         )
     elif planning_enabled:
         directions = [None] * num_directions
@@ -434,6 +439,7 @@ def run_evolution_loop(
 
     pool_save_path = Path(log_root) / "trajectory_pool.json"
     mutation_prompt_path = Path(__file__).parent / "prompts" / "evolution_prompts.yaml"
+    informed_prompt_path = Path(__file__).parent / "prompts" / "informed_planning_prompts.yaml"
 
     logger.info(f"Trajectory pool path: {pool_save_path} (fresh_start={fresh_start})")
 
@@ -458,6 +464,12 @@ def run_evolution_loop(
         if mutation_prompt_path.exists()
         else None,
         fresh_start=fresh_start,
+        reseed_after_stale_rounds=int(evolution_cfg.get("reseed_after_stale_rounds", 2) or 0),
+        directions=list(directions),
+        initial_direction=initial_direction or "",
+        informed_prompt_path=str(informed_prompt_path)
+        if informed_prompt_path.exists()
+        else None,
     )
 
     controller = EvolutionController(config)
@@ -707,6 +719,7 @@ def main(
                     max_attempts=max_attempts,
                     use_llm=use_llm,
                     allow_fallback=allow_fallback,
+                    seed_in_generation=bool(planning_cfg.get("seed_in_generation", True)),
                 )
             else:
                 directions = [direction] if direction else [None]
