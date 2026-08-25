@@ -7,8 +7,8 @@
 # REPRODUCIBILITY
 # Seeds Python + NumPy global RNG at the CLI entry point (cli.py:app).
 # The evolution operators use unseeded random.shuffle/sample/choices; this
-# makes them reproducible so the control and treatment arms explore
-# identically and differ only in the objective. Override with QA_SEED.
+# makes them reproducible so the evolution explores
+# identically. Override with QA_SEED.
 # ============================================================
 seed: 42
 
@@ -26,14 +26,18 @@ planning:
   # Use LLM to generate directions: true=call LLM; false=fallback only
   use_llm: true
   # Allow fallback when LLM fails: true=use built-in direction templates
-  allow_fallback: true
   # Planning prompts file path (relative to qlib_rd_loop directory)
   prompt_file: planning_prompts.yaml
   # Inject the Alpha158(20) seed library as orthogonal-signal context into the
-  # LLM direction prompt (common-mode, both arms; user decision 2026-08-12).
+  # LLM direction prompt (common-mode context; user decision 2026-08-12).
   # Seeds stay admitted:False and never enter the zoo -- this only steers what
   # the generator proposes. Set false to disable without a code edit.
-  seed_in_generation: true
+  # Disabled 2026-08-23: the OHLCV Alpha158 seeds anchor round-0 directions to
+  # price-volume microstructure and prime a TS_MEAN/TS_SUM formula the construct
+  # implements verbatim (operator monoculture). De-priming lets directions reach
+  # regression-residual / technical-indicator / conditional-logic / cross-sectional
+  # framings; the data-driven _market_context() still gives market context.
+  seed_in_generation: false
 
 # ============================================================
 # EXECUTION CONFIGURATION
@@ -74,7 +78,13 @@ evolution:
   # Flow: both enabled → round 0=original, 1=mutation, 2=crossover, ...
   #       mutation only → round 0=original, 1+=mutation, ...
   #       crossover only → round 0=original, 1+=crossover, ...
-  max_rounds: 5
+  # 15, not 5. factors_per_hypothesis went 3 -> 1, which cut the expected yield
+  # from 150 mined to 35 (expected_factor_count(10, 5, 5, 1)) -- about 4 admitted
+  # at the measured 12% gate pass rate, which is not a library. Restoring the
+  # budget through ROUNDS rather than directions is deliberate: rounds are where
+  # refinement happens, and the round-over-round learning test needs enough
+  # generations to show a trend at all (the current baseline is 0 of 7).
+  max_rounds: 15
 
   # Fraction of the previous phase kept as mutation parents, ranked best-first.
   #
@@ -86,11 +96,53 @@ evolution:
   #
   # 0.5 rather than something tighter because the fitness is noisy and a small
   # population collapses in diversity if only the leader breeds.
-  mutation_top_fraction: 0.5
+  #
+  # 2026-08-15: raised 0.5 -> 1.0. The intended balance (10 directions, ~5
+  # mutations vs 10 crossovers) never materialised -- the 20260815 run got
+  # 3 mutations vs 10 crossovers, because TWO cuts compound:
+  #   1. admitted parents are excluded from mutation entirely (see
+  #      admitted_push_fraction below): 10 parents - 4 admitted = 6
+  #   2. mutation_top_fraction 0.5 then halved 6 -> 3
+  # and measurement says the cut fell on the wrong operator: mutation IMPROVED
+  # on its parents (mean delta -0.278 -> -0.087, net_ir 0.72 -> 1.29) while
+  # crossover DEGRADED them (-0.087 -> -0.920, 0/10 admitted). 1.0 keeps every
+  # diagnosable parent in the refine bucket; the REFINE/ORTHOGONAL/ADMITTED-PUSH
+  # priority ordering still decides what each parent gets.
+  mutation_top_fraction: 1.0
+
+  # A fraction of ADMITTED winners also get a push-further refine instead of
+  # going to crossover only. 0.0 (the old default) meant the BEST parents were
+  # handed exclusively to crossover -- the operator measured to make them worse.
+  # 0.3 sends the top ~third of winners to the operator that compounds them,
+  # while leaving the rest as crossover stock.
+  # 0.5 -- an even split of the winners, rebalanced on measurement rather than
+  # on the assumption that recombination compounds. Per-operator output on the
+  # 20260821 run, median |rank_ic| over 130 mined factors:
+  #
+  #     mutation   n=48  0.0114   max 0.0461
+  #     original   n=54  0.0088   max 0.0464
+  #     crossover  n=28  0.0067   max 0.0192
+  #
+  # Crossover is the weakest producer on both the median and the ceiling, and at
+  # 0.3 the best parents were still going to it 7 times in 10. Note this is the
+  # only knob that moves work BETWEEN the two operators: `crossover_n` sets the
+  # crossover count AND seeds the pool mutation then draws from, so cutting it
+  # shrinks both phases rather than rebalancing them.
+  admitted_push_fraction: 0.5
 
   # Crossover: number of parents selected per crossover operation
   crossover_size: 2
   # Crossover: number of combinations per round (parallelism after crossover)
+  #
+  # 2026-08-15: cut 10 -> 5. Crossover went 0/10 with mean delta -0.920 on the
+  # 20260815 run. The prompt is now fixed (sign-align + linear blend, no bare
+  # interaction terms), so crossover is kept rather than disabled -- but at half
+  # the budget until it demonstrates a positive delta. Raise it back once it does.
+  # 10, matching num_directions, so each round crosses the full previous phase
+  # rather than a third of it. With max_rounds 15 this gives
+  # expected_factor_count(10, 10, 15, 1) = 150 mined -- the same budget the run
+  # had at factors_per_hypothesis: 3, now spent on 150 distinct hypotheses
+  # instead of 50 hypotheses paraphrased three ways.
   crossover_n: 10
 
   # Parallel execution within each evolution phase
@@ -116,14 +168,35 @@ evolution:
   top_percent_threshold: 0.3
 
   # Fresh start: true=each experiment starts with empty trajectory pool; false=load existing if available
-  fresh_start: true
-
-  # Cleanup on finish: true=delete trajectory pool file after experiment; false=keep for analysis
+  fresh_start: false   # RESUME gate2: this run's zoo was built by the
+                       # FIXED gate, so rehydrating it is not contaminating.
+                       # (Set true when starting a run whose predecessor
+                       # used a different admission rule.)
   cleanup_on_finish: false
 
-  # Learning-aware reseed (treatment arm only): rounds of NO repository growth
-  # before the search regenerates NEW, outcome-informed directions. 0 disables.
+  # Learning-aware reseed: regenerate NEW, outcome-informed directions when the
+  # repository grows too slowly. See EvolutionConfig for full semantics.
+  # Rounds of INSUFFICIENT growth (below growth_floor) before a stale reseed.
+  # 2, not 1. With ~1.2 expected admissions per round, a single below-floor
+  # round is well within normal variation; requiring two CONSECUTIVE slow rounds
+  # distinguishes a genuinely exhausted direction from ordinary noise.
   reseed_after_stale_rounds: 2
+  # A round with < this many admissions counts as stale (does not reset the
+  # counter). 2 => a 1-admission creep is still stale.
+  # 1, not 2. The floor defines what counts as a healthy round, and it was set
+  # against the OLD, looser gate. Under the research gate the measured pass rate
+  # is ~12%, so a 10-batch round yields ~1.2 admissions -- meaning a floor of 2
+  # marks almost EVERY round stale and, with reseed_after_stale_rounds: 1,
+  # reseeds directions before they are ever explored. Directions would churn
+  # every round and refinement would never accumulate any depth.
+  growth_floor: 1
+  # Scheduled immigration: inject fresh informed directions every this-many
+  # rounds regardless of growth. 0 disables.
+  # 4, not 3. Scheduled immigration is more valuable at 15 rounds than it was at
+  # 5 -- it now fires ~3 times instead of once -- but at every 3 rounds it would
+  # fire 4+ times on top of stale reseeds, and each reseed resets what a
+  # direction has learned. 4 keeps steady turnover without out-pacing refinement.
+  reseed_interval: 4
 
 # ============================================================
 # QUALITY GATE CONFIGURATION
@@ -131,7 +204,16 @@ evolution:
 # ============================================================
 quality_gate:
   # Consistency check (hypothesis–description–expression). Uses LLM to verify and correct expression if needed
-  consistency_enabled: false
+  #
+  # 2026-08-15: false -> true. This is the step-2 guard a human quant applies --
+  # does the expression actually implement the stated hypothesis, and is it free
+  # of structural/look-ahead errors. It matters more now that
+  # hypothesis_output_format demands a committed `expected_ic_sign`: a factor
+  # whose expression contradicts its own premise makes that commitment
+  # meaningless and poisons the sign-based learning signal. Costs one LLM call
+  # per factor (strict_mode stays false, so only major/critical inconsistencies
+  # reject; lesser ones are corrected in up to max_correction_attempts tries).
+  consistency_enabled: true
 
   # Complexity check: symbol length, base features count, free args ratio
   complexity_enabled: true
@@ -151,11 +233,34 @@ quality_gate:
 # ============================================================
 factor:
   # Number of factors to generate per hypothesis
-  factors_per_hypothesis: 3
+  # 1, not 3. Measured on the mined library: factors from the SAME hypothesis
+  # correlate at a median 0.628 versus 0.096 across hypotheses -- 6.6x -- and 8
+  # of 20 triples contain a pair above 0.90. A triple carries ~1.7 independent
+  # directions, not 3, and 56.7% of within-batch pairs exceed rho_bar=0.60, so
+  # batch-mates are mutually excluded from the library anyway.
+  #
+  # Throughput is roughly a wash (hypothesis generation dominates the LLM call
+  # either way). The reason is CREDIT ASSIGNMENT: at 1:1 a failed hypothesis
+  # means the IDEA failed, instead of leaving idea and construction confounded --
+  # the distinction the whole diagnosis layer exists to make.
+  #
+  # NOTE: this changes what "150 factors" means; the canonical count came from
+  # expected_factor_count(10, 10, 5, 3). Factor count is now a consequence, not
+  # a target -- the same logic that caps the library by information content.
+  factors_per_hypothesis: 1
 
   # Complexity constraints (important for preventing overfitting; keep symbol length under ~250)
   complexity:
-    symbol_length_threshold: 200
+    # 2026-08-15: 200 -> 250 to remove a prompt/config CONTRADICTION. The
+    # construction prompt tells the LLM "Symbol Length (SL) Limit: <= 250
+    # characters (STRICT LIMIT)" and .env sets
+    # FACTOR_CoSTEER_SYMBOL_LENGTH_THRESHOLD=250, while this gate rejected at
+    # 201 -- so a factor written exactly to the stated contract was thrown out.
+    # Measured on the archived libraries: 11 of 166 expressions fell in the
+    # 201-250 "told it was fine, then rejected" band. An instruction the model
+    # cannot satisfy wastes a generation round and teaches it nothing, because
+    # the rejection reason contradicts the rule it was given.
+    symbol_length_threshold: 250
     base_features_threshold: 5
     free_args_ratio_threshold: 0.5
 

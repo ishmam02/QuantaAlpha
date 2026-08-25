@@ -1,7 +1,21 @@
 qlib_factor_background: |-
   The factor is a characteristic or variable used in quant investment that can help explain the returns and risks of a portfolio or a single asset. Factors are used by investors to identify and exploit sources of excess returns, and they are central to many quantitative investment strategies.
   Each number in the factor represents a physics value to an instrument on a day.
-  User will train a model to predict the next several days return based on the factor values of the previous days.
+  A model is fitted on the factor values to predict a FORWARD RETURN, and the
+  factor is scored on how well it does that. Two properties of that target
+  decide whether a factor can score at all, and neither is optional:
+    - It is CROSS-SECTIONAL. The factor is ranked across instruments on each
+      date, and what is measured is whether that ranking orders the forward
+      return on that date. A factor that times the market as a whole but does
+      not separate instruments from each other scores nothing.
+    - The HORIZON IS MEASURED, not fixed. Each factor is scored against the
+      forward return at 1, 5 and 20 trading days, entered at the next open, and
+      the horizon at which it is strongest is the one recorded and used. A
+      mechanism that plays out over a day and one that plays out over a month
+      are both measurable; they are different effects, not better and worse
+      versions of one. The comparison across horizons is corrected for the
+      overlap between successive windows, so a slow horizon cannot score well
+      merely by being slow.
   The factor is defined in the following parts:
   1. Name: The name of the factor.
   2. Description: The description of the factor.
@@ -59,7 +73,7 @@ qlib_factor_strategy: |-
 qlib_factor_output_format: |-
   Your output should be a pandas dataframe similar to the following example information:
   <class 'pandas.core.frame.DataFrame'>
-  MultiIndex: 40914 entries, (Timestamp('2020-01-02 00:00:00'), 'SH600000') to (Timestamp('2021-12-31 00:00:00'), 'SZ300059')
+  MultiIndex: 40914 entries, (Timestamp('2018-01-02 00:00:00'), 'SH600000') to (Timestamp('2019-12-31 00:00:00'), 'SZ300059')
   Data columns (total 1 columns):
   #   Column            Non-Null Count  Dtype  
   ---  ------            --------------  -----  
@@ -75,7 +89,7 @@ qlib_factor_output_format: |-
               SZ000712      0.001298
               SZ000728      0.005330
                               ...
-  2021-12-31  SZ000750      0.000000
+  2019-12-31  SZ000750      0.000000
               SZ000776      0.002459
 
 qlib_factor_simulator: |-
@@ -145,7 +159,7 @@ qlib_factor_from_report_rich_style_description : |-
 qlib_factor_experiment_setting: |-
   | Dataset 📊 | Model 🤖    | Factors 🌟       | Data Split  🧮                                   |
   |---------|----------|---------------|-------------------------------------------------|
-  | CSI300  | LGBModel | Alpha158 Plus | Train: 2012-01-01 to 2018-12-31 <br> Valid: 2019-01-01 to 2020-12-31 <br> Test &nbsp;: 2021-01-01 to 2024-12-01 |
+  | CSI300  | LGBModel | Alpha158 Plus | Train / Valid / Test windows are fixed by the protocol and are NOT disclosed here |
 
 
 qlib_model_background: |-
@@ -236,4 +250,4 @@ qlib_model_rich_style_description: |-
 qlib_model_experiment_setting: |-
   | Dataset 📊 | Model 🤖    | Factors 🌟       | Data Split  🧮                                   |
   |---------|----------|---------------|-------------------------------------------------|
-  | CSI300  | QuantaAlpha-dev | 20 factors (Alpha158)  | Train: 2008-01-01 to 2014-12-31 <br> Valid: 2015-01-01 to 2016-12-31 <br> Test &nbsp;: 2017-01-01 to 2020-08-01 |
+  | CSI300  | QuantaAlpha-dev | 20 factors (Alpha158)  | Train / Valid / Test windows are fixed by the protocol and are NOT disclosed here |

@@ -31,6 +31,10 @@ print(f"mean IC  : {np.round(ic_mean, 4)}")
 print(f"σ_IC     : {np.round(ic_std, 4)}")
 print(f"ICIR     : {np.round(icir_expect, 4)}")
 
+def _icir_of(col):
+    return float(np.nanmean(col) / np.nanstd(col, ddof=1))
+
+
 # shrinkage=0 -> raw ICIR (no shrink): the Ding-Martin weights.
 w0, d0 = _icir_weights(ic_arr, 0.0)
 assert d0 == 0.0, "shrinkage=0 must report delta=0"
@@ -42,14 +46,22 @@ print("OK  IC/σ_IC weights: stable factor outranks the volatile one at equal me
 # shrinkage=1 -> equal weight (the high-σ_IC limit / null model).
 w1, d1 = _icir_weights(ic_arr, 1.0)
 assert d1 == 1.0
-assert np.allclose(w1, np.full(n_feats, 1.0 / n_feats)), "shrinkage=1 must equal-weight"
-print(f"shrink=1 weights: {np.round(w1, 4)}  (equal)")
-print("OK  full shrinkage collapses to equal weight 1/N")
+# The target is sign(icir)/N, NOT a positive 1/N. A uniform positive target
+# flips the sign of every factor with |icir| < d/(1-d)/N, and mined factors run
+# icir ~0.01-0.05 -- so on a reversal-dominated market the old target inverted
+# nearly every factor's contribution (measured: combiner rank IC -0.0063 vs
+# +0.0319 for a sign-aligned equal weight). This test asserted the pre-fix
+# behaviour; the sign-preserving target is the intended one.
+signs = np.sign([_icir_of(ic_arr[:, j]) for j in range(n_feats)])
+assert np.allclose(w1, signs / n_feats), \
+    f"shrinkage=1 must equal-weight WITH SIGN: got {w1}, want {signs / n_feats}"
+print(f"shrink=1 weights: {np.round(w1, 4)}  (sign-preserving equal)")
+print("OK  full shrinkage collapses to sign(icir)/N, keeping each factor's direction")
 
 # auto -> Ledoit-Wolf δ in [0,1], weights between raw ICIR and equal.
 wa, da = _icir_weights(ic_arr, "auto")
 assert 0.0 <= da <= 1.0, "auto delta must be a valid intensity"
-equal = np.full(n_feats, 1.0 / n_feats)
+equal = signs / n_feats          # the sign-preserving target, as above
 expected_auto = (1.0 - da) * icir_expect + da * equal
 assert np.allclose(wa, expected_auto, atol=1e-6), "auto must be (1-δ)·ICIR + δ·equal"
 # Each weight lies between its raw-ICIR and equal-weight endpoints.
@@ -103,7 +115,7 @@ def seed_preds(shrink):
     out = []
     for s in [42, 1, 7, 13, 29]:
         t = icir_theta([s], shrink)
-        out.append(_fit_predict_icir(features, features, y, t, panel).to_numpy())
+        out.append(_fit_predict_icir(features, features, y, t, panel)[0].to_numpy())
     return out
 
 # δ=0: raw ICIR -> bootstrap resamples the dates, so the 5 seeds differ.
@@ -114,17 +126,30 @@ assert not np.allclose(p_raw[0], p_raw[1]), "δ=0: different seeds must give dif
 assert se_raw > 0.0, "δ=0: bootstrap must produce positive seed variance"
 print("OK  raw ICIR: 5 bootstrap seeds give se > 0 (honest σ_IC)")
 
-# δ=1: equal weight -> weights are constant, so the bootstrap cannot move them;
-# the admission gate would see se=0 (the LightGBM-failure mode, here by design).
+# δ=1: the target is sign(icir)/N, and that SIGN is estimated from the same
+# bootstrap-resampled IC array. So full shrinkage no longer produces a constant
+# weight vector: a factor whose ICIR sits near zero can flip direction between
+# seeds, and the prediction moves with it.
+#
+# This is a repair, not a regression. Under the old positive 1/N target the
+# weights were seed-independent, the 5-seed admission gate measured se=0, and
+# the variance test was INERT -- it could not distinguish a stable factor from
+# one whose direction was a coin flip. Now that instability is visible, which is
+# the entire purpose of testing on 5 seeds.
 p_eq = seed_preds(1.0)
-se_eq = float(np.std([p.mean() for p in p_eq], ddof=1))
-print(f"δ=1 per-seed mean pred: {[round(float(p.mean()), 6) for p in p_eq]}  se={se_eq:.2e}")
-assert np.allclose(p_eq[0], p_eq[1]), "δ=1: equal weight must make seeds identical"
-assert se_eq < 1e-12, "δ=1: equal weight must zero the seed variance (to FP noise)"
-print("OK  full shrinkage: equal weight zeros bootstrap variance (sanity)")
+means = [float(p.mean()) for p in p_eq]
+se_eq = float(np.std(means, ddof=1))
+print(f"δ=1 per-seed mean pred: {[round(m, 6) for m in means]}  se={se_eq:.2e}")
+assert se_eq > 0.0, "δ=1: an ESTIMATED sign target must still carry seed variance"
+# The spread is discrete, not continuous: seeds cluster into a small number of
+# groups, one per sign assignment. Continuous jitter would mean something else.
+groups = len({round(m, 9) for m in means})
+assert 1 < groups <= len(means), f"δ=1: expected sign-flip clustering, saw {groups} distinct means"
+print(f"OK  full shrinkage: {groups} distinct seed outcomes -- the sign of a "
+      "near-zero-ICIR factor flips between bootstrap draws, and the gate now sees it")
 
 # The returned frame is wide T×N, aligned to the panel, masked by universe.
-pred = _fit_predict_icir(features, features, y, icir_theta([42], "auto"), panel)
+pred = _fit_predict_icir(features, features, y, icir_theta([42], "auto"), panel)[0]
 assert pred.shape == (len(dates), len(inst)), f"wide shape {pred.shape}"
 assert (pred.index == panel.dates).all() and (pred.columns == panel.instruments).all()
 assert pred.notna().any().any(), "prediction must not be entirely NaN"

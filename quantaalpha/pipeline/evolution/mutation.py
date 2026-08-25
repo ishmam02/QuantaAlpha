@@ -120,7 +120,7 @@ class MutationOperator:
             parent_metrics = "N/A"
 
         # Whether the parent was admitted, and if not, which gate it missed.
-        # Empty string under the control arm, so Arm A's prompt is unchanged.
+        # Empty string when there is no objective vector to refine on.
         objective_note = format_objective_note(parent)
         if objective_note:
             parent_metrics = f"{objective_note}\n{parent_metrics}"
@@ -160,14 +160,20 @@ class MutationOperator:
             return result
             
         except Exception as e:
-            logger.error(f"Mutation generation failed: {e}")
-            # Return fallback
-            return {
-                "new_hypothesis": self._generate_fallback_hypothesis(parent),
-                "exploration_direction": "Fallback strategy: exploring opposite direction",
-                "orthogonality_reason": "Using fallback strategy due to generation failure",
-                "expected_characteristics": "May produce factors negatively correlated with parent"
-            }
+            # A failed call yields NOTHING, by design. This used to substitute a
+            # canned hypothesis -- one of six hardcoded strategy ideas, or a
+            # rule that answered "momentum" with "mean reversion" -- which then
+            # entered the search indistinguishable from a reasoned proposal.
+            # Those are exactly the stale, market-specific priors the system is
+            # forbidden to inject: a mined result built on one would be crediting
+            # the search with an answer it was handed. An empty slot is honest;
+            # a canned one is a silent prior. The caller skips on {}.
+            logger.error(
+                f"Mutation generation failed for parent {parent.trajectory_id} "
+                f"({e}) -- skipping this slot rather than substituting a canned "
+                f"hypothesis"
+            )
+            return {}
     
     def _parse_detailed_response(self, response: str) -> dict[str, str]:
         """Parse JSON response from LLM."""
@@ -193,40 +199,35 @@ class MutationOperator:
             return {
                 "new_hypothesis": data.get("new_hypothesis", ""),
                 "exploration_direction": data.get("exploration_direction", ""),
-                "orthogonality_reason": data.get("orthogonality_reason", ""),
+                # 2026-08-15: the prompt no longer asks the model to justify
+                # ORTHOGONALITY (chasing difference for its own sake is not how
+                # the search is scored -- redundancy is measured and enforced at
+                # admission). It now asks what the parent's MEASUREMENT
+                # established and how that led to the next hypothesis. Both new
+                # keys fall back to the old one so trajectories written by the
+                # previous schema still read cleanly.
+                "parent_reading": data.get(
+                    "parent_reading", data.get("orthogonality_reason", "")),
+                "evidence_link": data.get(
+                    "evidence_link", data.get("orthogonality_reason", "")),
                 "expected_characteristics": data.get("expected_characteristics", "")
             }
         except json.JSONDecodeError:
             # If JSON parsing fails, treat entire response as hypothesis
             return {"new_hypothesis": response.strip()}
     
-    def _generate_fallback_hypothesis(self, parent: StrategyTrajectory) -> str:
-        """Generate a fallback hypothesis when LLM fails."""
-        parent_hypo = parent.hypothesis.lower() if parent.hypothesis else ""
-        
-        # Get fallback templates from prompts
-        fallback_templates = self.prompts.get("fallback_templates", [
-            "Explore mean reversion characteristics opposite to price momentum",
-            "Study nonlinear relationships between volume and price",
-            "Analyze trend transition signals across cycles",
-            "Mine liquidity features in market microstructure",
-            "Build factors based on volatility regime switching",
-            "Explore the relationship between sector rotation and individual stock alpha",
-        ])
-        
-        # Select based on parent content
-        if "momentum" in parent_hypo:
-            return "Explore mean reversion characteristics: patterns when price reverts to historical mean"
-        elif "mean reversion" in parent_hypo or "reversion" in parent_hypo:
-            return "Explore trend following characteristics: identify and follow medium-to-long term price trends"
-        elif "volume" in parent_hypo:
-            return "Explore price patterns: technical features purely based on price sequences"
-        elif "volatility" in parent_hypo:
-            return "Explore liquidity features: factors based on bid-ask spread and order flow"
-        else:
-            import random
-            return random.choice(fallback_templates)
-    
+    # ``_generate_fallback_hypothesis`` was REMOVED 2026-08-15.
+    #
+    # It answered a failed LLM call with a canned strategy idea: a keyword rule
+    # ("momentum" -> "explore mean reversion", "volume" -> "explore price
+    # patterns") over a list of six hardcoded directions, falling through to
+    # ``random.choice``. Every one of those is a market prior chosen by the
+    # author, and none of them is measured. Injected into the search they are
+    # indistinguishable from a hypothesis the system reasoned its way to, so any
+    # factor descended from one would credit the search with an answer it was
+    # given. Failures now skip the slot instead -- see ``generate_mutation``.
+
+
     def generate_mutation_prompt_suffix(self, parent: StrategyTrajectory) -> str:
         """
         Generate a prompt suffix to be appended to the hypothesis generator.
@@ -240,15 +241,28 @@ class MutationOperator:
             Prompt suffix string
         """
         mutation_result = self.generate_mutation(parent, use_detailed_prompt=True)
-        
+
+        # An empty result means the LLM call failed and NOTHING was substituted
+        # (the canned-hypothesis fallback was removed). Return an empty suffix so
+        # the caller emits the base prompt rather than a guidance block whose
+        # every field is blank -- an empty "Proposed next hypothesis:" heading
+        # reads as an instruction to invent one, which is the trapdoor again.
+        if not mutation_result.get("new_hypothesis"):
+            logger.warning(
+                f"no mutation guidance for parent {parent.trajectory_id}; "
+                f"emitting the base prompt with no mutation block"
+            )
+            return ""
+
         # Use template from prompts if available
         suffix_template = self.prompts.get("suffix_template")
         if suffix_template:
             return suffix_template.format(
                 parent_summary=parent.to_summary_text(),
+                parent_reading=mutation_result.get('parent_reading', ''),
                 new_hypothesis=mutation_result.get('new_hypothesis', 'Explore new direction'),
                 exploration_direction=mutation_result.get('exploration_direction', ''),
-                orthogonality_reason=mutation_result.get('orthogonality_reason', '')
+                evidence_link=mutation_result.get('evidence_link', ''),
             )
         
         # Default suffix (English)
@@ -258,21 +272,26 @@ class MutationOperator:
 
 ## Mutation Round Guidance
 
-This is a mutation exploration round that requires generating an orthogonal new strategy based on the parent strategy.
+An earlier hypothesis has been measured. This round proposes what to test next.
 
 ### Parent Strategy Summary
 {parent.to_summary_text()}
 
-### Mutation Direction Suggestions
-- **New Hypothesis Direction**: {mutation_result.get('new_hypothesis', 'Explore new direction')}
+### What the parent's measurement establishes
+{mutation_result.get('parent_reading', '')}
+
+### Proposed next hypothesis
+- **Hypothesis**: {mutation_result.get('new_hypothesis', 'Explore new direction')}
 - **Exploration Dimension**: {mutation_result.get('exploration_direction', '')}
-- **Orthogonality Reasoning**: {mutation_result.get('orthogonality_reason', '')}
+- **How the parent's evidence led here**: {mutation_result.get('evidence_link', '')}
 
-### Important Notes
-1. Your new hypothesis must be orthogonal to the parent strategy to avoid repeated exploration
-2. Prioritize exploring data dimensions and market patterns not covered by the parent
-3. Generated factors should have low correlation with parent factors
+### What this round is scored on
+1. The marginal contribution of the resulting factors to the existing book, net
+   of trading cost. A premise the book already expresses contributes nothing
+   measurable, however sound it is.
+2. Redundancy against the book is measured separately and enforced at admission,
+   so being different from the parent is not itself worth anything.
 
-Please propose your new hypothesis based on the above mutation guidance.
+Resemblance to the parent is an outcome of your reasoning, not a target.
 """
         return suffix

@@ -71,26 +71,30 @@ def _traj(did: int, rnd: int, metrics: dict, factors=None) -> StrategyTrajectory
     )
 
 
-def test_v1_control_arm_is_noop():
-    """No U on any trajectory => reseed never fires, zoo context empty."""
+def test_v1_no_repository_data_is_noop():
+    """No repository size available => reseed never fires, zoo context empty.
+
+    This case used to be phrased as "the control arm is a no-op", gated on a
+    `_has_treatment_data()` check. The A/B framework was removed, so there is
+    no control arm and that method is gone -- but the invariant it protected
+    still matters and still holds: before any admission has been recorded there
+    is nothing to reseed FROM, and firing anyway would replace the starting
+    directions with directions informed by no outcomes at all.
+    """
     cfg = _cfg(num_directions=2, directions=["c0", "c1"])
     ctl = EvolutionController(cfg)
-    # Control-arm trajectories carry only RankIC -- no U, no `admitted`.
+    # Trajectories carrying no U and no `admitted` -- the early-run state.
     ctl.pool.add(_traj(0, 0, {"RankIC": 0.31}))
     ctl.pool.add(_traj(1, 0, {"RankIC": 0.27}))
 
-    assert ctl._has_treatment_data() is False
-    # Even with a stuck repository size, the data-availability gate fires first
-    # and the stale counter never moves.
-    with mock.patch.object(ctl, "_zoo_size", return_value=5):
-        ctl._best_zoo_size = 5
+    with mock.patch.object(ctl, "_zoo_size", return_value=None):
         for _ in range(4):
             assert ctl._reseed_if_stale() is False
     assert ctl._stale_rounds == 0
     assert ctl._directions == ["c0", "c1"]
     assert ctl._current_phase == RoundPhase.ORIGINAL
     assert ctl._build_zoo_context() == ""
-    print("OK  V1: control arm is a no-op (gate on U presence, not the env)")
+    print("OK  V1: no repository data is a no-op (gate on data presence)")
 
 
 def test_v2_grow_and_mark_saturated():
@@ -217,7 +221,7 @@ def test_v5_informed_directions_parse_and_no_fallback():
     with mock.patch("quantaalpha.pipeline.planning.APIBackend", fake_ok):
         out = generate_informed_directions(
             initial_direction="explore momentum", n=3, prompt_file=prompt,
-            history_summary="dir0: redundant", use_llm=True, allow_fallback=False)
+            history_summary="dir0: redundant", use_llm=True)
     assert out == ["alphaA", "alphaB", "alphaC"]
 
     fake_bad = mock.MagicMock()
@@ -225,10 +229,12 @@ def test_v5_informed_directions_parse_and_no_fallback():
     with mock.patch("quantaalpha.pipeline.planning.APIBackend", fake_bad):
         out = generate_informed_directions(
             initial_direction="explore momentum", n=3, prompt_file=prompt,
-            history_summary="dir0: redundant", use_llm=True,
-            allow_fallback=False, max_attempts=1)
-    assert out == []  # no canned directions injected on failure
-    print("OK  V5: informed directions parse; allow_fallback=False => [] on failure")
+            history_summary="dir0: redundant", max_attempts=1, use_llm=True)
+    # The `allow_fallback` flag is gone because the canned fallback directions it
+    # guarded were deleted outright: a hardcoded hypothesis injected on parse
+    # failure is a market prior the system did not mine. [] is now unconditional.
+    assert out == []
+    print("OK  V5: informed directions parse; a parse failure yields [] with no canned directions")
 
 
 def test_v6_reseed_fires_through_real_get_next_task():
@@ -265,6 +271,12 @@ def test_v6_reseed_fires_through_real_get_next_task():
     ctl._mutation_targets, ctl._mutation_idx = [], 0
     ctl._current_round = 3
     ctl._best_zoo_size = 5
+    # A controller that has already taken its growth baseline, which is what a
+    # real run looks like by round 3. Leaving this at its -1 init makes the
+    # first check spend itself establishing the baseline (deliberate: it stops a
+    # resumed run reading a spurious +1 of growth and masking a stall already in
+    # progress), so the reseed would fire one round later than this case asserts.
+    ctl._zoo_size_at_last_check = 5
     ctl._stale_rounds = 1
     with mock.patch.object(ctl, "_zoo_size", return_value=5), \
          mock.patch.object(ctl, "_generate_informed_directions",
@@ -285,7 +297,7 @@ def test_v6_reseed_fires_through_real_get_next_task():
 
 
 if __name__ == "__main__":
-    test_v1_control_arm_is_noop()
+    test_v1_no_repository_data_is_noop()
     test_v2_grow_and_mark_saturated()
     test_v3_sequential_transitions_divert_on_reseed()
     test_v4_extraction_surfaces_admitted_verdict()

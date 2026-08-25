@@ -19,7 +19,8 @@ hypothesis_and_feedback: |-
 hypothesis_output_format: |-
   The output should follow JSON format. Do not add any other text in your response. The schema is as follows:
   {
-  "hypothesis": "A SINGLE LINE OF TEXT. The new hypothesis generated based on the information provided.",
+  "hypothesis": "A SINGLE LINE OF TEXT. The new hypothesis generated based on the information provided. It MUST state a DIRECTION -- say explicitly whether a HIGH factor value predicts HIGHER or LOWER forward returns. 'X measures buying pressure' is not a hypothesis; 'a high X predicts LOWER forward returns because ...' is.",
+  "expected_ic_sign": "EXACTLY ONE of: \"positive\" or \"negative\". The sign of the cross-sectional IC you predict between this factor and forward returns. This is a COMMITMENT that will be checked against the realized RankIC: if you say positive and the measurement comes back negative, the hypothesis was directionally WRONG and the next round must revise the premise rather than restate it. Do not hedge -- an unfalsifiable hypothesis teaches the search nothing.",
   "concise_knowledge": "A SINGLE LINE OF TEXT. Transferable knowledge based on theoretical principles. Use conditional grammar. eg. 'If...., ..; When..., .; and etc' Make sure that you state things clearly without ambiguity. Eg. avoid saying 'previous hypothesis', because one wouldn't know what that is.",
   "concise_observation": "A SINGLE LINE OF TEXT. It focuses on the observation of the given scenario, data characteristics, or previous experiences (failures & succeses).",
   "concise_justification": "A SINGLE LINE OF TEXT. Justify the hypothesis based on theoretical principles or initial assumptions.",
@@ -31,17 +32,40 @@ factor_hypothesis_specification: |-
   1. **Data-Driven Hypothesis Formation:**  
     - Ground hypotheses within the scope of available data for seamless testing.
     - Align hypotheses with the temporal, cross-sectional, and distributional properties of the data.
-    - Avoid overfitting by focusing on robust, economically intuitive, and innovative relationships. 
+    - State the economic or structural mechanism the hypothesis rests on, so that
+      it can be shown false. Whether a mechanism is intuitive is not evidence
+      either way.
 
   2. **Justification of the Hypothesis:**  
-    - Use observed market patterns to creatively infer underlying economic or behavioral drivers.
-    - Build on empirical evidence while exploring innovative connections or untested relationships.
-    - Propose actionable insights that challenge conventional assumptions, yet remain testable.
-    - Emphasize the factor's potential to uncover unique, predictive market behaviors.
+    - Infer the driver from observed market structure, and say what would have to
+      be true of participants or constraints for it to hold.
+    - Whether the proposed driver agrees with or contradicts conventional
+      thinking is not itself an argument in either direction.
 
-  3. **Continuous Optimization and Exploration:**  
-      - Refine the first hypothesis iteratively by testing across different variants. 
-      - Incorporate feedback from empirical results to enhance the factor's predictive power.
+  3. **Use of prior rounds:**
+      - Realized results from earlier rounds are supplied as feedback when they
+        exist. Read them as evidence about the market, not as a template to
+        vary: producing variants of a prior hypothesis is one option among
+        others, and the measurement is what decides whether it was the right
+        one.
+
+  4. **Knowledge cutoff (STRICT — overrides everything above):**
+      - The research window you are mining is stated in the direction/market
+        context you were given. Reason as a researcher whose knowledge ENDS at
+        that window's end date.
+      - This is a cutoff on KNOWLEDGE, not just on data. Do not use: events
+        after that date; factor ideas or anomalies first published, popularized
+        or widely adopted after it; knowledge of how this market's
+        microstructure, participant mix, liquidity or momentum/reversal
+        behaviour EVOLVED later; or knowledge of which factors later decayed or
+        became crowded.
+      - Never justify a hypothesis with hindsight ("this later proved", "it is
+        now known", "in subsequent years"). If a justification only makes sense
+        to someone who lived past the window end, it is disallowed — argue it
+        instead from evidence available inside the window.
+      - Rationale: the factor is selected on data AFTER that window. A
+        hypothesis seeded by later knowledge scores well there for the wrong
+        reason and fails in live trading, which defeats the entire experiment.
 
 
 function_lib_description: |-
@@ -136,22 +160,23 @@ factor_experiment_output_format: |-
           "variables": {
               "variable or function name 1": "description of variable or function 1",
               "variable or function name 2": "description of variable or function 2"
-          }
+          },
           "formulation": "A LaTeX formula of factor 1",
           "expression": "An expression of factor 1, based on functions and variable mentioned",
       },
-      "factor name 2": {
+  {% if factors_per_hypothesis > 1 %}    "factor name 2": {
           "description": "description of factor 2",
           "variables": {
               "variable or function name 1": "description of variable or function 1",
               "variable or function name 2": "description of variable or function 2"
-          }
+          },
           "formulation": "A LaTeX formula of factor 2",
           "expression": "An expression of factor 2, based on functions and variable mentioned",
       }
-      # Don't add ellipsis (...) or any filler text that might cause JSON parsing errors here!
+  {% endif %}    # Don't add ellipsis (...) or any filler text that might cause JSON parsing errors here!
+      # Return EXACTLY {{ factors_per_hypothesis }} top-level key{{ "s" if factors_per_hypothesis != 1 else "" }}, no more and no fewer.
   }
-
+  
   Here is an example:
   {
       "Normalized_Intraday_Range_Factor_10D": {
@@ -161,22 +186,22 @@ factor_experiment_output_format: |-
               "$open": "Open price of the stock on that day.",
               "ABS(A)": "Absolute value of A.",
               "TS_STD(A, n)": "Standard deviation of sequence A over the past n days."
-          }
+          },
           "formulation": "NIR_\\text{10D} = \\frac{\\text{ABS}(\\text{close} - \\text{open})}{\\text{STD}(\\text{close}, 10)}",
           "expression": "ABS($close - $open) / (TS_STD($close, 10) + 1e-8)",
-      },
-      "Volume_Range_Correlation_Factor_20D": {
+      }{% if factors_per_hypothesis > 1 %},
+    "Volume_Range_Correlation_Factor_20D": {
           "description": "This factor measures the correlation between the candlestick range (high - low) and the trading volume over a 20-day period, aiming to capture the relationship between price range and market participation.",
           "variables": {
               "$high": "High price of the stock on that day.",
               "$low": "Low price of the stock on that day.",
               "$volume": "Volume of the stock on that day.",
               "TS_CORR(A, B, n)": "Correlation coefficient between sequences A and B over the past n days."
-          }
+          },
           "formulation": "VRC_\\text{20D} = \\text{TS_CORR}(\\text{high} - \\text{low}, \\text{volume}, 20)",
           "expression": "TS_CORR($high - $low, $volume, 20)",
       }
-  }
+  {% endif %}}
 
 factor_feedback_generation:
   system: |-
@@ -290,7 +315,6 @@ factor_feedback_generation:
 
     Note: Only factors with 'Factor Implementation' as True are implemented and tested in this experiment. If 'Factor Implementation' is False, the hypothesis for that factor cannot be verified in this run.
 
-
 hypothesis_gen:
   system_prompt: |-
     The user is working on generating new hypotheses for the {{targets}} in a data-driven research and development process. 
@@ -335,74 +359,62 @@ hypothesis2experiment:
     5. Some additional information to help you generate new {{targets}}.
 
 
-    1. **2-3 Factors per Generation:**
-      - Ensure each generation produces 2-3 factors.
-      - Balance simplicity and innovation to build a robust factor library.
+    1. **{{ factors_per_hypothesis }} Factor{{ "s" if factors_per_hypothesis != 1 else "" }} per Generation:**
+      - Ensure each generation produces exactly {{ factors_per_hypothesis }} factor{{ "s" if factors_per_hypothesis != 1 else "" }}.
       - Note that each factor is independent. Please do NOT reference other factors within the factor expression.
 
     2. **CRITICAL: Factor Complexity Constraints (MUST FOLLOW - OVERFITTING PREVENTION):**
       - **Symbol Length (SL) Limit: ≤ 250 characters (STRICT LIMIT)**
         - Factor expressions MUST NOT exceed 250 characters. This is a HARD LIMIT.
         - **WARNING: Overly complex/long expressions (> 250 chars) are highly prone to OVERFITTING.** They may perform well on training data but fail catastrophically on test data.
-        - **Simple factors generalize better.** A concise factor with moderate performance is FAR more valuable than a complex one with high training performance but poor test performance.
-        - Example of GOOD (short, ~50 chars): `RANK(TS_MEAN($return, 20))`
-        - Example of GOOD (moderate, ~100 chars): `RANK(TS_CORR($close, $volume, 10)) * SIGN(TS_MEAN($return, 5))`
-        - Example of BAD (too long, > 250 chars): `RANK(POW(TS_CORR($close, SEQUENCE(15), 15), 2)) * RANK(TS_MEAN(($high - $low) / ($volume + 1e-8), 15)) * ...`
+        - The limit exists because training-window performance and held-out
+          performance come apart as expression size grows: a longer expression
+          has more ways to fit the training window specifically. The score that
+          decides admission is measured out-of-sample, so training performance
+          bought with length does not survive to it.
+        - The limit is on LENGTH. No example expressions are given here: an
+          expression shown as "GOOD" is a factor idea, and the search would be
+          credited with an answer it was handed rather than one it found.
       - **Base Features (ER) Limit: ≤ 6 distinct raw features**
-        - Use at most 6 distinct base features (e.g., $close, $open, $high, $low, $volume, $return).
+        - Use at most 6 distinct base features from: $close, $open, $high, $low, $volume, $return, $vwap.
         - Reusing the same feature multiple times is acceptable, but using too many different features indicates over-engineering.
-        - Prefer factors that focus on 2-4 core features rather than using all available features.
-      - **Simplicity Priority (ANTI-OVERFITTING):**
-        - **ALWAYS prioritize simplicity over complexity.** A simple factor that works is FAR better than a complex one.
-        - **Complex factors with many nested functions, conditional branches, and parameters are OVERFITTING indicators.**
-        - Avoid deep nesting (e.g., RANK(POW(TS_CORR(...))) is too nested)
-        - Avoid complex conditional expressions (e.g., (A > B) ? (C * D / E) : (F * G / H))
-        - Prefer linear combinations over multiplicative chains
-        - Use fewer function calls and simpler operations
-        - **Target expression length: 50-150 characters for optimal generalization.**
-      - **If previous factors were flagged for complexity, you MUST generate MUCH simpler alternatives in the next iteration.**
+        - This is a bound, not a target: use as many of the six as the mechanism
+          you are testing requires, and no more than the limit allows.
+      - **Free-Parameter Budget (why the two limits above exist):**
+        - Every window size, exponent, threshold and coefficient you choose is a
+          free parameter fitted to the training window. The measured quantity is
+          the RATIO of free parameters to expression size; the checker flags an
+          expression whose ratio exceeds **0.5**.
+        - The reason is arithmetic, not stylistic: each additional free parameter
+          is another degree of freedom that can absorb training noise, and this
+          search runs hundreds of trials, so a form flexible enough to fit noise
+          will find some. That is what the length and feature limits above
+          bound.
+        - Spend that budget wherever the mechanism you are testing actually
+          needs it. WHICH form uses it best -- nesting, products, sums,
+          conditionals, or something else -- is your judgement and is what the
+          measurement is there to settle. No form is preferred here.
+      - **If previous factors were flagged for complexity, the flag reports which
+        limit was exceeded and by how much; how to come back under it is yours to
+        determine.**
 
-    3.**Key Considerations in Factor Construction:**
-      - **Data Preprocessing and Standardization:**
-          - Avoid using raw prices and volumes directly due to scale differences
-          - Use relative changes or standardized data (e.g., RANK(), ZSCORE())
-          - Convert prices to returns, e.g. `(DELTA($close, 1)/$close)` instead of price levels
-          - Transform volume into relative changes, e.g. `(DELTA($volume, 1)/$volume)`
+    3.**Mechanics you need to know (these are facts about the executor, not advice):**
+      - Add a small constant (e.g. 1e-8) to any denominator; a zero divisor
+        produces inf/NaN and the factor is dropped before it is scored.
+      - Correlation and rank operators need enough points in their window to be
+        defined at all.
+      - Each factor is evaluated independently. A factor expression cannot
+        reference another factor.
+      - Undeclared variables and functions are a syntax error.
 
-      - **Time Series Processing:**
-          - Consider appropriate sample periods for indicators requiring historical data
-          - Choose suitable window sizes for moving averages SMA(), EMA(), WMA()
-
-      - **Normalization and Stability:**
-          - Add small constants (e.g., 1e-8) to denominators to prevent division by zero
-          - Use TS_ZSCORE() for factor value standardization
-          - Consider SIGN() to reduce impact of extreme values
-          - Apply MAX(MIN(x, upper), lower) for value truncation
-
-      - **Cross-sectional Treatment:**
-          - Apply RANK() or ZSCORE() for cross-sectional comparability
-          - Use FILTER() for outlier handling
-          - Ensure sufficient window length for correlation calculations
-
-      - **Robustness Considerations:**
-          - Validate factor stability across multiple time windows
-          - Consider TS_MEDIAN() over TS_MEAN() to reduce outlier impact
-          - Apply moving averages to smooth high-frequency variations
-  
-      - **Flexibility Considerations:**  
-          - Allow for a range of values or flexibility when defining factors, rather than imposing strict equality constraints.
-          - For example, in expression `(TS_MIN($low, 10) == DELAY(TS_MIN($low, 10), 1))`, `==` is too restrictive. 
-          - Instead, use a range-based approach like: `(TS_MIN($low, 10) < DELAY(TS_MIN($low, 10), 1) + 1/10 * TS_STD($low, 20)) && (TS_MIN($low, 10) > DELAY(TS_MIN($low, 10), 1) - 1/10 * TS_STD($low, 20))`.
-
-      - **Handling Duplicated Sub-expressions:**
-            - When given specific duplicated sub-expressions to avoid, ensure new factor expressions use alternative calculations
-            - Replace duplicated patterns with semantically similar but structurally different expressions
-            - For example, if `ABS($close - $open)` is flagged as duplicated:
-                - Consider using `($high - $low)` for price range
-                - Use `SIGN($close - $open) * ($close - $open)` for directional magnitude
-                - Explore other price difference combinations like `($high - $low) / ($open + $close)`
-            - Maintain factor interpretability while avoiding structural repetition
-            - Focus on unique combinations of operators and variables to ensure originality
+      Everything else about HOW to construct the expression -- which operators,
+      whether to standardise, whether to smooth, how to handle outliers, what
+      to do about a flagged duplicate -- is yours to determine. This section
+      used to recommend specific operators for specific purposes and show worked
+      substitutions. That is removed deliberately: those recommendations are the
+      author's priors, and once followed they are indistinguishable from
+      something the search reasoned to, which is what the measurement exists to
+      establish.
 
     Please generate the output following the format below:
     {{ experiment_output_format }}
@@ -424,6 +436,10 @@ hypothesis2experiment:
     - $low: low price of the stock on that day.
     - $volume: volume of the stock on that day.
     - $return: daily return of the stock on that day.
+    - $vwap: volume-weighted average price for the day -- the price at which the
+      day's volume actually transacted, as opposed to the open/close endpoints.
+      Where the close sits relative to $vwap says whether the session's flow was
+      accumulating or distributing into the close.
 
     Allowed operators and functions in factor expressions are: 
     {{function_lib_description}}
@@ -433,11 +449,18 @@ hypothesis2experiment:
     **Alert: Duplication Detected in Previous Factor Expressions**
     {{ expression_duplication }}
 
-    Recommendations:
-    - Avoid the duplicated sub-expressions above
-    - Generate novel factor by uniquely combining data variables and operations
-    - Experiment with a mix of mathematical operations (e.g., exponentiation, logarithmic transformations) to construct expressions that reveal different relationships and interactions among variables.
-    - Replace raw variables with transformed variants to enhance expressiveness, such as using `$open`, `$close/TS_MEAN($close, 10)`, or `($open + $close) / 2` instead of `$close` to normalize or adjust for trends.
+    What the check measured is stated above: which sub-expression duplicated
+    what, and by how much it exceeded the threshold. A factor that repeats a
+    construction the repository already holds adds no information the book does
+    not already carry, which is why the gate rejected it.
+
+    No remedy is prescribed here, and no example expression is given. An
+    operator or transform named here as "how to be novel" would be a
+    construction the search was handed rather than one it reasoned its way to,
+    and it would be selected disproportionately for that reason alone -- which
+    is measurable: TS_MEAN held 64-83% of the window-summarizer slot across
+    every mine on record. What to change so the construction clears the gate is
+    yours to determine.
     {% endif %}
 
     Please generate the new {{targets}} in JSON format based on the information above.
@@ -454,28 +477,31 @@ expression_duplication: |-
   {% if free_args_ratio >= 0.5 %}
   - Parsimony Check Failed: Free arguments ratio ({{ "%.2f"|format(free_args_ratio * 100) }}%) >= 50%
     - Number of free args: {{ num_free_args }}, Total nodes: {{ num_all_nodes }}
-    - This indicates the factor is over-parameterized. Please reduce the number of free parameters.
+    - The gate measures free arguments as a fraction of total nodes. A factor
+      with many free parameters has more ways to fit the training window
+      specifically, and admission is scored out of sample. What to change so
+      the construction clears it is yours to determine.
   {% endif %}
   {% if unique_vars_ratio >= 0.5 %}
   - Diversity Check Failed: Unique variables ratio ({{ "%.2f"|format(unique_vars_ratio * 100) }}%) >= 50%
     - Number of unique vars: {{ num_unique_vars }}, Total nodes: {{ num_all_nodes }}
-    - This indicates the factor lacks diversity. Please use more repeated variables or operators.
+    - The gate measures the ratio of distinct variables to total nodes. What to
+      change so the construction clears it is your judgement.
   {% endif %}
   {% if symbol_length > symbol_length_threshold %}
   - **Symbol Length (SL) Check FAILED: Expression length ({{ symbol_length }}) exceeds HARD LIMIT ({{ symbol_length_threshold }} characters)**
-    - **🚨 OVERFITTING ALERT**: This factor expression is TOO COMPLEX and will almost certainly OVERFIT.
-    - **Root Cause**: Complex expressions with many nested functions, conditional branches, and parameters fit noise in training data rather than true market patterns.
-    - **Action Required**: Generate a FUNDAMENTALLY SIMPLER expression. Do NOT just remove a few characters - redesign the factor from scratch.
-    - **Target Length**: 50-150 characters for optimal generalization. Anything over 200 is suspicious.
-    - **Example of GOOD** (~50 chars): `RANK(TS_MEAN($return, 20))`
-    - **Example of ACCEPTABLE** (~100 chars): `RANK(TS_CORR($close, $volume, 10)) * SIGN(TS_MEAN($return, 5))`
-    - **Example of BAD** (> 200 chars): Any expression with multiple nested functions, complex conditionals, or many arithmetic operations.
-    - **REMEMBER**: A simple factor with IC=0.03 that generalizes is FAR more valuable than a complex factor with IC=0.06 that overfits.
+    - The factor was rejected before evaluation. The threshold is the number
+      stated above; there is no second target length, and no example expression
+      is given here -- one shown as "good" is a factor idea, and a factor built
+      from it would credit the search with something it was handed.
+    - Why the limit exists: expression size and out-of-sample performance come
+      apart, because a longer expression has more ways to fit the training
+      window specifically, and admission is scored out of sample. How to bring
+      the construction under the threshold is your judgement.
   {% endif %}
   {% if num_base_features > base_features_threshold %}
   - **Base Features Count (ER) Check Failed: Number of base features ({{ num_base_features }}) exceeds threshold ({{ base_features_threshold }})**
     - **CRITICAL**: The factor uses too many distinct raw features (e.g., $close, $open, $high, $low, $volume, $return).
-    - **Action Required**: Reduce the number of distinct base features used. Focus on 2-4 core features instead of using all available features.
-    - Target: Use at most {{ base_features_threshold }} distinct base features. Reusing the same feature multiple times is acceptable.
+    - **Action Required**: Bring the count to at most {{ base_features_threshold }} distinct base features. Which features to keep is your judgement — reusing the same feature multiple times does not count against the limit.
   {% endif %}
 

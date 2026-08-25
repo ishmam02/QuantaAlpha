@@ -86,10 +86,58 @@ def replay_repository(path: str | os.PathLike[str] | None = None) -> dict[str, d
         for expr in record.get("evicted_exprs") or []:
             repo.pop(expr, None)
         metrics = record.get("metrics") or {}
+        # The per-factor tear sheet (t_nw, rank_ic_neutral, ic_breakeven_book,
+        # sign, mechanism, ...) is written to its OWN ledger field, not merged
+        # into the batch ``metrics`` at persist time. Admission merges it into
+        # the in-memory repository (net_cost_runner.py:540) so the replace duel
+        # and eviction can rank on |t_nw|; rehydration MUST do the same, or a
+        # fresh runner (one per evolution task) rebuilds the repository from the
+        # ledger with batch metrics only -- every incumbent then lacks t_nw,
+        # ``_research_score`` returns -inf, and the replace duel lets a WEAKER
+        # near-duplicate replace a stronger incumbent (anti-learning, measured
+        # 2026-08-24: a |t| 8.92 WMA-smoothed factor replaced a |t| 11.15 one).
+        sheets = record.get("factor_tearsheets") or {}
         for expr in record.get("factor_exprs") or []:
             if expr:
-                repo[expr] = metrics
+                m = dict(metrics)
+                sheet = sheets.get(expr) if isinstance(sheets, dict) else None
+                if isinstance(sheet, dict):
+                    m.update(sheet)
+                repo[expr] = m
     return repo
 
 
-__all__ = ["DEFAULT_LEDGER_PATH", "Ledger", "replay_repository"]
+def replay_t_history(path: str | os.PathLike[str] | None = None) -> list[float]:
+    """``|t_nw|`` of EVERY factor scored so far this run, for the FDR gate.
+
+    The Benjamini-Hochberg correction runs over the full family of tests, not
+    the survivors -- a correction computed only over admitted factors is
+    truncated to its own winners and can never bind (see test_winsor_fdr F4).
+    So this reads every record's ``factor_tearsheets`` (admitted or rejected)
+    and returns ``abs(t_nw)`` for each, in evaluation order.
+
+    Eviction/transition records carry no ``factor_tearsheets`` and contribute
+    nothing, so a factor is counted once, at the batch it was scored -- never
+    re-added when it is later evicted. Records without tearsheets (pre-fix
+    runs) are skipped too, making rehydration safe against a ledger that
+    predates this change.
+    """
+    out: list[float] = []
+    try:
+        for record in Ledger(path).read():
+            sheets = record.get("factor_tearsheets") or {}
+            if isinstance(sheets, dict):
+                sheets = sheets.values()
+            for sheet in sheets:
+                try:
+                    t = float(sheet.get("t_nw"))
+                except (TypeError, ValueError):
+                    continue
+                if t == t:  # not NaN
+                    out.append(abs(t))
+    except OSError:
+        pass
+    return out
+
+
+__all__ = ["DEFAULT_LEDGER_PATH", "Ledger", "replay_repository", "replay_t_history"]

@@ -103,4 +103,33 @@ def write_alphazoo_csv(path: str | Path) -> Path:
     return p
 
 
-__all__ = ["SEED_POOL", "TRANSLATION", "translate_alpha158_20", "write_alphazoo_csv"]
+def seed_context(header: str | None = None) -> str:
+    """The Alpha158(20) pool rendered as prompt context.
+
+    Lives here, beside ``SEED_POOL``, because more than one prompt path needs it
+    and a second copy would drift. ``planning._seed_context`` delegates to this;
+    the hypothesis/factor-generation path in ``proposal.py`` uses it too.
+
+    That second consumer is the point. The paper's seed pool exists to tell the
+    generator which signal space is ALREADY covered, and until 2026-08-16 it
+    reached the LLM exactly once per run -- in the direction-planning system
+    prompt. Hypothesis generation and factor construction, the ~50 batches where
+    expressions are actually written, never saw it. Steering the topic without
+    steering the expression is consistent with the ~40% of batches that came
+    back as duplicates of the book.
+
+    Returns "" when the pool cannot be loaded, so a missing/empty pool degrades
+    to no context rather than breaking generation.
+    """
+    if not SEED_POOL:
+        return ""
+    head = header or (
+        "Canonical Alpha158(20) reference signals. This is the PUBLIC signal "
+        "space -- it is already covered, and a factor that re-expresses one of "
+        "these adds nothing a measurement can credit:"
+    )
+    return "\n".join([head] + [f"  - {n}: {e}" for n, e in SEED_POOL.items()])
+
+
+__all__ = ["SEED_POOL", "TRANSLATION", "translate_alpha158_20", "write_alphazoo_csv",
+           "seed_context"]

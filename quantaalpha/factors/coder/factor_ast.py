@@ -42,10 +42,25 @@ class VarNode(Node):
 @dataclass
 class NumberNode(Node):
     value: float
-    
+
     def __str__(self):
-        return str(self.value)
-        
+        # Render integral floats as INTS ("5", not "5.0"). This string is handed
+        # to the factor calculator, whose temporal ops call pandas
+        # ``.rolling(window)`` / ``.shift(periods)`` / ``.pct_change(periods=...)``,
+        # and those reject a float window with ``slice indices must be integers
+        # or None or have an __index__ method``. Any code path that re-renders an
+        # AST through ``str(node)`` -- notably the segment_ablation window-sweep
+        # -- used to emit ``TS_MEAN($close, 5.0)``
+        # and fail execution, which is the historical "crossover 0/10 admits"
+        # (every crossover child with a temporal window died before it could be
+        # scored). Non-integral literals (1e-12, 0.5) are unchanged; NaN/inf fall
+        # through to ``str(v)``. ``_node_str`` (the debug tree view) still shows
+        # the raw float, so NUM(5.0) is unchanged for diagnostics.
+        v = self.value
+        if v == v and float(v).is_integer():
+            return str(int(v))
+        return str(v)
+
     def _node_str(self):
         return f"NUM({self.value})"
 
@@ -475,6 +490,38 @@ def collect_unique_vars(node: Node, unique_vars: set) -> None:
         collect_unique_vars(node.condition, unique_vars)
         collect_unique_vars(node.true_expr, unique_vars)
         collect_unique_vars(node.false_expr, unique_vars)
+
+
+def collect_operators(node: Node, operators: set) -> None:
+    """Recursively collect function-operator names from an AST.
+
+    Parallel to :func:`collect_unique_vars`, but RECORDS each function name
+    instead of skipping it. Used by the operator-coverage measurement
+    (``quantaalpha.factors.operator_coverage``) to read which operators a
+    mined population actually exercised.
+
+    ``FunctionNode.name`` is set by ``create_function_node`` to ``tokens[0]``,
+    which is the ``var`` parse action's ``VarNode`` (not a str) -- ``str(VarNode)``
+    returns the name so rendering works, but ``.name`` has no ``.upper()``. So the
+    name is recovered the same way ``segment_profiling._func_name`` does: read
+    ``.name`` off the ``VarNode`` when it is one, else stringify.
+    """
+    if isinstance(node, FunctionNode):
+        nm = node.name
+        name = nm.name if isinstance(nm, VarNode) else str(nm)
+        operators.add(name.upper())
+        for arg in node.args:
+            collect_operators(arg, operators)
+    elif isinstance(node, BinaryOpNode):
+        collect_operators(node.left, operators)
+        collect_operators(node.right, operators)
+    elif isinstance(node, UnaryOpNode):
+        collect_operators(node.operand, operators)
+    elif isinstance(node, ConditionalNode):
+        collect_operators(node.condition, operators)
+        collect_operators(node.true_expr, operators)
+        collect_operators(node.false_expr, operators)
+    # VarNode / NumberNode carry no operator name.
 
 
 def count_all_nodes(expr: str) -> int:

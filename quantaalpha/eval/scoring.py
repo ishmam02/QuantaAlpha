@@ -73,7 +73,7 @@ def rank(value: float, incumbent_values: Iterable[float]) -> float:
 
     **Neutral (``0.5``), not ``0.0``.** Returning ``0.0`` makes ``e_j = 1`` on
     every dimension, so a batch ranked against nothing scores near the maximum
-    ``U`` -- and since evolutionary fitness is ``U`` under the treatment arm,
+    ``U`` -- and since evolutionary fitness is ``U`` under the net-cost objective,
     the very first batch becomes a fitness leader no legitimately-scored batch
     can overtake. Measured on run 20260728_151227: batch 1 scored ``U=0.9500``
     against an empty repository while batches 2-6, scored against real

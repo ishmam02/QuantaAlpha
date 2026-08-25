@@ -148,10 +148,23 @@ class FactorConsistencyChecker:
         factor_expression: str,
         variables: Dict[str, str] = None
     ) -> Tuple[ConsistencyCheckResult, str, str]:
-        """Check consistency and attempt correction. Returns (result, final_expr, final_desc)."""
+        """Check consistency and attempt correction. Returns (result, final_expr, final_desc).
+
+        Corrections that CYCLE are abandoned early. The checker can disagree with
+        itself across calls -- observed live on ``High_Vol_Reversal_5D``, where it
+        proposed A, then B, then A again, burning three correction round-trips
+        (~4 min of LLM time) before rejecting the factor anyway. The loop only
+        compared each proposal with the immediately preceding expression, so an
+        A->B->A cycle slipped through. Tracking every expression already tried
+        stops the cycle at the repeat.
+        """
         current_expression = factor_expression
         current_description = factor_description
-        
+        # Every expression/description already evaluated, so a proposal that
+        # revisits one is recognised as a cycle rather than treated as progress.
+        seen_expressions = {factor_expression}
+        seen_descriptions = {factor_description}
+
         for attempt in range(self.max_correction_attempts):
             result = self.check_consistency(
                 hypothesis=hypothesis,
@@ -170,13 +183,28 @@ class FactorConsistencyChecker:
                 return result, current_expression, current_description
             
             if result.corrected_expression and result.corrected_expression != current_expression:
+                if result.corrected_expression in seen_expressions:
+                    logger.warning(
+                        f"Correction CYCLE on {factor_name}: proposed an expression "
+                        f"already tried; the checker is oscillating rather than "
+                        f"converging. Stopping after {attempt} correction(s)."
+                    )
+                    break
                 logger.info(f"Attempting expression correction ({attempt + 1}/{self.max_correction_attempts})")
                 logger.info(f"Original: {current_expression}")
                 logger.info(f"Corrected: {result.corrected_expression}")
                 current_expression = result.corrected_expression
+                seen_expressions.add(current_expression)
             elif result.corrected_description and result.corrected_description != current_description:
+                if result.corrected_description in seen_descriptions:
+                    logger.warning(
+                        f"Correction CYCLE on {factor_name}: proposed a description "
+                        f"already tried. Stopping after {attempt} correction(s)."
+                    )
+                    break
                 logger.info(f"Attempting description correction ({attempt + 1}/{self.max_correction_attempts})")
                 current_description = result.corrected_description
+                seen_descriptions.add(current_description)
             else:
                 logger.warning(f"Cannot correct factor {factor_name}, giving up")
                 break

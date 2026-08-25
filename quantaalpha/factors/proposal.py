@@ -18,6 +18,13 @@ from quantaalpha.factors.regulator.factor_regulator import FactorRegulator
 
 DEFAULT_HISTORY_LIMIT = 6
 MIN_HISTORY_LIMIT = 1
+# How many times to re-prompt the hypothesis LLM when its output is unparseable
+# (a code block, an empty string, malformed JSON). ``robust_json_parse`` already
+# repairs most malformed JSON; this bound covers a response that contains no
+# JSON object at all -- a stochastic lapse (one 2026-08-23 hypothesis-revise call
+# returned a full Python function). Re-prompting recovers almost all of these;
+# the bad response is a random lapse, not a deterministic one.
+MAX_PARSE_RETRIES = 3
 
 
 def render_hypothesis_and_feedback(prompt_dict, trace: Trace, history_limit: int = DEFAULT_HISTORY_LIMIT) -> str:
@@ -53,6 +60,16 @@ def is_input_length_error(error_msg: str) -> bool:
 QlibFactorHypothesis = Hypothesis
 qa_prompt_dict = Prompts(file_path=Path(__file__).parent / "prompts" / "proposal.yaml")
 
+
+# The Alpha158(20) seed context used to be appended to the hypothesis
+# specification here (``_with_seed_context``). Removed 2026-08-23: those OHLCV
+# seeds primed a TS_MEAN/TS_SUM formula the construct copied verbatim and
+# anchored round-0 directions to price-volume microstructure (operator
+# monoculture). Direction-planning seed injection is also disabled via
+# ``seed_in_generation: false`` in the configs; the data-driven
+# ``_market_context()`` still gives the generator its market context.
+
+
 class AlphaAgentHypothesis(Hypothesis):
     """
     AlphaAgentHypothesis extends the Hypothesis class to include a potential_direction,
@@ -65,7 +82,8 @@ class AlphaAgentHypothesis(Hypothesis):
         concise_observation: str,
         concise_justification: str,
         concise_knowledge: str,
-        concise_specification: str
+        concise_specification: str,
+        expected_ic_sign: str = "",
     ) -> None:
         super().__init__(
             hypothesis,
@@ -76,6 +94,13 @@ class AlphaAgentHypothesis(Hypothesis):
             concise_knowledge,
         )
         self.concise_specification = concise_specification
+        # The PRE-REGISTERED direction. The hypothesis prompt demands "EXACTLY
+        # ONE of positive or negative" and tells the model it "will be checked
+        # against the realized RankIC" -- but until now nothing parsed it, so
+        # the commitment was requested, promised a test, and silently dropped.
+        # A mechanism that predicts no direction is not a mechanism, and one
+        # whose direction is contradicted by measurement has been falsified.
+        self.expected_ic_sign = (expected_ic_sign or "").strip().lower()
         
     def __str__(self) -> str:
         return f"""Hypothesis: {self.hypothesis}
@@ -83,6 +108,7 @@ class AlphaAgentHypothesis(Hypothesis):
                 Concise Justification: {self.concise_justification}
                 Concise Knowledge: {self.concise_knowledge}
                 concise Specification: {self.concise_specification}
+                Expected IC Sign: {self.expected_ic_sign}
                 """
 
 base_prompt_dict = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
@@ -198,6 +224,26 @@ class QlibFactorHypothesis2Experiment(FactorHypothesis2Experiment):
 
 qa_prompt_dict = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
 
+
+def _factors_per_hypothesis() -> int:
+    """How many factors one hypothesis should yield, from the run config.
+
+    Read through the environment because these classes are instantiated deep in
+    the RD-Agent loop with no handle on the run config, and are pickled (see the
+    note above about prompt_dict). `factor_mining.main` exports it.
+
+    This knob was DEAD until now: `factors_per_hypothesis` was read only by
+    `expected_factor_count`, a budget estimator that nothing calls, while the
+    prompt hardcoded "2-3 Factors per Generation". Setting it to 1 in the config
+    therefore changed nothing -- a live run was measured emitting 3 factors per
+    hypothesis with the config asking for 1.
+    """
+    import os
+    try:
+        return max(int(os.environ.get("QA_FACTORS_PER_HYPOTHESIS", "1")), 1)
+    except (TypeError, ValueError):
+        return 1
+
 # prompt_dict not as attribute: class instance is pickled later, prompt_dict cannot be pickled
 class AlphaAgentHypothesisGen(FactorHypothesisGen):
     def __init__(self, scen: Scenario, potential_direction: str=None) -> Tuple[dict, bool]:
@@ -205,18 +251,34 @@ class AlphaAgentHypothesisGen(FactorHypothesisGen):
         self.potential_direction = potential_direction
 
     def prepare_context(self, trace: Trace, history_limit: int = DEFAULT_HISTORY_LIMIT) -> Tuple[dict, bool]:
-        
-        if len(trace.hist) > 0:
+
+        # Refine-mode, hypothesis layer (refine_target=hypothesis): the premise
+        # itself is the fault, so the LLM must REVISE it rather than propose a
+        # new one. Inject the pre-rendered revise block (parent hypothesis +
+        # diagnosis) as the context, overriding the usual direction/feedback
+        # rendering. (The frozen-hypothesis / expression-refine case never
+        # reaches here -- gen() short-circuits before the LLM call.)
+        _rd = getattr(self, "refine_directive", None)
+        if _rd and _rd.get("refine_target") == "hypothesis":
+            block = getattr(self, "revise_hypothesis_block", "") or ""
+            directive = _rd.get("directive_text", "")
+            if block:
+                hypothesis_and_feedback = f"{block}\n\n### Refinement directive\n{directive}"
+            else:
+                hypothesis_and_feedback = (
+                    f"Revise the parent hypothesis per this directive:\n{directive}"
+                )
+        elif len(trace.hist) > 0:
             hypothesis_and_feedback = render_hypothesis_and_feedback(
                 qa_prompt_dict, trace, history_limit
             )
-            
-        elif self.potential_direction is not None: 
+
+        elif self.potential_direction is not None:
             hypothesis_and_feedback = (
                 Environment(undefined=StrictUndefined)
                 .from_string(qa_prompt_dict["potential_direction_transformation"])
                 .render(potential_direction=self.potential_direction)
-            ) # 
+            ) #
         else:
             hypothesis_and_feedback = "No previous hypothesis and feedback available since it's the first round. You are encouraged to propose an innovative hypothesis that diverges significantly from existing perspectives."
             
@@ -240,73 +302,251 @@ class AlphaAgentHypothesisGen(FactorHypothesisGen):
             concise_knowledge=response_dict.get("concise_knowledge", ""),
             concise_justification=response_dict.get("concise_justification", ""),
             concise_specification=response_dict.get("concise_specification", ""),
+            expected_ic_sign=response_dict.get("expected_ic_sign", ""),
         )
         return hypothesis
-    
+
+    def _warn_if_refine_drifted(self, hypothesis: "AlphaAgentHypothesis") -> None:
+        """Soft guard for the hypothesis-revise path (refine_target=hypothesis).
+
+        The revise contract is prompt text only -- the JSON schema is the
+        standard hypothesis one, so nothing structurally forces the LLM to
+        revise rather than restart orthogonally. If the emitted hypothesis
+        shares essentially no wording with its parent, it is an orthogonal
+        restart dressed as a refinement. Surface that in the log so the
+        failure mode is observable (a refine loop that silently restarts would
+        otherwise look like it is exploiting). Observational only: it does not
+        block or rewrite the output.
+        """
+        _rd = getattr(self, "refine_directive", None)
+        if not _rd or _rd.get("refine_target") != "hypothesis":
+            return
+        pp = getattr(self, "parent_prefix", {}) or {}
+        parent = pp.get("hypothesis") or _rd.get("parent_hypothesis") or ""
+        child = getattr(hypothesis, "hypothesis", "") or ""
+        if not parent or not child:
+            return
+        pw, cw = set(parent.lower().split()), set(child.lower().split())
+        if not pw:
+            return
+        overlap = len(pw & cw) / len(pw)
+        if overlap < 0.08:
+            logger.warning(
+                f"refine[hypothesis] produced an orthogonal restart (word "
+                f"overlap {overlap:.2f} with the parent hypothesis) -- the "
+                f"directive asked for a revision; the LLM may have ignored it."
+            )
+
+    def _gen_with_parse_retry(self, system_prompt: str, user_prompt: str,
+                              json_flag: bool) -> "AlphaAgentHypothesis":
+        """Call the hypothesis LLM and parse; re-prompt on malformed output.
+
+        The model occasionally returns a code block or an empty string instead
+        of a JSON object (one hypothesis-revise call returned a full Python
+        function, see the 2026-08-23 push smoke). ``robust_json_parse`` repairs
+        most malformed JSON, but a response with no JSON object at all raises.
+        Re-prompting a bounded number of times recovers almost all of these --
+        the bad response is a stochastic lapse, not a deterministic one. Raises
+        the last parse error after ``MAX_PARSE_RETRIES`` so the caller can
+        degrade safely.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(MAX_PARSE_RETRIES):
+            try:
+                resp = APIBackend().build_messages_and_create_chat_completion(
+                    user_prompt, system_prompt, json_mode=json_flag)
+                return self.convert_response(resp)
+            except (json.JSONDecodeError, ValueError) as e:
+                last_exc = e
+                logger.warning(
+                    f"hypothesis-gen returned unparseable output "
+                    f"(attempt {attempt + 1}/{MAX_PARSE_RETRIES}: {e}); "
+                    f"re-prompting...")
+        assert last_exc is not None
+        raise last_exc
+
+    def _refine_hypothesis_fallback(self) -> "AlphaAgentHypothesis | None":
+        """Degrade-safely fallback for a failed hypothesis-revise.
+
+        When the hypothesis-revise LLM output is unparseable after retries, the
+        safe degradation is NOT to kill the task (which loses the child and the
+        round's work) but to fall back to the FROZEN parent premise -- the same
+        thing the expression-refine short-circuit does. The factor constructor
+        then refines the parent expression, so the child is scored as a
+        degraded-but-valid expression-refine instead of dying. Returns None for
+        non-refine paths (a fresh-gen failure is a real error worth surfacing,
+        not something to paper over with a parent that does not exist).
+        """
+        _rd = getattr(self, "refine_directive", None)
+        if not _rd or _rd.get("refine_target") != "hypothesis":
+            return None
+        pp = getattr(self, "parent_prefix", {}) or {}
+        parent_hypothesis = pp.get("hypothesis") or _rd.get("parent_hypothesis") or ""
+        parent_sign = str(pp.get("expected_ic_sign")
+                          or _rd.get("parent_expected_ic_sign") or "").strip().lower()
+        if parent_sign not in ("positive", "negative"):
+            parent_sign = ""
+        return AlphaAgentHypothesis(
+            hypothesis=parent_hypothesis,
+            concise_observation="",
+            concise_justification="",
+            concise_knowledge="",
+            concise_specification="",
+            expected_ic_sign=parent_sign,
+        )
+
     def gen(self, trace: Trace) -> AlphaAgentHypothesis:
         """Generate hypothesis; supports dynamic history limit for input length."""
-        history_limit = DEFAULT_HISTORY_LIMIT
-        
-        while history_limit >= MIN_HISTORY_LIMIT:
-            try:
-                context_dict, json_flag = self.prepare_context(trace, history_limit)
-                system_prompt = (
-                    Environment(undefined=StrictUndefined)
-                    .from_string(qa_prompt_dict["hypothesis_gen"]["system_prompt"])
-                    .render(
-                        targets=self.targets,
-                        scenario=self.scen.get_scenario_all_desc(filtered_tag="hypothesis_and_experiment"),
-                        hypothesis_output_format=context_dict["hypothesis_output_format"],
-                        hypothesis_specification=context_dict["hypothesis_specification"],
-                    )
-                )
-                user_prompt = (
-                    Environment(undefined=StrictUndefined)
-                    .from_string(qa_prompt_dict["hypothesis_gen"]["user_prompt"])
-                    .render(
-                        targets=self.targets,
-                        hypothesis_and_feedback=context_dict["hypothesis_and_feedback"],
-                        RAG=context_dict["RAG"],
-                        round=len(trace.hist)
-                    )
-                )
+        # Refine-mode short-circuit (Eq. 6): when the diagnosis froze the
+        # hypothesis (refine_target=EXPRESSION -- the cost-stall case: the
+        # premise is sound, only the construction is too expensive), the
+        # hypothesis generator returns the FROZEN parent hypothesis verbatim
+        # and skips the LLM call entirely. The factor constructor then refines
+        # the expressions while keeping this premise; the coder renders code
+        # from those expressions, so the whole construction layer is refined
+        # without re-proposing the premise. (The hypothesis-revise case,
+        # refine_target=HYPOTHESIS, falls through to the LLM call below with the
+        # revise block already injected by prepare_context.)
+        _rd = getattr(self, "refine_directive", None)
+        if _rd and _rd.get("refine_target") == "expression":
+            pp = getattr(self, "parent_prefix", {}) or {}
+            parent_hypothesis = pp.get("hypothesis") or _rd.get("parent_hypothesis") or ""
+            # The concise_* fields are empty: this is a FROZEN premise, not a
+            # freshly generated one, so the LLM observation/justification do not
+            # apply. The factor constructor only reads ``str(hypothesis)``.
+            # The premise is frozen, so its DIRECTIONAL prediction is frozen too
+            # and has to travel with it. Dropping it here made every refine child
+            # arrive with no stated direction, and the falsifiability gate then
+            # rejected all of them -- 36 rejections in one run, silencing the one
+            # operator measured to actually improve factors.
+            parent_sign = str(pp.get("expected_ic_sign")
+                              or _rd.get("parent_expected_ic_sign") or "").strip().lower()
+            if parent_sign not in ("positive", "negative"):
+                parent_sign = ""
+            return AlphaAgentHypothesis(
+                hypothesis=parent_hypothesis,
+                concise_observation="",
+                concise_justification="",
+                concise_knowledge="",
+                concise_specification="",
+                expected_ic_sign=parent_sign,
+            )
 
-                resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
-                hypothesis = self.convert_response(resp)
-                return hypothesis
-            
-            except Exception as e:
-                if is_input_length_error(str(e)) and history_limit > MIN_HISTORY_LIMIT:
-                    history_limit -= 1
-                    logger.warning(f"Input length exceeded, retrying with history_limit={history_limit}...")
-                else:
-                    raise
-        
-        # Last attempt with minimum history limit
-        context_dict, json_flag = self.prepare_context(trace, MIN_HISTORY_LIMIT)
-        system_prompt = (
-            Environment(undefined=StrictUndefined)
-            .from_string(qa_prompt_dict["hypothesis_gen"]["system_prompt"])
-            .render(
-                targets=self.targets,
-                scenario=self.scen.get_scenario_all_desc(filtered_tag="hypothesis_and_experiment"),
-                hypothesis_output_format=context_dict["hypothesis_output_format"],
-                hypothesis_specification=context_dict["hypothesis_specification"],
+        # First-class deterministic sign-flip refine (the measured-direction
+        # fix): the parent's pre-registered IC direction was OPPOSITE its
+        # measured one while the edge cleared the bar (|t| >= k_sigma) -- the
+        # construction has a real edge, the hypothesis just labeled the
+        # direction backwards. The construction is FROZEN verbatim (the factor
+        # constructor re-uses the parent factors unchanged, see the SIGN
+        # short-circuit in ``FactorHypothesis2Experiment.convert``); the
+        # direction is CORRECTED to the measured one; and the hypothesis records
+        # the measured correction so the child's premise states the corrected
+        # prediction. No LLM call -- this is the search learning from its
+        # measured mistake and correcting it for free. See
+        # ``diagnosis.sign_flip_directive``.
+        if _rd and _rd.get("refine_target") == "sign":
+            pp = getattr(self, "parent_prefix", {}) or {}
+            parent_hypothesis = pp.get("hypothesis") or _rd.get("parent_hypothesis") or ""
+            corrected_sign = str(pp.get("expected_ic_sign")
+                                 or _rd.get("parent_expected_ic_sign") or "").strip().lower()
+            if corrected_sign not in ("positive", "negative"):
+                corrected_sign = ""
+            correction = _rd.get("directive_text") or ""
+            # Append the measured correction to the frozen premise so the
+            # child's hypothesis states the corrected direction (the premise is
+            # otherwise identical to the parent's). ``correction`` is
+            # measurement-only prose; it never prescribes a remedy.
+            hyp = (parent_hypothesis + "\n\n" + correction).strip() if correction else parent_hypothesis
+            return AlphaAgentHypothesis(
+                hypothesis=hyp,
+                concise_observation="",
+                concise_justification="",
+                concise_knowledge="",
+                concise_specification="",
+                expected_ic_sign=corrected_sign,
             )
-        )
-        user_prompt = (
-            Environment(undefined=StrictUndefined)
-            .from_string(qa_prompt_dict["hypothesis_gen"]["user_prompt"])
-            .render(
-                targets=self.targets,
-                hypothesis_and_feedback=context_dict["hypothesis_and_feedback"],
-                RAG=context_dict["RAG"],
-                round=len(trace.hist)
+
+        history_limit = DEFAULT_HISTORY_LIMIT
+
+        try:
+            while history_limit >= MIN_HISTORY_LIMIT:
+                try:
+                    context_dict, json_flag = self.prepare_context(trace, history_limit)
+                    system_prompt = (
+                        Environment(undefined=StrictUndefined)
+                        .from_string(qa_prompt_dict["hypothesis_gen"]["system_prompt"])
+                        .render(
+                            targets=self.targets,
+                            scenario=self.scen.get_scenario_all_desc(filtered_tag="hypothesis_and_experiment"),
+                            hypothesis_output_format=context_dict["hypothesis_output_format"],
+                            hypothesis_specification=context_dict["hypothesis_specification"],
+                        )
+                    )
+                    user_prompt = (
+                        Environment(undefined=StrictUndefined)
+                        .from_string(qa_prompt_dict["hypothesis_gen"]["user_prompt"])
+                        .render(
+                            targets=self.targets,
+                            hypothesis_and_feedback=context_dict["hypothesis_and_feedback"],
+                            RAG=context_dict["RAG"],
+                            round=len(trace.hist)
+                        )
+                    )
+
+                    hypothesis = self._gen_with_parse_retry(system_prompt, user_prompt, json_flag)
+                    self._warn_if_refine_drifted(hypothesis)
+                    return hypothesis
+
+                except Exception as e:
+                    if is_input_length_error(str(e)) and history_limit > MIN_HISTORY_LIMIT:
+                        history_limit -= 1
+                        logger.warning(f"Input length exceeded, retrying with history_limit={history_limit}...")
+                    else:
+                        raise
+
+            # Last attempt with minimum history limit
+            context_dict, json_flag = self.prepare_context(trace, MIN_HISTORY_LIMIT)
+            system_prompt = (
+                Environment(undefined=StrictUndefined)
+                .from_string(qa_prompt_dict["hypothesis_gen"]["system_prompt"])
+                .render(
+                    targets=self.targets,
+                    scenario=self.scen.get_scenario_all_desc(filtered_tag="hypothesis_and_experiment"),
+                    hypothesis_output_format=context_dict["hypothesis_output_format"],
+                    hypothesis_specification=context_dict["hypothesis_specification"],
+                )
             )
-        )
-        resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
-        hypothesis = self.convert_response(resp)
-        return hypothesis
+            user_prompt = (
+                Environment(undefined=StrictUndefined)
+                .from_string(qa_prompt_dict["hypothesis_gen"]["user_prompt"])
+                .render(
+                    targets=self.targets,
+                    hypothesis_and_feedback=context_dict["hypothesis_and_feedback"],
+                    RAG=context_dict["RAG"],
+                    round=len(trace.hist)
+                )
+            )
+            hypothesis = self._gen_with_parse_retry(system_prompt, user_prompt, json_flag)
+            self._warn_if_refine_drifted(hypothesis)
+            return hypothesis
+
+        except (json.JSONDecodeError, ValueError) as e:
+            # The LLM returned unparseable output (a code block / empty string)
+            # even after MAX_PARSE_RETRIES re-prompts. For a hypothesis-revise,
+            # degrade safely to the frozen parent premise so the task produces a
+            # (degraded) scored child instead of dying and losing the round --
+            # the same expression-refine semantics the short-circuit uses. For a
+            # fresh generation there is no parent to fall back to; a failure
+            # there is a real error, so re-raise it.
+            fallback = self._refine_hypothesis_fallback()
+            if fallback is not None:
+                logger.warning(
+                    f"hypothesis-revise LLM output unparseable after "
+                    f"{MAX_PARSE_RETRIES} retries ({e}); degrading to the frozen "
+                    f"parent premise (expression-refine semantics) so the child "
+                    f"is scored instead of lost.")
+                return fallback
+            raise
     
     
 
@@ -367,7 +607,15 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
         
     def prepare_context(self, hypothesis: Hypothesis, trace: Trace, history_limit: int = DEFAULT_HISTORY_LIMIT) -> Tuple[dict | bool]:
         scenario = trace.scen.get_scenario_all_desc()
-        experiment_output_format = qa_prompt_dict["factor_experiment_output_format"]
+        # Render the output schema for the requested count. The EXAMPLE teaches
+        # harder than the prose: a two-slot schema beside "produce exactly 1"
+        # is why a run configured for one factor per hypothesis was measured
+        # emitting three.
+        experiment_output_format = (
+            Environment(undefined=StrictUndefined)
+            .from_string(qa_prompt_dict["factor_experiment_output_format"])
+            .render(factors_per_hypothesis=_factors_per_hypothesis())
+        )
         function_lib_description = qa_prompt_dict['function_lib_description']
         hypothesis_and_feedback = render_hypothesis_and_feedback(
             qa_prompt_dict, trace, history_limit
@@ -378,6 +626,38 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
         factor_list = []
         for experiment in experiment_list:
             factor_list.extend(experiment.sub_tasks)
+
+        # Refine-mode (Eq. 6), expression layer: the hypothesis is FROZEN (the
+        # generator returned the parent premise verbatim) and only the
+        # construction is to be refined. Inject the pre-rendered frozen-prefix
+        # block (parent factor expressions + the directive) into the feedback
+        # channel so the LLM refines the parent's expressions rather than
+        # inventing unrelated ones. The directive was produced deterministically
+        # by diagnosis.diagnose; this block is the AlphaEvolve artifact
+        # side-channel that tells the LLM *what* to fix. Only applies when
+        # refine_target=expression (the cost-stall family); hypothesis-refine
+        # re-derives expressions from the revised premise and has no frozen
+        # expression prefix, so the block is empty and this is a no-op.
+        _rd = getattr(self, "refine_directive", None)
+        if _rd and _rd.get("refine_target") == "expression":
+            block = getattr(self, "refine_factors_block", "") or ""
+            if block:
+                hypothesis_and_feedback = (
+                    (hypothesis_and_feedback + "\n\n" if hypothesis_and_feedback else "")
+                    + block
+                )
+        elif _rd and _rd.get("refine_target") == "recombine":
+            # Crossover (Eq. 7): the two parents' validated strengths as
+            # CONSTRUCTOR inspiration -- "draw ideas from, do not copy". The
+            # hypothesis is authored fresh by the generator (this is not a
+            # frozen-prefix build); the block only tells the constructor which
+            # validated construction patterns to inherit ideas from.
+            block = getattr(self, "crossover_strength_block", "") or ""
+            if block:
+                hypothesis_and_feedback = (
+                    (hypothesis_and_feedback + "\n\n" if hypothesis_and_feedback else "")
+                    + block
+                )
 
         return {
             "target_hypothesis": str(hypothesis),
@@ -391,6 +671,61 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
         
     def convert(self, hypothesis: Hypothesis, trace: Trace) -> Experiment:
         """Convert hypothesis to factor expressions; supports dynamic history limit."""
+        # First-class deterministic sign-flip refine (the measured-direction
+        # fix): the construction is FROZEN verbatim -- the parent's expressions
+        # are re-used UNCHANGED, only the pre-registered direction was backwards
+        # (corrected on the hypothesis in ``AlphaAgentHypothesisGen.gen``). So
+        # build the experiment straight from the parent factor dicts with NO LLM
+        # call: the search measured that its prediction was backwards and
+        # corrects it, re-testing the identical construction under the corrected
+        # direction. Mirrors ``BacktestHypothesis2FactorExpression.convert`` (a
+        # no-LLM build from a factor list). ``trace.hist`` is empty at convert
+        # time (only the feedback step appends, AFTER construct), so the dedup
+        # against ``based_experiments`` is a no-op -- the frozen factors pass
+        # through unchanged. See ``diagnosis.sign_flip_directive``.
+        _rd = getattr(self, "refine_directive", None)
+        if _rd and _rd.get("refine_target") == "sign":
+            pp = getattr(self, "parent_prefix", {}) or {}
+            parent_factors = pp.get("factors") or _rd.get("parent_factors") or []
+            tasks = []
+            for i, f in enumerate(parent_factors):
+                if not isinstance(f, dict):
+                    continue
+                expr = f.get("expression") or f.get("factor_expression") or ""
+                if not expr:
+                    continue
+                tasks.append(
+                    FactorTask(
+                        factor_name=f.get("name") or f.get("factor_name") or f"signflip_{i}",
+                        factor_description=f.get("description", ""),
+                        factor_formulation=f.get("formulation", ""),
+                        factor_expression=expr,
+                        variables=f.get("variables", ""),
+                    )
+                )
+            exp = QlibFactorExperiment(tasks)
+            exp.based_experiments = [QlibFactorExperiment(sub_tasks=[])] + [
+                t[1] for t in trace.hist if t[2]]
+            unique_tasks = []
+            for task in tasks:
+                duplicate = False
+                for based_exp in exp.based_experiments:
+                    for sub_task in based_exp.sub_tasks:
+                        if task.factor_name == sub_task.factor_name:
+                            duplicate = True
+                            break
+                    if duplicate:
+                        break
+                if not duplicate:
+                    unique_tasks.append(task)
+            exp.tasks = unique_tasks
+            try:
+                exp.hypothesis = hypothesis
+            except Exception:
+                logger.warning("could not attach hypothesis to sign-flip experiment; "
+                               "the mechanism gate will have nothing to read")
+            return exp
+
         history_limit = DEFAULT_HISTORY_LIMIT
         
         while history_limit >= MIN_HISTORY_LIMIT:
@@ -416,6 +751,7 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
                 targets=self.targets,
                 scenario=trace.scen.background, # get_scenario_all_desc(filtered_tag="hypothesis_and_experiment"),
                 experiment_output_format=context["experiment_output_format"],
+                factors_per_hypothesis=_factors_per_hypothesis(),
             )
         )
         user_prompt = (
@@ -564,7 +900,24 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
         self.factor_regulator.add_factor(proposed_names, proposed_exprs)
                 
                 
-        return self.convert_response(resp, trace)
+        exp = self.convert_response(resp, trace)
+        # ATTACH THE HYPOTHESIS TO THE EXPERIMENT.
+        #
+        # `convert_response` builds the experiment from the response text alone
+        # and never sees the hypothesis, so `exp.hypothesis` was unset for every
+        # factor this system has ever mined. The runner reads it to record the
+        # economic mechanism -- measured across every ledger and factor library
+        # on disk, `mechanism` is non-empty ZERO times out of all of them.
+        #
+        # That was invisible while a missing mechanism only logged a warning.
+        # Once it became an admission gate it rejected everything, which is how
+        # it was finally noticed.
+        try:
+            exp.hypothesis = hypothesis
+        except Exception:                      # some Experiment types are slotted
+            logger.warning("could not attach hypothesis to experiment; the "
+                           "mechanism gate will have nothing to read")
+        return exp
     
 
     def convert_response(self, response: str, trace: Trace) -> FactorExperiment:

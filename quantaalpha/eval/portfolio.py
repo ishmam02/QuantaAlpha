@@ -195,7 +195,19 @@ def topk_dropout(
     long_locked: dict[str, int] = {}
     short_locked: dict[str, int] = {}
 
+    every_n = max(1, int(getattr(theta.portfolio, "rebalance_every", 1) or 1))
+
     for step, date in enumerate(pred.index):
+        if step % every_n != 0 and w_prev is not None:
+            # Hold between rebalances; see mean_variance for why this needs no
+            # change in the cost model.
+            prior = y_tilde.shift(1).loc[date] if (y_tilde is not None and date in y_tilde.index) else None
+            w_hold = drift(w_prev, prior, theta) if prior is not None else w_prev.copy()
+            weights.loc[date] = w_hold
+            drifted.loc[date] = w_hold
+            w_prev = w_hold
+            continue
+
         scores = pred.loc[date]
         if universe is not None:
             scores = scores.where(universe.loc[date].astype(bool))
@@ -281,8 +293,18 @@ def solo_book(signal: pd.DataFrame, theta: Protocol, universe: pd.DataFrame | No
     Used only for ``turnover_solo``, the diagnostic that *does* vary across
     signals once the book-level turnover has been flattened by the structural
     ``n_drop/topk`` cap.
+
+    Dispatches on ``Θ.portfolio.construction`` rather than hardcoding
+    ``topk_dropout``. Hardcoding it made this raise
+    ``NotImplementedError: unsupported construction 'mean_variance'`` under the
+    live protocol, and the caller in ``net_cost_runner`` wraps the whole
+    implementability check in a bare ``except``, so BOTH ``turnover_solo`` and
+    ``capacity_cny`` were silently absent from every tear sheet: measured 0 of
+    65 on the 2026-08-24 run. The turnover gate (``max_solo_turnover``) and the
+    capacity gate (``min_capacity_cny``) therefore never fired -- the two checks
+    that stop a factor which cannot pay for its own trading.
     """
-    return topk_dropout(signal, theta, universe=universe)
+    return build_book(signal, theta, universe=universe)
 
 
 __all__ = ["build_book", "mean_variance", "solo_book", "topk_dropout"]
@@ -422,7 +444,34 @@ def mean_variance(
     drifted = pd.DataFrame(0.0, index=pred.index, columns=pred.columns)
     w_prev = prev_w.reindex(pred.columns).fillna(0.0) if prev_w is not None else None
 
-    for date in pred.index:
+    # Multi-day holding period. On a non-rebalance date the book is carried
+    # forward untouched, so `0.5*|w - w_drift|` -- the quantity every cost term
+    # is charged on -- is identically zero and turnover falls ~every_n-fold with
+    # no special case anywhere in the cost model.
+    #
+    # This is the change the horizon re-score argued for: at h=1, 122 of 150
+    # mined factors are statistically real after FDR and ZERO clear the
+    # break-even a 1386%/yr book demands.
+    every_n = max(1, int(getattr(port, "rebalance_every", 1) or 1))
+    # h-day RISK and h-day ALPHA. Holding for `every_n` days scales the variance
+    # of the held position by ~every_n; leaving Sigma daily while the cost is
+    # paid once per period would have the optimiser compare a one-off cost with
+    # a fraction of the risk it actually carries.
+    # Variance is scaled to the FORECAST horizon, matching the alpha (see
+    # operator._book). Both must use the same clock or the optimiser trades off
+    # an h-day return against a 1-day risk.
+    horizon_scale = float(max(1, int(getattr(theta.execution, "label_horizon", 1) or 1)))
+
+    for step, date in enumerate(pred.index):
+        if step % every_n != 0 and w_prev is not None:
+            # Hold. Drift the book through one period of P&L and trade nothing.
+            prior = y_tilde.shift(1).loc[date] if (y_tilde is not None and date in y_tilde.index) else None
+            w_hold = drift(w_prev, prior, theta) if prior is not None else w_prev.copy()
+            weights.loc[date] = w_hold
+            drifted.loc[date] = w_hold          # w == w_drift  =>  zero turnover
+            w_prev = w_hold
+            continue
+
         scores = pred.loc[date]
         if universe is not None:
             scores = scores.where(universe.loc[date].astype(bool))
@@ -461,13 +510,47 @@ def mean_variance(
             adv_row = None
             if adv is not None and date in adv.index:
                 adv_row = adv.loc[date].reindex(scores.index) / float(theta.costs.nav)
-            target = mv_weights_costed(
-                mu, risk, None if risk is not None else vol_row ** 2,
-                gamma, w_drift.reindex(scores.index).fillna(0.0), lam, max_w,
-                adv_w=adv_row, kappa2=float(theta.costs.kappa2),
-                impact_exponent=float(theta.costs.impact_exponent),
-                hurdle=float(getattr(port, "cost_hurdle", 1.0)),
-                trade_penalty=float(getattr(port, "trade_penalty", 0.0)))
+            prev_w = w_drift.reindex(scores.index).fillna(0.0)
+            impact_sigma = (vol_row
+                            if bool(getattr(theta.costs, "impact_vol_scaled", False))
+                            else None)
+            if risk is None:
+                # DIAGONAL Sigma -> the problem is separable and has an exact
+                # solution. The projected subgradient that used to run here does
+                # not converge: measured against SLSQP on this exact shape it
+                # left 4.4e-4 of objective on the table and put ~15% of the book
+                # in the wrong place (mean L1 0.148 on weights summing to 1).
+                # The exact solve matches SLSQP to L1 0.00000, is feasible to
+                # 1.6e-13, and runs 28.8x faster.
+                from quantaalpha.eval.riskmodel import mv_weights_exact
+
+                k2s = None
+                if float(theta.costs.kappa2) > 0 and adv_row is not None:
+                    a = adv_row.reindex(scores.index)
+                    a = a.fillna(a.median() if a.notna().any() else 1.0).clip(lower=1e-9)
+                    e = float(theta.costs.impact_exponent)
+                    k2s = (float(theta.costs.kappa2) / a.to_numpy() ** (e - 1.0))
+                    if impact_sigma is not None:
+                        sg = impact_sigma.reindex(scores.index)
+                        k2s = k2s * sg.fillna(sg.median() if sg.notna().any() else 0.02).to_numpy()
+                target = mv_weights_exact(
+                    mu, (vol_row ** 2) * horizon_scale, gamma, prev_w, lam, max_w,
+                    k2_scale=k2s,
+                    impact_exponent=float(theta.costs.impact_exponent),
+                    hurdle=float(getattr(port, "cost_hurdle", 1.0)),
+                    trade_penalty=float(getattr(port, "trade_penalty", 0.0)))
+            else:
+                # A factor Sigma couples the names, so separability -- and with
+                # it the exact argument above -- does not hold. Keep the
+                # subgradient for that path rather than pretend otherwise.
+                target = mv_weights_costed(
+                    mu, risk, None,
+                    gamma, prev_w, lam, max_w,
+                    adv_w=adv_row, kappa2=float(theta.costs.kappa2),
+                    impact_exponent=float(theta.costs.impact_exponent),
+                    impact_sigma=impact_sigma,
+                    hurdle=float(getattr(port, "cost_hurdle", 1.0)),
+                    trade_penalty=float(getattr(port, "trade_penalty", 0.0)))
         elif risk is not None:
             from quantaalpha.eval.riskmodel import mv_weights_factor
 
@@ -478,7 +561,7 @@ def mean_variance(
             # no window yet (the first year of the panel). Falling back is
             # deliberate: a rank-deficient risk model is worse than an honest
             # diagonal one.
-            target = _mv_weights(mu, vol_row ** 2, lam, max_w)
+            target = _mv_weights(mu, (vol_row ** 2) * horizon_scale, lam, max_w)
 
         # Spend at most the turnover budget: move partway from the drifted book
         # toward the target. Both are on the simplex, so the blend is feasible.

@@ -128,3 +128,8 @@ release-notes.md
 # ---- Sphinx documentation ----
 docs/_build/
 .claude
+hf_data
+logs
+scripts 
+tests
+tools

@@ -129,8 +129,9 @@ class FactorEvaluatorForCoder(CoSTEEREvaluator):
                 if symbol_length > symbol_length_threshold:
                     feedback_parts.append(
                         f"Symbol Length (SL) Check Failed: Symbol length ({symbol_length}) exceeds threshold ({symbol_length_threshold}). "
-                        f"The factor expression is too complex and may lead to overfitting. "
-                        f"Please simplify the expression to reduce structural complexity."
+                        f"This exceeded the gate and the factor was rejected before "
+                        f"evaluation. How to bring the construction under the "
+                        f"threshold is your judgement."
                     )
                 
                 # Base features (ER)

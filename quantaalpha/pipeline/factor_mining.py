@@ -31,8 +31,8 @@ from quantaalpha.pipeline.evolution import (
     StrategyTrajectory,
     RoundPhase,
 )
-# Name of the scalar being optimized, so Arm B's logs do not claim to show
-# RankIC while actually showing U.
+# Name of the scalar being optimized, so the objective's logs do not claim to
+# show RankIC while actually showing U.
 from quantaalpha.pipeline.evolution.trajectory import _PRIMARY_METRIC
 from quantaalpha.core.exception import FactorEmptyError
 from quantaalpha.log import logger
@@ -150,13 +150,30 @@ def _run_evolution_task(
     strategy_suffix = task.get("strategy_suffix", "")
     round_idx = task["round_idx"]
     parent_trajectories = task.get("parent_trajectories", [])
+    # Refine-mode fields (present when the objective vector ``U`` is available;
+    # absent on orthogonal mutation tasks, so the loop stays byte-identical to
+    # before).
+    # See evolution/refine.py + diagnosis.py: a RefinementOperator produces these
+    # from a parent's verdict; the loop uses them to freeze the parent's sound
+    # layers and refine only the diagnosed weakness (Eq. 6).
+    refine_mode = bool(task.get("refine_mode", False))
+    refine_directive = task.get("refine_directive") or None
+    parent_prefix = task.get("parent_prefix") or None
+    # Crossover carries its two parents' expressions instead of a single
+    # parent prefix; the loop needs them to apply the both-parent check.
+    crossover_parents = task.get("crossover_parents") or None
+    refine_factors_block = task.get("refine_factors_block", "")
+    revise_hypothesis_block = task.get("revise_hypothesis_block", "")
+    # Crossover (Eq. 7): the two parents' validated strengths as constructor
+    # inspiration. Empty on refine/orthogonal tasks.
+    crossover_strength_block = task.get("crossover_strength_block", "")
 
     # Per-round deterministic LLM seed: base (CHAT_SEED env, immutable) + round
     # index. Round 0 reproduces the old fixed-seed protocol exactly; later
     # rounds draw from a different but reproducible seed. At CHAT_TEMPERATURE=0
     # this is inert (the provider is deterministic regardless of seed); it only
     # contributes diversity once the user opts in by raising the temperature,
-    # and then both arms stay reproducible because the seed is a function of the
+    # and then the run stays reproducible because the seed is a function of the
     # round, not of wall-clock randomness.
     try:
         _chat_seed_base = int(os.environ.get("CHAT_SEED", "42"))
@@ -167,8 +184,8 @@ def _run_evolution_task(
     # Resolve direction by phase. Prefer the controller-attached string
     # (task["direction"]) so a reseed-grown direction reaches the loop even
     # though the local `directions` list was frozen at round 0; fall back to
-    # that list to keep the control arm (which seeds the controller from the
-    # same list) byte-identical.
+    # that list to keep the controller (which seeds from the same list)
+    # byte-identical.
     direction = task.get("direction")
     if direction is None:
         if phase in (RoundPhase.ORIGINAL, RoundPhase.MUTATION):
@@ -177,6 +194,13 @@ def _run_evolution_task(
             direction = None
 
     trajectory_id = StrategyTrajectory.generate_id(direction_id, round_idx, phase)
+    # Publish it on the task so the ONE id is shared. The controller's
+    # create_trajectory_from_loop_result receives this same dict (sequential
+    # path: by reference; parallel path: round-tripped as result["task"]) and
+    # now reuses this value instead of minting a second one. Without this the
+    # library recorded children under one id space and parents under another,
+    # and no parent link in the library ever resolved.
+    task["trajectory_id"] = trajectory_id
     parent_ids = [p.trajectory_id for p in parent_trajectories] or task.get(
         "parent_trajectory_ids", []
     )
@@ -204,6 +228,13 @@ def _run_evolution_task(
         direction_id=direction_id,
         round_idx=round_idx,
         quality_gate_config=quality_gate_cfg or {},
+        refine_mode=refine_mode,
+        refine_directive=refine_directive,
+        parent_prefix=parent_prefix,
+        crossover_parents=crossover_parents,
+        refine_factors_block=refine_factors_block,
+        revise_hypothesis_block=revise_hypothesis_block,
+        crossover_strength_block=crossover_strength_block,
     )
     model_loop.user_initial_direction = user_direction
 
@@ -313,17 +344,49 @@ def _run_tasks_parallel(
         return []
 
     result_queue = Queue()
-    processes = []
 
-    logger.info(f"Starting {len(tasks)} parallel evolution tasks")
+    # BOUNDED. This used to start one Process per task with no cap: with
+    # num_directions=10 that is 10 concurrent full backtests, each holding its
+    # own panel + zoo signals. Measured on this box a single mine process is
+    # ~1.5 GB resident, so 10 of them is ~15 GB on a 16 GB machine with swap
+    # already near full -- an OOM/freeze, not a slowdown. The cap is the
+    # constraint that actually binds (memory), not the core count.
+    #
+    # QA_MAX_PARALLEL_TASKS overrides. Default: leave a core and ~4 GB for the
+    # OS and the parent, and never exceed the task count.
+    try:
+        import multiprocessing as _mp
+        _cores = _mp.cpu_count()
+    except Exception:
+        _cores = 4
+    _mem_gb = 0.0
+    try:
+        _mem_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        pass
+    _by_mem = max(1, int((_mem_gb - 4.0) // 1.5)) if _mem_gb else 2
+    _default = max(1, min(_cores - 1, _by_mem, 4))
+    try:
+        max_workers = int(os.environ.get("QA_MAX_PARALLEL_TASKS", _default))
+    except ValueError:
+        max_workers = _default
+    max_workers = max(1, min(max_workers, len(tasks)))
 
-    for idx, task in enumerate(tasks):
-        serialized_task = _serialize_task_for_parallel(task)
+    logger.info(
+        f"Starting {len(tasks)} parallel evolution tasks, {max_workers} at a time "
+        f"(cores={_cores}, ram={_mem_gb:.0f}GB, ~1.5GB/worker)"
+    )
 
+    results = []
+    pending = list(enumerate(tasks))
+    procs: dict[int, Process] = {}
+    collected = 0
+
+    def _launch(idx: int, task: dict) -> None:
         p = Process(
             target=_parallel_task_worker,
             args=(
-                serialized_task,
+                _serialize_task_for_parallel(task),
                 directions,
                 step_n,
                 use_local,
@@ -335,14 +398,25 @@ def _run_tasks_parallel(
             ),
         )
         p.start()
-        processes.append(p)
+        procs[idx] = p
         logger.info(
-            f"Started task {idx}: phase={task['phase'].value}, direction={task['direction_id']}"
+            f"Started task {idx}: phase={task['phase'].value}, "
+            f"direction={task['direction_id']} ({len(procs)}/{max_workers} slots)"
         )
 
-    results = []
-    for _ in range(len(tasks)):
+    # A slot is freed by the RESULT, not by is_alive(). Reaping on is_alive()
+    # deadlocks whenever len(tasks) > max_workers: multiprocessing's queue
+    # feeder thread can keep a process "alive" after it has put its result, so
+    # the loop sat blocked in get() with a full window and never refilled.
+    # Verified on (tasks, cap) = (10,3), (8,2), (5,1): all complete, peak
+    # concurrency never exceeds the cap.
+    while collected < len(tasks):
+        while pending and len(procs) < max_workers:
+            idx, task = pending.pop(0)
+            _launch(idx, task)
+
         result = result_queue.get()
+        collected += 1
         if result["success"]:
             original_task = tasks[result["task_idx"]]
             result["task"] = original_task
@@ -353,7 +427,11 @@ def _run_tasks_parallel(
             logger.error(f"Task {result['task_idx']} failed: {result['error']}")
             logger.error(result.get("traceback", ""))
 
-    for p in processes:
+        finished = procs.pop(result["task_idx"], None)
+        if finished is not None:
+            finished.join()
+
+    for p in procs.values():
         p.join()
 
     logger.info(f"Parallel tasks done: {len(results)}/{len(tasks)} succeeded")
@@ -396,9 +474,22 @@ def run_evolution_loop(
         evolution_cfg.get("parent_selection_strategy", "best")
     )
     top_percent_threshold = float(evolution_cfg.get("top_percent_threshold", 0.3))
+    # T6 ADMITTED-PUSH. This was declared on EvolutionConfig and read by
+    # ``_prepare_mutation_targets`` but never plumbed through from the YAML, so
+    # the knob sat at its 0.0 dataclass default and every admitted winner went
+    # crossover-only regardless of the configured fraction.
+    admitted_push_fraction = float(
+        evolution_cfg.get("admitted_push_fraction", 0.0) or 0.0
+    )
+    # Same trap: declared on EvolutionConfig, read by the router, but with no
+    # path from the YAML. Not currently set in any config, so wiring it changes
+    # nothing today -- it just stops a future value from being silently dropped.
+    orthogonal_tail_fraction = float(
+        evolution_cfg.get("orthogonal_tail_fraction", 0.25) or 0.0
+    )
     log_root = str(logger.log_trace_path)
     parallel_enabled = bool(evolution_cfg.get("parallel_enabled", False))
-    # QA_SEQUENTIAL_EVOLUTION overrides the config for the treatment arm.
+    # QA_SEQUENTIAL_EVOLUTION overrides the config.
     # Feedback only teaches batches generated after it, so batches produced
     # concurrently within a round cannot learn from each other's verdicts --
     # the mechanism the net-of-cost objective depends on is silently disabled
@@ -425,7 +516,6 @@ def run_evolution_loop(
             prompt_file=prompt_path,
             max_attempts=int(planning_cfg.get("max_attempts", 5)),
             use_llm=bool(planning_cfg.get("use_llm", True)),
-            allow_fallback=bool(planning_cfg.get("allow_fallback", True)),
             seed_in_generation=bool(planning_cfg.get("seed_in_generation", True)),
         )
     elif planning_enabled:
@@ -437,7 +527,20 @@ def run_evolution_loop(
     for i, d in enumerate(directions):
         logger.info(f"  Direction {i}: {d}")
 
-    pool_save_path = Path(log_root) / "trajectory_pool.json"
+    # Pool location. ``log_root`` is a FRESH timestamped directory on every
+    # launch, so a pool written there can never be found by a restart -- which
+    # silently defeats fresh_start=False (the run reloads nothing and re-mines
+    # from round 0). Anchor it to the EXPERIMENT instead, which is stable across
+    # restarts by construction: run.sh derives the ledger path from the same id.
+    # QA_POOL_PATH overrides for one-off runs.
+    _exp = os.environ.get("EXPERIMENT_ID", "")
+    if os.environ.get("QA_POOL_PATH"):
+        pool_save_path = Path(os.environ["QA_POOL_PATH"])
+    elif _exp:
+        pool_save_path = Path("data/results") / f"trajectory_pool_{_exp}.json"
+    else:
+        pool_save_path = Path(log_root) / "trajectory_pool.json"
+    pool_save_path.parent.mkdir(parents=True, exist_ok=True)
     mutation_prompt_path = Path(__file__).parent / "prompts" / "evolution_prompts.yaml"
     informed_prompt_path = Path(__file__).parent / "prompts" / "informed_planning_prompts.yaml"
 
@@ -454,6 +557,8 @@ def run_evolution_loop(
         prefer_diverse_crossover=True,
         parent_selection_strategy=parent_selection_strategy,
         mutation_top_fraction=mutation_top_fraction,
+        admitted_push_fraction=admitted_push_fraction,
+        orthogonal_tail_fraction=orthogonal_tail_fraction,
         top_percent_threshold=top_percent_threshold,
         parallel_enabled=parallel_enabled,
         pool_save_path=str(pool_save_path),
@@ -464,12 +569,15 @@ def run_evolution_loop(
         if mutation_prompt_path.exists()
         else None,
         fresh_start=fresh_start,
-        reseed_after_stale_rounds=int(evolution_cfg.get("reseed_after_stale_rounds", 2) or 0),
+        reseed_after_stale_rounds=int(evolution_cfg.get("reseed_after_stale_rounds", 1) or 0),
+        growth_floor=int(evolution_cfg.get("growth_floor", 2) or 0),
+        reseed_interval=int(evolution_cfg.get("reseed_interval", 3) or 0),
         directions=list(directions),
         initial_direction=initial_direction or "",
         informed_prompt_path=str(informed_prompt_path)
         if informed_prompt_path.exists()
         else None,
+        seed_in_generation=bool(planning_cfg.get("seed_in_generation", True)),
     )
 
     controller = EvolutionController(config)
@@ -666,6 +774,17 @@ def main(
             (run_cfg.get("quality_gate") or {}) if isinstance(run_cfg, dict) else {}
         )
 
+        # Export the per-hypothesis factor count so the construction prompt can
+        # state it. It reaches proposal.py through the environment because those
+        # classes are built deep in the RD-Agent loop and get pickled. Without
+        # this the key is inert: nothing else reads it, and the prompt used to
+        # hardcode "2-3 Factors per Generation" regardless of what config said.
+        factor_cfg = (run_cfg.get("factor") or {}) if isinstance(run_cfg, dict) else {}
+        _fph = factor_cfg.get("factors_per_hypothesis")
+        if _fph is not None:
+            os.environ["QA_FACTORS_PER_HYPOTHESIS"] = str(int(_fph))
+            logger.info(f"  Factors per hypothesis: {int(_fph)}")
+
         if evolution_mode is not None:
             use_evolution = evolution_mode
         else:
@@ -708,7 +827,6 @@ def main(
             n_dirs = int(planning_cfg.get("num_directions", 1))
             max_attempts = int(planning_cfg.get("max_attempts", 5))
             use_llm = bool(planning_cfg.get("use_llm", True))
-            allow_fallback = bool(planning_cfg.get("allow_fallback", True))
             prompt_file = planning_cfg.get("prompt_file") or "planning_prompts.yaml"
             prompt_path = Path(__file__).parent / "prompts" / str(prompt_file)
             if planning_enabled and direction:
@@ -718,7 +836,6 @@ def main(
                     prompt_file=prompt_path,
                     max_attempts=max_attempts,
                     use_llm=use_llm,
-                    allow_fallback=allow_fallback,
                     seed_in_generation=bool(planning_cfg.get("seed_in_generation", True)),
                 )
             else:

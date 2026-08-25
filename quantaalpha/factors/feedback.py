@@ -19,13 +19,13 @@ from quantaalpha.utils import convert2bool
 # Max retries for JSON parsing
 MAX_JSON_PARSE_RETRIES = 3
 
-# The metrics the generator is shown under the control-arm objective.
+# The metrics the generator is shown by the default Qlib feedback path.
 #
 # Note what these are: Qlib computes `excess_return_with_cost.*` alongside
 # these, and they are discarded here before reaching the prompt. The feedback
 # that shapes the next hypothesis therefore never mentions transaction cost --
 # the frictionless/tradeable gap of the formulation, reduced to four string
-# literals. The treatment arm replaces this selection wholesale
+# literals. The net-cost objective replaces this selection wholesale
 # (see net_cost_feedback.NetCostFactorFeedback).
 FRICTIONLESS_METRICS = [
     "1day.excess_return_without_cost.max_drawdown",
@@ -219,7 +219,7 @@ class QlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
 qa_feedback_prompts = Prompts(file_path=Path(__file__).parent / "prompts" / "prompts.yaml")
 class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
     def _build_combined_result(self, current_result, sota_result) -> str:
-        """The metric block the LLM sees. Overridden by the treatment arm."""
+        """The metric block the LLM sees. Overridden by the net-cost objective."""
         return process_results(current_result, sota_result)
 
     def generate_feedback(self, exp: Experiment, hypothesis: Hypothesis, trace: Trace) -> HypothesisFeedback:
@@ -281,7 +281,7 @@ class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Fee
             logger.warning(f"Failed to calculate complexity info: {e}")
 
         # Process the results to filter important metrics
-        # Extracted as a hook so the treatment arm can substitute a
+        # Extracted as a hook so the net-cost objective can substitute a
         # net-of-cost, dimension-targeted payload without duplicating this
         # entire method.
         combined_result = self._build_combined_result(current_result, sota_result)

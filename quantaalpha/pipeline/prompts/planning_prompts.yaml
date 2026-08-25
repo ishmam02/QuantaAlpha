@@ -1,3 +1,21 @@
+# CUT 2026-08-18: a "DIVERSITY ON EVERY AXIS" block (mechanism / horizon /
+# reasoning frame) and an "ACTIONABILITY" requirement.
+#
+# The diversity block began as a taxonomy of eight signal families with a quota
+# of ~2 directions each, and the model enumerated it: all eight families
+# appeared, roughly two per family, horizons distributed across the three named
+# buckets. That is grid-filling, not diversity. Stripping the taxonomy left a
+# generic version with no evidence behind it, and the monoculture it was meant
+# to cure (78% of hypotheses in one family) happened DOWNSTREAM of planning --
+# the ten directions themselves were varied. So the block was not solving the
+# problem it was added for.
+#
+# The system prompt already asks for directions that are "orthogonal in
+# approach". Actionability was filler.
+#
+# This file went 154 -> 455 words across the project's history and is the one
+# place where added prompt engineering measurably made the output worse.
+#
 # System prompt: role of the planning module
 # Placeholders: {initial_direction}, {n}, {seed_context} (seed_context may be
 # empty when seed_in_generation is disabled -- leaves a blank line, harmless).
@@ -13,8 +31,30 @@ user: |-
   {initial_direction}
 
   Generate EXACTLY {n} diversified exploration directions. Requirements:
-  1) Diversity: directions must differ in data signals, time horizons, or reasoning frameworks.
-  2) Actionability: each direction must be specific enough to generate a hypothesis.
+
+  1) ECONOMIC MECHANISM (required): each direction must say WHY the edge exists --
+     what about the behaviour of participants, the structure of the market, or
+     the constraints they trade under would cause it. A formula on its own is
+     not a direction: "compute the 20-day z-score of X" states what to compute
+     and not why it should predict anything.
+     No example of a good mechanism is given here on purpose. The one that used
+     to appear was a retail-herding reversal story, and 78% of the hypotheses in
+     the run that followed invoked retail-versus-institutional behaviour, with
+     every admitted factor inside that one family.
+
+  2) COMMIT TO A DIRECTION, AND DO NOT ASSUME ONE: for each direction, state
+     whether you expect a HIGH factor value to predict HIGHER or LOWER forward
+     returns, and why the mechanism implies that sign.
+     - Do NOT assume continuation ("what went up keeps going") is the default.
+       Whether a market continues or reverts at a given horizon is an EMPIRICAL
+       property of that market and horizon, not a universal law, and it differs
+       across venues, capitalisations and holding periods.
+     - Across the {n} directions, deliberately include BOTH continuation and
+       reversal framings so the search can measure which one this market
+       actually rewards rather than assuming it.
+     Realised results from earlier rounds are supplied to you as feedback when
+     they exist; when they do, let the MEASURED sign override your prior.
+
   3) Format: return JSON wrapped in a ```json code block.
 
 # Output format: JSON with "directions" array of exactly {n} strings

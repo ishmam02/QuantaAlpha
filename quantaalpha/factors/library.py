@@ -22,11 +22,36 @@ DEFAULT_FACTOR_CACHE_DIR = os.environ.get(
 )
 
 
+def _per_factor_metrics(backtest_results: Any, factor_expr: str) -> dict:
+    """This factor's own combiner credit, pulled out of the batch's results (C4).
+
+    ``factor_attribution`` is ``{expression: {...}}`` built by the ICIR
+    combiner's ``_icir_attribution`` and carried through by the runner. Each
+    record holds the factor's share of the composite's weight (``weight``), the
+    signed mean ICIR weight (``weight_raw``), cross-seed stability
+    (``weight_stability``), its own full-sample ``rank_ic``/``ic_mean``/
+    ``ic_std``, and its share of the book's rebalance cost
+    (``turnover_share``).
+
+    Returns ``{}`` when attribution is unavailable -- the LightGBM path produces
+    no per-factor weights, and a cache miss yields none either -- so callers see
+    an explicitly empty dict rather than the batch numbers wearing a per-factor
+    label, which would be worse than nothing.
+    """
+    if not isinstance(backtest_results, dict) or not factor_expr:
+        return {}
+    attribution = backtest_results.get("factor_attribution")
+    if not isinstance(attribution, dict):
+        return {}
+    rec = attribution.get(factor_expr)
+    return dict(rec) if isinstance(rec, dict) else {}
+
+
 def _admitted_flag(backtest_results: Any):
     """Whether F_Theta admitted this factor, or None if the arm has no verdict.
 
-    The treatment runner emits `feasible`; the control arm's Qlib metrics carry
-    no such key, so control-arm libraries record None rather than a misleading
+    The net-cost runner emits `feasible`; a Qlib-only metrics Series carries
+    no such key, so Qlib-only libraries record None rather than a misleading
     False.
     """
     if not isinstance(backtest_results, dict):
@@ -71,7 +96,7 @@ class FactorLibraryManager:
         exactly what an earlier attempt did.
 
         This seeds the pool the *generator* sees, not the E_Θ repository: the
-        treatment arm rehydrates its repository from the ledger, so a seeded
+        runner rehydrates its repository from the ledger, so a seeded
         factor still has to earn admission on its own contribution. That is the
         intended split -- the pool is what the search starts from, not what it
         is credited with.
@@ -252,6 +277,17 @@ class FactorLibraryManager:
                     "created_at": datetime.now().isoformat(),
                 },
                 "backtest_results": backtest_results,
+                # C4: this factor's OWN metrics, not the batch's.
+                #
+                # ``backtest_results`` above is one dict per EXPERIMENT, written
+                # identically to all N factors of the batch -- so every factor of
+                # a hypothesis carried the same RankIC and the library was not
+                # rankable (measured: 78 factors sharing 26 distinct IC values).
+                # The combiner already computes per-factor credit in
+                # ``_icir_attribution`` and the operator surfaces it as
+                # ``factor_attribution`` keyed by expression; it just was never
+                # written down. Empty on the LightGBM path or a cache miss.
+                "factor_metrics": _per_factor_metrics(backtest_results, factor_expr),
                 "feedback": feedback_dict,
                 # Did this factor pass F_Theta and enter the effective-alpha
                 # repository? The library records every trial (which the ledger

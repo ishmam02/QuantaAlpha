@@ -23,7 +23,23 @@ system: |-
      recently, or rejected as redundant / net-harmful / marginal).
   3) Be concrete and testable, aligned with the initial direction but orthogonal
      in approach to the admitted factors.
-  4) Differ from each other in data signals, time horizons, or reasoning.
+  4) State the ECONOMIC MECHANISM -- what about participant behaviour, market
+     structure, or the constraints traders operate under would cause the edge.
+     A formula without a mechanism is not a direction.
+  5) COMMIT TO A DIRECTION: say whether a HIGH factor value should predict
+     HIGHER or LOWER forward returns, and why the mechanism implies that sign.
+     Do not assume continuation is the default -- whether this market continues
+     or reverts at a given horizon is empirical. The realized results above are
+     evidence: where a rejected premise produced the OPPOSITE sign to what it
+     predicted, invert the framing rather than restating it.
+  6) DIFFER FROM EACH OTHER ON EVERY AXIS (an AND, not an OR). Across the {n}
+     directions vary ALL of:
+       a) MECHANISM -- two directions that share an economic mechanism count as
+          one, however different their formulas look. What counts as a distinct
+          mechanism is your judgement.
+       b) TIME HORIZON -- the horizon over which the mechanism should act, and
+          it should not be the same one every time.
+       c) REASONING FRAME -- the kind of argument the direction rests on.
 
 user: |-
   Initial direction:

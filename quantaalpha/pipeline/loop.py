@@ -52,10 +52,10 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
     
     @measure_time
     def __init__(
-        self, 
-        PROP_SETTING: BaseFacSetting, 
-        potential_direction, 
-        stop_event: threading.Event, 
+        self,
+        PROP_SETTING: BaseFacSetting,
+        potential_direction,
+        stop_event: threading.Event,
         use_local: bool = True,
         strategy_suffix: str = "",
         evolution_phase: str = "original",
@@ -64,6 +64,13 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
         direction_id: int = 0,
         round_idx: int = 0,
         quality_gate_config: dict = None,
+        refine_mode: bool = False,
+        refine_directive: dict = None,
+        parent_prefix: dict = None,
+        crossover_parents: dict = None,
+        refine_factors_block: str = "",
+        revise_hypothesis_block: str = "",
+        crossover_strength_block: str = "",
     ):
         with logger.tag("init"):
             self.use_local = use_local
@@ -77,6 +84,25 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             self.parent_trajectory_ids = parent_trajectory_ids or []
             self.direction_id = direction_id
             self.round_idx = round_idx  # 0=original, 1=mutation, 2=crossover, ...
+
+            # Diagnose-and-refine mutation (Eq. 6). Only set when a
+            # RefinementOperator diagnosed the parent; absent on orthogonal
+            # mutation tasks, so those stay byte-identical to before.
+            # ``refine_directive`` is the structured
+            # verdict (what to fix); ``parent_prefix`` is the frozen prefix
+            # (hypothesis + factor expressions to build on); the two block
+            # strings are pre-rendered prompt sections handed to the steps.
+            self.refine_mode = refine_mode
+            self.refine_directive = refine_directive or None
+            self.parent_prefix = parent_prefix or None
+            self.crossover_parents = crossover_parents or None
+            self.refine_factors_block = refine_factors_block or ""
+            self.revise_hypothesis_block = revise_hypothesis_block or ""
+            # Crossover (Eq. 7): the two parents' validated strengths, rendered
+            # as constructor inspiration ("draw ideas from, do not copy"). Empty
+            # on refine/orthogonal tasks; threaded onto the factor constructor
+            # below, parallel to ``refine_factors_block``.
+            self.crossover_strength_block = crossover_strength_block or ""
 
             # Quality gate config
             self.quality_gate_config = quality_gate_config or {}
@@ -116,6 +142,31 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             )
             logger.log_object(self.factor_constructor, tag="experiment generation")
 
+            # Thread the refine directive into the steps that act on it. The
+            # hypothesis generator decides freeze-vs-revise (refine_target);
+            # the factor constructor injects the frozen-prefix block when the
+            # hypothesis is frozen and only the expressions are refined. Both
+            # steps read these attributes via getattr with a default, so an
+            # orthogonal loop (no attrs set) is unchanged.
+            if self.refine_mode and self.refine_directive:
+                self.hypothesis_generator.refine_directive = self.refine_directive
+                self.hypothesis_generator.parent_prefix = self.parent_prefix or {}
+                self.hypothesis_generator.revise_hypothesis_block = self.revise_hypothesis_block
+                self.factor_constructor.refine_directive = self.refine_directive
+                self.factor_constructor.parent_prefix = self.parent_prefix or {}
+                self.factor_constructor.refine_factors_block = self.refine_factors_block
+                # Crossover inspiration block (recombine path). Empty on refine
+                # tasks, so the constructor's existing expression-refine logic
+                # is unchanged.
+                self.factor_constructor.crossover_strength_block = (
+                    self.crossover_strength_block
+                )
+                logger.info(
+                    f"Refine mode: target={self.refine_directive.get('refine_target')}, "
+                    f"verdict={self.refine_directive.get('verdict')}, "
+                    f"weakness={self.refine_directive.get('weakness_dimension')}"
+                )
+
             self.coder: Developer = import_class(PROP_SETTING.coder)(scen)
             logger.log_object(self.coder, tag="coder")
             
@@ -154,8 +205,92 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
         """Construct multiple factors from the hypothesis."""
         with logger.tag("r"): 
             factor = self.factor_constructor.convert(prev_out["factor_propose"], self.trace)
+            self._apply_operator_contract(factor)
             logger.log_object(factor.sub_tasks, tag="experiment generation")
         return factor
+
+    def _apply_operator_contract(self, factor) -> None:
+        """Check that the operator actually did structural work.
+
+        Measured behaviour without this: EVERY refine child changes a lookback
+        window, whatever weakness the diagnosis named -- one rescue and four
+        regressions across two runs. A better diagnosis fed to an operator that
+        answers every instruction by editing one constant produces better-
+        labelled constant edits, so the diagnosis and this check have to ship
+        together.
+
+        Drops a literal-only child only when a sibling survives, so the contract
+        can never empty a batch; otherwise it records the violation and lets the
+        child through. The point is first to MEASURE how often this happens --
+        the fraction falling over a run is the evidence that the diagnosis is
+        being acted on rather than merely read.
+        """
+        try:
+            from quantaalpha.pipeline.evolution.operator_contract import (
+                ContractReport, check_crossover, check_refine, rejection_note,
+            )
+        except Exception:
+            return
+        directive = getattr(self, "refine_directive", None) or {}
+        tasks = list(getattr(factor, "sub_tasks", None) or [])
+        if not tasks:
+            return
+
+        # A crossover carries its two parents' expressions; a refine carries a
+        # single parent prefix. Checking a crossover with the refine rule (or
+        # vice versa) tests the wrong property.
+        cx = getattr(self, "crossover_parents", None) or {}
+        a_exprs, b_exprs = list(cx.get("a") or []), list(cx.get("b") or [])
+        is_crossover = bool(a_exprs and b_exprs)
+        prefix = getattr(self, "parent_prefix", None) or {}
+        parents = [f.get("expression", "") for f in (prefix.get("factors") or [])
+                   if f.get("expression")]
+        # T5: the crossover gate (check_crossover) fires whenever the task
+        # carries BOTH parents' expressions, regardless of refine_target
+        # (crossover is "recombine", not "expression"). The refine gate
+        # (check_refine, literal-only edit) fires only on the expression-refine
+        # path. A task with neither payload has nothing to check.
+        if not is_crossover and not (directive.get("refine_target") == "expression" and parents):
+            return
+
+        report = ContractReport()
+        offenders = []
+        for t in tasks:
+            expr = getattr(t, "factor_expression", None)
+            if not expr:
+                continue
+            if is_crossover:
+                r = check_crossover(expr, a_exprs, b_exprs)
+                passed = r.ok
+                report.note(r)
+            else:
+                results = [check_refine(expr, p) for p in parents]
+                passed = any(r.ok for r in results)
+                report.note(results[0] if not passed
+                            else results[0].__class__(True, "structural"))
+            if not passed:
+                offenders.append(t)
+
+        if report.checked:
+            kind = "crossover" if is_crossover else "refine"
+            what = ("inherited from only ONE parent" if is_crossover
+                    else "changed ONLY numeric constants")
+            logger.info(
+                f"operator contract [{kind}]: {report.rejected}/{report.checked} "
+                f"child(ren) {what}"
+            )
+        if offenders and len(offenders) < len(tasks):
+            keep = [t for t in tasks if t not in offenders]
+            factor.sub_tasks = keep
+            logger.info(
+                f"operator contract: dropped {len(offenders)} literal-only "
+                f"child(ren); {len(keep)} structural sibling(s) remain"
+            )
+        elif offenders:
+            logger.info(
+                "operator contract: ALL children were literal-only; keeping them "
+                "rather than emptying the batch. " + rejection_note("literal_only")
+            )
 
     @measure_time
     @stop_event_check
@@ -184,6 +319,68 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
     @measure_time
     @stop_event_check
     def feedback(self, prev_out: dict[str, Any]):
+        # Operator-coverage measurement for the within-mechanism generator. The
+        # construct LLM reads ``hypothesis_and_feedback`` (the channel
+        # ``generate_feedback`` fills) in the SAME user prompt that already lists
+        # every declared operator via ``function_lib_description`` -- so it can SEE
+        # REGBETA/RSI/MACD/COUNT but has no signal about which the population has
+        # exhausted. The block below puts that measurement beside the menu: the
+        # library-so-far (prior rounds, read before this batch is saved) plus the
+        # current batch's factors. Measurement only -- the block names the unused
+        # operators as the LOCATION of the convergence and closes "yours to
+        # determine", prescribing no remedy and carrying no market prior.
+        #
+        # ``library_path`` is computed here (hoisted from the save block below) so
+        # the population can be read and so the save reuses the same path.
+        import os as _os
+        from pathlib import Path as _Path
+        from quantaalpha.factors.operator_coverage import coverage_block as _coverage_block
+        _project_root = _Path(__file__).resolve().parent.parent.parent
+        _library_suffix = _os.environ.get("FACTOR_LIBRARY_SUFFIX", "")
+        _library_filename = (
+            f"all_factors_library_{_library_suffix}.json" if _library_suffix
+            else "all_factors_library.json"
+        )
+        _factorlib_dir = _project_root / "data" / "factorlib"
+        library_path = _factorlib_dir / _library_filename
+        population_exprs: list[str] = []
+        try:
+            from quantaalpha.factors.library import FactorLibraryManager as _FLM
+            _prior = _FLM(str(library_path)).data.get("factors", {}) or {}
+            population_exprs.extend(
+                f.get("factor_expression", "") for f in _prior.values()
+                if isinstance(f, dict) and f.get("factor_expression")
+            )
+        except Exception:
+            logger.exception("could not read prior factor library for coverage; using current batch only")
+        try:
+            # The CURRENT batch's factor expressions live on the EXPERIMENT, not
+            # the hypothesis: ``prev_out["factor_propose"]`` is the hypothesis
+            # (no factor_expression), while ``prev_out["factor_backtest"]`` is
+            # the runner-developed experiment whose ``sub_tasks[*].factor_expression``
+            # ``add_factors_from_experiment`` reads just below. Without this the
+            # current batch would be missing from the population and round 0
+            # (empty prior library) would render NO coverage block -- the very
+            # round the monoculture forms.
+            _exp = prev_out.get("factor_backtest")
+            for _t in getattr(_exp, "sub_tasks", []) or []:
+                _e = getattr(_t, "factor_expression", "")
+                if _e:
+                    population_exprs.append(_e)
+        except Exception:
+            logger.exception("could not read current-batch factor expressions for coverage")
+        try:
+            _cov = _coverage_block(population_exprs)
+        except Exception:
+            logger.exception("operator-coverage block failed for feedback; omitting")
+            _cov = ""
+        # Per-process summarizer instance under parallel execution, so the
+        # attribute is local to this worker and never crosses arms.
+        try:
+            self.summarizer.operator_coverage_block = _cov
+        except Exception:
+            pass
+
         feedback = self.summarizer.generate_feedback(prev_out["factor_backtest"], prev_out["factor_propose"], self.trace)
         with logger.tag("ef"):  # evaluate and feedback
             logger.log_object(feedback, tag="feedback")
@@ -193,12 +390,8 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
 
         # Auto-save factors to unified factor library
         try:
-            import os
             from pathlib import Path
             from quantaalpha.factors.library import FactorLibraryManager
-            
-            # Project root: loop.py -> pipeline/ -> quantaalpha/ -> project_root/
-            project_root = Path(__file__).resolve().parent.parent.parent
 
             experiment_id = "unknown"
             if hasattr(self, 'session_folder') and self.session_folder:
@@ -221,15 +414,10 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             trajectory_id = getattr(self, 'trajectory_id', '')
             parent_trajectory_ids = getattr(self, 'parent_trajectory_ids', [])
 
-            # Factor library filename can be customized via env FACTOR_LIBRARY_SUFFIX
-            library_suffix = os.environ.get('FACTOR_LIBRARY_SUFFIX', '')
-            if library_suffix:
-                library_filename = f"all_factors_library_{library_suffix}.json"
-            else:
-                library_filename = "all_factors_library.json"
-            factorlib_dir = project_root / "data" / "factorlib"
-            factorlib_dir.mkdir(parents=True, exist_ok=True)
-            library_path = factorlib_dir / library_filename
+            # Factor library path is hoisted above (computed before the feedback
+            # call so the operator-coverage population could read the prior
+            # library); reuse it here and ensure the directory exists.
+            _factorlib_dir.mkdir(parents=True, exist_ok=True)
             manager = FactorLibraryManager(str(library_path))
             manager.add_factors_from_experiment(
                 experiment=prev_out["factor_backtest"],

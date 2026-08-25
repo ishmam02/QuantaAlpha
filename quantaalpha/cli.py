@@ -21,6 +21,16 @@ else:
 
 import fire
 from quantaalpha.pipeline.factor_mining import main as mine
+
+# Record every LLM exchange for after-the-fact audit. Installed at the CLI so it
+# covers every entry point and every operator, rather than one call site at a
+# time. Several defects this session were invisible in metrics and obvious in
+# the transcript: format specs shipped where numbers belonged, a horizon
+# instruction that contradicted the gate, and context blocks that vanished when
+# their loader failed. QA_LLM_LOG=0 disables.
+from quantaalpha.llm.io_log import install as _install_llm_log
+
+_install_llm_log()
 from quantaalpha.pipeline.factor_backtest import main as backtest
 from quantaalpha.app.utils.health_check import health_check
 from quantaalpha.app.utils.info import collect_info
@@ -30,8 +40,8 @@ from quantaalpha.app.utils.info import collect_info
 # this is the real entry point. The evolution operators use unseeded
 # `random.shuffle`/`random.sample`/`random.choices`
 # (crossover.py:370/412/432/502, mutation.py:217); seeding here makes those
-# reproducible. Property 2 binds E_theta, not the generator, but a clean A/B
-# needs both arms to explore identically.
+# reproducible. Property 2 binds E_theta, not the generator, but seeding the
+# generator here makes the run reproducible.
 # (Note: TrajectoryPool.select_parents_for_crossover at trajectory.py:251 also
 # shuffles, but is dead code -- the controller uses
 # crossover_op.select_crossover_pairs.)

@@ -30,7 +30,17 @@ from .trajectory import (
 )
 from .mutation import MutationOperator
 from .crossover import CrossoverOperator
+from .refine import RefinementOperator
 
+
+# T6 diagnosability-based mutation routing. Each prev-phase parent is bucketed
+# by what its evaluation verdict SAYS to do with it, not by where it ranks on
+# fitness (the old rank+tail-cut routing bred the best parents and restarted the
+# weakest -- backwards: the failures need refining, the winners go to crossover).
+# See ``_prepare_mutation_targets`` / ``_build_mutation_task``.
+_BUCKET_REFINE = "refine"            # rejected + a usable verdict -> fix why it failed
+_BUCKET_ORTHOGONAL = "orthogonal"    # NO_DATA / no usable verdict / exhausted lever
+_BUCKET_ADMITTED_PUSH = "admitted_push"  # a gated admitted winner -> push the edge
 
 
 def expected_factor_count(
@@ -69,6 +79,11 @@ def expected_factor_count(
     return batches * max(int(factors_per_hypothesis), 0)
 
 
+# How many prior attempts the diagnosis is shown. Enough to reveal a repeated
+# failure, few enough to leave room for the parent's own detail.
+_POPULATION_SAMPLE = 8
+
+
 @dataclass
 class EvolutionConfig:
     """Configuration for evolution process."""
@@ -100,6 +115,23 @@ class EvolutionConfig:
     # Fraction of the previous phase kept as mutation parents, best first. 1.0
     # reproduces the old behaviour of mutating everything.
     mutation_top_fraction: float = 1.0
+
+    # VESTIGIAL under the T6 diagnosability-based bucket routing (see
+    # ``_prepare_mutation_targets``): selection now routes each parent to
+    # REFINE / ORTHOGONAL / ADMITTED-PUSH by its verdict + diagnosability, not by
+    # its fitness-rank position, so there is no "weakest tail" to cut. The field
+    # is kept for config-file compatibility and no longer drives routing.
+    orthogonal_tail_fraction: float = 0.25
+
+    # T6 ADMITTED-PUSH: a config-gated fraction of ADMITTED winners that ALSO get
+    # a "push the edge further" refine task (local-search exploitation of a
+    # working factor), instead of going to crossover only. 0.0 (default) = a
+    # clean split -- admitted winners are crossover-only, never mutated; the
+    # mutation budget goes entirely to refining rejected diagnosable parents.
+    # >0 fills the lowest-priority mutation slots with push-further refines
+    # (REFINE > ORTHOGONAL > ADMITTED-PUSH), so it never crowds out a
+    # failure-refine. NOT a Theta field.
+    admitted_push_fraction: float = 0.0
     # Top percent threshold when parent_selection_strategy = "top_percent_plus_random"
     top_percent_threshold: float = 0.3
 
@@ -116,17 +148,37 @@ class EvolutionConfig:
     # Start with empty trajectory pool (ignore existing data)
     fresh_start: bool = True
 
-    # Learning-aware reseed: rounds of NO repository growth before the search
-    # regenerates NEW, outcome-informed directions (treatment arm only; the
-    # control arm has no ledger and the gate no-ops). NOT a Theta field -- the
-    # frozen protocol hash must not move.
-    reseed_after_stale_rounds: int = 2
+    # Learning-aware reseed: regenerate NEW, outcome-informed directions when the
+    # repository grows too slowly. NOT a Theta field -- the frozen protocol hash
+    # must not move.
+    # Rounds of INSUFFICIENT growth (below ``growth_floor`` admissions) before a
+    # stale reseed fires. 1 fires on the first slow round; the previous 2 let a
+    # creeping zoo (an occasional admission) defer reseed indefinitely while the
+    # search inbred the same directions and the round cap gave up short of 150.
+    reseed_after_stale_rounds: int = 1
+    # A round whose admissions < growth_floor counts as stale (does not reset the
+    # counter). 2 means a 1-admission creep is still "stale"; only a burst of
+    # >= 2 resets. Set >= 1; a creep slower than this triggers reseed instead of
+    # inbreeding.
+    growth_floor: int = 2
+    # Scheduled immigration: every ``reseed_interval`` rounds, inject fresh
+    # informed directions REGARDLESS of growth -- steady anti-inbreed that does
+    # not wait for stagnation. 0 disables.
+    reseed_interval: int = 3
     # The controller owns the live direction list so it can GROW it on a reseed.
     # Seeded from the initial planning output; ``num_directions`` is the frozen
     # initial count (also the reseed batch size).
     directions: list[str] = field(default_factory=list)
     initial_direction: str = ""
     informed_prompt_path: Optional[str] = None
+    # Whether the Alpha158(20) seed library is injected into direction-planning.
+    # Mirrors ``planning_cfg.seed_in_generation`` so the RESEED path
+    # (``_generate_informed_directions`` -> ``generate_informed_directions``) honors
+    # the same flag the round-0 path (``generate_parallel_directions``) already
+    # reads from factor_mining. Without this the reseed would default to
+    # seed_in_generation=True and keep injecting the OHLCV seeds after the
+    # round-0 directions were de-primed -- half a de-prime. NOT a Theta field.
+    seed_in_generation: bool = True
 
 
 class EvolutionController:
@@ -168,6 +220,9 @@ class EvolutionController:
         crossover_path = Path(config.crossover_prompt_path) if config.crossover_prompt_path else None
         self.mutation_op = MutationOperator(prompt_path=mutation_path)
         self.crossover_op = CrossoverOperator(prompt_path=crossover_path)
+        # The refine prompts live in the same evolution_prompts.yaml (``refine:``
+        # section), so the operator reuses the mutation prompt path.
+        self.refine_op = RefinementOperator(prompt_path=mutation_path)
         
         # State tracking
         self._current_round = 0
@@ -178,8 +233,13 @@ class EvolutionController:
         
         # Track active branch count (changes after crossover)
         self._active_branch_count = config.num_directions
-        # Track trajectories to mutate in current mutation round
+        # Track trajectories to mutate in current mutation round. ``_mutation_buckets``
+        # is the parallel per-target routing decision (T6): REFINE / ORTHOGONAL /
+        # ADMITTED-PUSH, set by ``_prepare_mutation_targets`` from each parent's
+        # verdict + diagnosability (NOT its fitness rank) and read by
+        # ``_build_mutation_task`` so the serial and parallel paths route identically.
         self._mutation_targets: list[StrategyTrajectory] = []
+        self._mutation_buckets: list[str] = []
         self._mutation_idx = 0  # Current index in mutation targets
 
         # Learning-aware reseed state. The controller owns the live direction
@@ -193,6 +253,74 @@ class EvolutionController:
         self._best_zoo_size = -1
         self._stale_rounds = 0
         self._reseed_count = 0
+        # Zoo size at the previous reseed check, so growth is measured per round
+        # (admissions since the last check) rather than vs an all-time high -- a
+        # creeping zoo must still register as stale.
+        self._zoo_size_at_last_check = -1
+
+        # RESUME. The pool survives a restart (fresh_start=False) but this
+        # state block does not: without the restore below a resumed run rebuilds
+        # the zoo from the ledger and then re-runs ORIGINAL round 0 for every
+        # direction, re-mining work that is already in the pool.
+        if not config.fresh_start and self.pool._trajectories:
+            self._restore_progress()
+
+    def _restore_progress(self) -> None:
+        """Rebuild round / phase / completed-direction state from the pool.
+
+        Only three things have to be recovered for the loop to continue where it
+        stopped:
+
+        * ``_current_round`` -- the highest round any trajectory reached. The
+          loop increments it on each phase transition, so resuming a round lower
+          than the pool's maximum would re-do rounds already recorded.
+        * ``_directions_completed`` -- every direction that already has an
+          ORIGINAL trajectory. ``_get_original_task`` hands out the first
+          direction NOT in this set, so an empty set means all 10 originals are
+          re-mined before anything else runs.
+        * ``_current_phase`` -- the phase of the most recent trajectory. The
+          transition helpers advance from here, so starting at ORIGINAL after a
+          crossover round would walk the whole cycle again.
+
+        Everything else (crossover groups, mutation targets) is derived per
+        round from the pool, so it rebuilds itself on the next call.
+        """
+        trajs = list(self.pool._trajectories.values())
+        if not trajs:
+            return
+
+        max_round = max((getattr(t, "round_idx", 0) or 0) for t in trajs)
+
+        completed = set()
+        for t in trajs:
+            ph = getattr(t, "phase", None)
+            if ph is not None and getattr(ph, "value", ph) == RoundPhase.ORIGINAL.value:
+                completed.add(getattr(t, "direction_id", None))
+        completed.discard(None)
+
+        # Phase of the LATEST trajectory: created_at is an ISO string, so a
+        # plain max() orders correctly; fall back to round_idx when absent.
+        def _key(t):
+            return (getattr(t, "round_idx", 0) or 0, str(getattr(t, "created_at", "")))
+        latest = max(trajs, key=_key)
+        ph = getattr(latest, "phase", None)
+        phase = RoundPhase.ORIGINAL
+        if ph is not None:
+            try:
+                phase = ph if isinstance(ph, RoundPhase) else RoundPhase(getattr(ph, "value", ph))
+            except ValueError:
+                phase = RoundPhase.ORIGINAL
+
+        self._current_round = int(max_round)
+        self._directions_completed = completed
+        self._current_phase = phase
+        # RDAgentLog takes ONE message argument -- printf-style args raise.
+        n_dirs = len(self._directions) or self.config.num_directions
+        logger.info(
+            f"RESUME: restored from {len(trajs)} pooled trajectories -- "
+            f"round {self._current_round}, phase {self._current_phase.value}, "
+            f"{len(completed)}/{n_dirs} directions already have an ORIGINAL trajectory"
+        )
 
     @staticmethod
     def _blank_direction_status(direction_id: int, source: str) -> dict:
@@ -274,7 +402,17 @@ class EvolutionController:
                         "direction_id": d,
                         "direction": self._directions[d],
                         "parent_trajectories": [],
-                        "strategy_suffix": "",
+                        # ORIGINAL rounds are where reseed re-enters
+                        # exploration, and they were the ONLY phase that got no
+                        # memory at all ("No guidance for original"). Measured
+                        # consequence: the round-6 reseed produced 0 back-
+                        # references to any prior round -- it explored genuinely
+                        # new ground (48/51 novel hypotheses, six operators never
+                        # used before) and re-derived it from nothing, then
+                        # admitted nothing. Exploration does not require amnesia;
+                        # what has already been measured and failed is exactly
+                        # what a fresh direction should not re-tread.
+                        "strategy_suffix": self._build_zoo_context(),
                         "round_idx": self._current_round,
                     })
             
@@ -309,30 +447,27 @@ class EvolutionController:
             for idx, parent in enumerate(self._mutation_targets):
                 if idx < self._mutation_idx:
                     continue  # Skip already processed
-                
+
                 # Check if this mutation already exists
                 existing = [t for t in self.pool.get_all()
-                           if t.round_idx == self._current_round 
+                           if t.round_idx == self._current_round
                            and t.phase == RoundPhase.MUTATION
                            and parent.trajectory_id in t.parent_ids]
                 if existing:
                     continue
-                
-                suffix = self.mutation_op.generate_mutation_prompt_suffix(parent)
-                zc = self._build_zoo_context()
-                if zc:
-                    suffix = suffix + "\n" + zc
-                tasks.append({
-                    "phase": RoundPhase.MUTATION,
-                    "direction_id": idx,
-                    "parent_trajectories": [parent],
-                    "strategy_suffix": suffix,
-                    "round_idx": self._current_round,
-                })
-            
+
+                # T6: route by the bucket decided in _prepare_mutation_targets
+                # (shared with _get_mutation_task so the serial and parallel paths
+                # cannot diverge on the refine/orthogonal/push decision).
+                bucket = (self._mutation_buckets[idx]
+                          if idx < len(self._mutation_buckets)
+                          else _BUCKET_REFINE)
+                tasks.append(self._build_mutation_task(parent, idx, bucket))
+
             # If no tasks, transition phase for next call
             if not tasks:
                 self._mutation_targets = []
+                self._mutation_buckets = []
                 self._mutation_idx = 0
                 self._current_round += 1
                 
@@ -356,16 +491,24 @@ class EvolutionController:
             
             for idx in range(self._crossover_idx, len(self._crossover_groups)):
                 parents = self._crossover_groups[idx]
-                suffix = self.crossover_op.generate_crossover_prompt_suffix(parents)
+                # T6: compute each parent's strength directive ONCE (cached) so
+                # the suffix and build_task_extras share one diagnosis.
+                strengths = [self._cached_strength(p) for p in parents]
+                suffix = self.crossover_op.generate_crossover_prompt_suffix(parents, strengths)
                 zc = self._build_zoo_context()
                 if zc:
                     suffix = suffix + "\n" + zc
+                # Eq. 7: ship the two parents' validated strengths as constructor
+                # inspiration (not a literal splice). None when fewer than 2
+                # parents -> unchanged LLM-only crossover.
+                _cx_extras = self.crossover_op.build_task_extras(parents, strengths) or {}
                 tasks.append({
                     "phase": RoundPhase.CROSSOVER,
                     "direction_id": idx,
                     "parent_trajectories": parents,
                     "strategy_suffix": suffix,
                     "round_idx": self._current_round,
+                    **_cx_extras,
                 })
             
             # If no tasks, transition phase for next call
@@ -419,6 +562,7 @@ class EvolutionController:
             # Update mutation index to skip completed
             self._mutation_idx = len(self._mutation_targets)
             self._mutation_targets = []
+            self._mutation_buckets = []
             self._mutation_idx = 0
             self._current_round += 1
             
@@ -457,6 +601,16 @@ class EvolutionController:
     
     def _get_original_task(self) -> Optional[dict[str, Any]]:
         """Get next original round task."""
+        # Budget guard. The three phase getters call each other on every
+        # transition (original->mutation->crossover->mutation->...), and
+        # ``get_next_task``'s ``_rounds_exhausted`` check is only on the OUTER
+        # entry -- so once a transition chain starts, nothing re-checks it.
+        # Measured: a resumed controller whose pool has no minable parents
+        # recursed to round 1116+ with max_rounds=15 and QA_MAX_ROUNDS_CAP=60
+        # both set, i.e. the budget was bypassed entirely. Each getter now
+        # re-checks before doing any work.
+        if self._rounds_exhausted():
+            return None
         # Find a direction that hasn't completed original
         for d in range(len(self._directions)):
             if d not in self._directions_completed:
@@ -465,7 +619,10 @@ class EvolutionController:
                     "direction_id": d,
                     "direction": self._directions[d],
                     "parent_trajectories": [],
-                    "strategy_suffix": "",  # No guidance for original
+                    # See the note in get_all_tasks_for_current_phase: ORIGINAL
+                    # was the only phase generated with no memory of what had
+                    # already been measured and failed.
+                    "strategy_suffix": self._build_zoo_context(),
                     "round_idx": self._current_round,
                 }
         
@@ -503,8 +660,345 @@ class EvolutionController:
             logger.info("Neither mutation nor crossover enabled, evolution complete after original")
             return None
     
+    def _get_ablation_eval(self):
+        """Lazy per-segment ablation closure, env-gated (``QA_ABLATION_DIAGNOSIS=1``).
+
+        Returns a callable ``parent -> SegmentAblation | None`` that runs the
+        per-segment solo measurement of the parent's expression (the AlphaEvolve
+        "which sub-tree is broken" signal), or ``None`` when the flag is OFF (the
+        default). With the flag off, ``build_task_extras`` gets ``ablation_eval=None``
+        and the diagnosis is byte-identical to the pre-ablation path -- this is the
+        no-regression guarantee. Turning the ablation on for a relaunch is one flag.
+
+        The heavy ``CustomFactorCalculator`` (the ~163 MB/col qlib load) and the
+        ``EvaluationOperator`` panel are built ONCE and cached on
+        ``self._ablation_eval_cache``; the closure's ``eval_signal``/``score`` are
+        the metrics.py primitives wired exactly as the controller's own
+        coverage-probe precedent (``EvaluationOperator(theta)`` + ``_windows`` +
+        ``_panel`` + ``label_frame`` + ``_cross_sectional_corr(_slice(s, win), ...)``).
+        An eval error on any parent returns ``None`` so an ablation failure never
+        blocks a diagnosis (the refine.py seam catches it too, defence in depth).
+
+        Wired into the single per-parent diagnosis (``_cached_diagnosis``) that
+        BOTH the bucket classification (``_prepare_mutation_targets``) and the task
+        build (``_build_mutation_task`` -> ``build_task_extras``) reuse, so the
+        ablation runs ONCE per parent per round and the bucket decision and the
+        built task see the same directive (and the same ablation_summary). The
+        prior design ran the ablation only in the build and a second, ablation-less
+        diagnosis in the classification; the two LLM calls disagreed (the
+        classification saw a different prompt and the LLM path is not deterministic
+        across calls), so a REFINE bucket silently fell back to an orthogonal
+        restart. Caching one directive fixes both the disagreement and the cost.
+        """
+        if os.environ.get("QA_ABLATION_DIAGNOSIS", "0").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            return None
+        if getattr(self, "_ablation_eval_cache", None) is not None:
+            return self._ablation_eval_cache
+
+        import numpy as np
+        import pandas as pd
+        from quantaalpha.eval.data import align_signal
+        from quantaalpha.eval.metrics import (
+            _cross_sectional_corr, _slice, label_frame, newey_west_t,
+        )
+        from quantaalpha.eval.operator import EvaluationOperator
+        from quantaalpha.eval.protocol import default_protocol_path, load_protocol
+        from quantaalpha.backtest.custom_factor_calculator import CustomFactorCalculator
+        from quantaalpha.pipeline.evolution.segment_ablation import ablate
+
+        theta = load_protocol(os.environ.get("QA_PROTOCOL") or default_protocol_path())
+        op = EvaluationOperator(theta)
+        start, end, win = op._windows(False)
+        panel = op._panel(start, end)
+        label = label_frame(panel, theta)
+        # The factor-expression renderer (CustomFactorCalculator) needs the LONG
+        # qlib format -- a MultiIndex (datetime, instrument) frame with $close /
+        # $volume / ... columns -- but ``op._panel`` returns a PanelBundle of WIDE
+        # (dates x instruments) per-field frames. A bare ``CustomFactorCalculator()``
+        # has neither data_df nor config, so ``calculate_factor`` raised "No stock
+        # data provided and no config for loading" on every sub-expression and the
+        # ablation silently produced all-NaN (the 30x "Factor computation failed
+        # [abl]" in the 0823 smoke). Build the long frame once from the bundle's
+        # already-universe-masked fields and hand it to the calculator; the panel
+        # is the eval window's, so the solo metrics match the gate's window.
+        _fields = (("$open", panel.open), ("$high", panel.high),
+                   ("$low", panel.low), ("$close", panel.close),
+                   ("$volume", panel.volume), ("$amount", panel.amount),
+                   ("$vwap", panel.vwap))
+        long_df = pd.concat({n: f.stack() for n, f in _fields}, axis=1)
+        long_df.index.names = ["datetime", "instrument"]
+        calc = CustomFactorCalculator(data_df=long_df, auto_extract_cache=False)
+        _nan = float("nan")
+        _empty = pd.Series(dtype=float)
+
+        def eval_signal(sub_expr: str):
+            """Compute + align a sub-expression to the panel (opaque handle)."""
+            sig = calc.calculate_factor("abl", sub_expr)
+            if sig is None or (hasattr(sig, "empty") and sig.empty):
+                return None
+            return align_signal(sig, panel)
+
+        def _rank_turnover(handle) -> float:
+            """Construction-agnostic solo turnover (no book, no combiner).
+
+            The mean absolute day-to-day change in the signal's cross-sectional
+            rank, counted only across adjacent days BOTH in-universe (so
+            name entry/exit does not inject spurious jumps). This is the turnover
+            a long-short book on the sub-tree's signal would incur, independent of
+            the portfolio construction -- which is what the ablation needs to
+            attribute cost to a sub-tree. The prior ``solo_turnover()`` built a
+            ``topk_dropout`` book and raised ``NotImplementedError`` for the
+            ``mean_variance`` construction (Defect C, unmasked once Fix A made the
+            calculator actually render). Scale is a per-name per-day rank fraction
+            (0..1); only the RELATIVE turnover across sub-trees / windows is
+            load-bearing for routing, so the absolute scale is irrelevant here.
+            """
+            if handle is None:
+                return _nan
+            s = _slice(handle, win)
+            if s.empty:
+                return _nan
+            uni = _slice(panel.universe, win).reindex(
+                index=s.index, columns=s.columns).fillna(False)
+            ranks = s.where(uni).rank(axis=1, pct=True)
+            d = np.abs(np.diff(ranks.values, axis=0))
+            both = uni.values[1:] & uni.values[:-1]
+            if not both.any():
+                return _nan
+            return float(np.nanmean(np.where(both, d, np.nan)))
+
+        def score(handle) -> dict:
+            """SOLO metrics for one handle: IC and cost SEPARATELY (no net_ir)."""
+            if handle is None:
+                return {"rank_ic": _nan, "t_nw": _nan, "ic_pos_frac": _nan,
+                        "monotonicity": _nan, "turnover_solo": _nan, "ric_series": _empty}
+            ric = _cross_sectional_corr(_slice(handle, win), label, "spearman").dropna()
+            if ric.empty:
+                return {"rank_ic": _nan, "t_nw": _nan, "ic_pos_frac": _nan,
+                        "monotonicity": _nan, "turnover_solo": _nan, "ric_series": _empty}
+            return {
+                "rank_ic": float(ric.mean()),
+                "t_nw": float(newey_west_t(ric)),
+                "ic_pos_frac": float((ric > 0).mean()),
+                # monotonicity is not load-bearing for routing (the IC sign +
+                # t_nw + turnover carry the diagnosis); left NaN to avoid the
+                # extra quantile_metrics cost on every sub-tree + window variant.
+                "monotonicity": _nan,
+                "turnover_solo": _rank_turnover(handle),
+                "ric_series": ric,
+            }
+
+        def ablation_eval(parent):
+            factors = getattr(parent, "factors", None) or []
+            if not factors:
+                return None
+            expr = (factors[0] or {}).get("expression", "") or ""
+            if not expr:
+                return None
+            sign = str(getattr(parent, "expected_ic_sign", "") or "").strip().lower()
+            try:
+                return ablate(expr, sign, eval_signal=eval_signal, score=score)
+            except Exception as e:
+                logger.warning(f"ablation_eval failed for parent "
+                               f"{getattr(parent, 'trajectory_id', '?')} ({e})")
+                return None
+
+        self._ablation_eval_cache = ablation_eval
+        return ablation_eval
+
+    def _cached_diagnosis(self, parent: StrategyTrajectory):
+        """One ``diagnose_parent`` per parent per round, cached + reused.
+
+        The bucket classification (``_prepare_mutation_targets``) and the task
+        build (``_build_mutation_task`` -> ``build_task_extras``) used to call
+        ``diagnose_parent`` separately: the classification WITHOUT
+        ``ablation_eval``, the build WITH it. The LLM diagnosis path runs at a
+        non-zero temperature with no chat cache, so two separate calls on the same
+        parent can return different structured verdicts, AND the two calls saw
+        different prompts (the per-part ablation block was threaded only into the
+        build). They disagreed: classification -> ``is_refinement`` True (REFINE
+        bucket), build -> not-refinement (``build_task_extras`` returns None) ->
+        the refine silently fell back to an orthogonal restart. The 0823 smoke
+        showed this on BOTH parents ("2 REFINE" classified, then both
+        "mutation[..] ORTHOGONAL" built).
+
+        Computing the directive ONCE here -- WITH the ablation, so the cached
+        directive carries ``ablation_summary`` -- and reusing it in the build
+        makes the bucket and the task agree by construction and halves the
+        per-round diagnosis LLM calls (the build no longer re-diagnoses). The
+        cache is cleared at the start of each ``_prepare_mutation_targets``;
+        ``_classify_mutation_bucket`` (state-load re-derivation) populates it on a
+        miss so a subsequent build finds the directive. With the ablation flag OFF,
+        ``_get_ablation_eval()`` is ``None`` and the only behavioural change vs the
+        prior path is the removal of the redundant second diagnosis call -- the
+        no-regression guarantee.
+        """
+        cache = getattr(self, "_diagnosis_cache", None)
+        if cache is None:
+            cache = {}
+            self._diagnosis_cache = cache
+        tid = parent.trajectory_id
+        if tid in cache:
+            return cache[tid]
+        d = self.refine_op.diagnose_parent(
+            parent, self.pool.get_ancestors(tid),
+            self._diagnosis_population(parent),
+            ablation_eval=self._get_ablation_eval())
+        cache[tid] = d
+        return d
+
+    def _cached_strength(self, parent: StrategyTrajectory):
+        """One ``diagnose_strength`` per parent per crossover batch, cached +
+        reused (sibling of ``_cached_diagnosis``).
+
+        Eq. 7 crossover locates, for each of the two best parents, the
+        construction decisions its measurements VALIDATED. The suffix
+        (``generate_crossover_prompt_suffix``) and the task build
+        (``build_task_extras``) both need the SAME directive per parent: a
+        separate diagnosis call in each would run the LLM strength diagnosis
+        twice per parent (non-zero temperature, no chat cache) and the two
+        could disagree, exactly the divergence ``_cached_diagnosis`` fixed for
+        mutation. Computing it once here and passing it to both makes the
+        suffix's "what each parent's measurement validated" and the constructor
+        inspiration block the same directive by construction.
+
+        ``diagnose_strength`` reads the parent's already-computed
+        ``factor_attribution`` / segments (no ablation re-run), so -- unlike
+        ``_cached_diagnosis`` -- there is no ablation flag to thread. The
+        cache is cleared at the start of each ``_prepare_crossover_groups``;
+        ``None`` is stored (and returned) when the parent has no objective
+        vector, so ``build_task_extras`` tolerates it.
+        """
+        cache = getattr(self, "_strength_cache", None)
+        if cache is None:
+            cache = {}
+            self._strength_cache = cache
+        tid = parent.trajectory_id
+        if tid in cache:
+            return cache[tid]
+        from quantaalpha.pipeline.evolution.strength_diagnosis import diagnose_strength
+        d = diagnose_strength(
+            parent,
+            self.pool.get_ancestors(tid),
+            self._diagnosis_population(parent),
+        )
+        cache[tid] = d
+        return d
+
+    def _build_mutation_task(self, parent: StrategyTrajectory, direction_id: int,
+                             bucket: str = _BUCKET_REFINE) -> dict[str, Any]:
+        """Build one mutation task for ``parent`` routed by ``bucket`` (T6).
+
+        The refine-vs-orthogonal decision is made once in
+        ``_prepare_mutation_targets`` from the parent's verdict + diagnosability
+        and carried here as ``bucket`` so the serial ``_get_mutation_task`` and
+        the parallel ``get_all_tasks_for_current_phase`` cannot diverge on it:
+
+          * REFINE / ADMITTED-PUSH -- ``build_task_extras`` (Eq. 6 diagnose +
+            freeze + refine, or the ADMITTED push-further directive) yields a
+            refinement task. The directive is the one cached in
+            ``_prepare_mutation_targets`` (via ``_cached_diagnosis``), so the
+            bucket and the task are the same diagnosis by construction; if the
+            bucket was REFINE the cached directive is a refinement and the task is
+            built. A cache miss (an ADMITTED-PUSH parent the classification does
+            not pre-diagnose, or a state load) falls back to diagnosing here, and
+            if THAT yields no refinement the parent falls through to the orthogonal
+            path rather than being dropped.
+          * ORTHOGONAL -- the explore / restart path; the diagnosis is skipped.
+
+        T5: the parent's lineage is passed to ``build_task_extras`` here (parent
+        process) so the exhausted-lever note is baked into the serialized
+        directive and the parallel child needs no pool access.
+        """
+        extras = None
+        if bucket in (_BUCKET_REFINE, _BUCKET_ADMITTED_PUSH):
+            # T5: pass the parent's lineage so the diagnosis can detect an
+            # exhausted refinement lever (fix #5).
+            ancestors = self.pool.get_ancestors(parent.trajectory_id)
+            # Reuse the directive cached in _prepare_mutation_targets (via
+            # _cached_diagnosis) so the REFINE bucket decided there and the task
+            # built here cannot diverge on the refine-vs-orthogonal call. A cache
+            # miss (an ADMITTED-PUSH parent the classification does not
+            # pre-diagnose, or a state load) falls back to diagnosing here.
+            extras = self.refine_op.build_task_extras(
+                parent, ancestors, self._diagnosis_population(parent),
+                ablation_eval=self._get_ablation_eval(),
+                directive=getattr(self, "_diagnosis_cache", {}).get(
+                    parent.trajectory_id))
+
+        if extras is not None:
+            # REFINE / ADMITTED-PUSH child (Eq. 6): build on the parent's
+            # construction. The directive is the load-bearing guidance, so the
+            # zoo-context digest (an "avoid the explored space" signal that
+            # would fight "build on THIS parent") is NOT appended -- only the
+            # orthogonal path gets it.
+            task = {
+                "phase": RoundPhase.MUTATION,
+                "direction_id": direction_id,
+                "parent_trajectories": [parent],
+                "round_idx": self._current_round,
+                **extras,
+            }
+            _rd = extras.get("refine_directive", {}) or {}
+            _tag = "ADMITTED-PUSH" if bucket == _BUCKET_ADMITTED_PUSH else "REFINE"
+            logger.info(
+                f"mutation[{direction_id}] {_tag} parent {parent.trajectory_id} "
+                f"(verdict={_rd.get('verdict')}, target={_rd.get('refine_target')}, "
+                f"weakness={_rd.get('weakness_dimension')})"
+            )
+            return task
+
+        # ORTHOGONAL mutation -- the explore / restart path. Also the defensive
+        # fallback when a REFINE/ADMITTED-PUSH bucket's diagnosis yields no task.
+        suffix = self.mutation_op.generate_mutation_prompt_suffix(parent)
+        zc = self._build_zoo_context()
+        if zc:
+            suffix = suffix + "\n" + zc
+        task = {
+            "phase": RoundPhase.MUTATION,
+            "direction_id": direction_id,
+            "parent_trajectories": [parent],
+            "strategy_suffix": suffix,
+            "round_idx": self._current_round,
+        }
+        logger.info(
+            f"mutation[{direction_id}] ORTHOGONAL parent {parent.trajectory_id}"
+        )
+        return task
+
+    def _classify_mutation_bucket(self, parent: StrategyTrajectory) -> str:
+        """Re-derive a parent's T6 mutation bucket from its current metrics.
+
+        Mirrors the classification in ``_prepare_mutation_targets`` so a state
+        load (which restores targets from IDs but may carry no buckets in a
+        pre-T6 state file) re-derives the same routing. An admitted parent that
+        IS a mutation target was selected for ADMITTED-PUSH -- the unselected
+        admitted winners are crossover-only and absent from the target list, so
+        seeing an admitted parent here means it was pushed.
+        """
+        metrics = parent.backtest_metrics or {}
+        if "U" not in metrics:
+            return _BUCKET_ORTHOGONAL
+        if bool(metrics.get("admitted", False)):
+            return _BUCKET_ADMITTED_PUSH
+        d = self._cached_diagnosis(parent)
+        if d is not None and d.is_refinement():
+            return _BUCKET_REFINE
+        return _BUCKET_ORTHOGONAL
+
     def _get_mutation_task(self) -> Optional[dict[str, Any]]:
         """Get next mutation round task."""
+        # Budget guard. The three phase getters call each other on every
+        # transition (original->mutation->crossover->mutation->...), and
+        # ``get_next_task``'s ``_rounds_exhausted`` check is only on the OUTER
+        # entry -- so once a transition chain starts, nothing re-checks it.
+        # Measured: a resumed controller whose pool has no minable parents
+        # recursed to round 1116+ with max_rounds=15 and QA_MAX_ROUNDS_CAP=60
+        # both set, i.e. the budget was bypassed entirely. Each getter now
+        # re-checks before doing any work.
+        if self._rounds_exhausted():
+            return None
         # If mutation is disabled, skip to crossover or stay in mutation loop
         if not self.config.mutation_enabled:
             if self.config.crossover_enabled:
@@ -517,40 +1011,31 @@ class EvolutionController:
         # If mutation targets not prepared, prepare them
         if not self._mutation_targets:
             self._prepare_mutation_targets()
-        
+
         # Process next mutation target
         while self._mutation_idx < len(self._mutation_targets):
             parent = self._mutation_targets[self._mutation_idx]
             direction_id = self._mutation_idx  # Use index as new direction ID
-            
+            bucket = (self._mutation_buckets[self._mutation_idx]
+                      if self._mutation_idx < len(self._mutation_buckets)
+                      else _BUCKET_REFINE)
+
             # Check if this mutation already exists
             existing = [t for t in self.pool.get_all()
-                       if t.round_idx == self._current_round 
+                       if t.round_idx == self._current_round
                        and t.phase == RoundPhase.MUTATION
                        and parent.trajectory_id in t.parent_ids]
             if existing:
                 self._mutation_idx += 1
                 continue
-            
-            # Generate mutation guidance
-            suffix = self.mutation_op.generate_mutation_prompt_suffix(parent)
-            zc = self._build_zoo_context()
-            if zc:
-                suffix = suffix + "\n" + zc
-            
-            task = {
-                "phase": RoundPhase.MUTATION,
-                "direction_id": direction_id,
-                "parent_trajectories": [parent],
-                "strategy_suffix": suffix,
-                "round_idx": self._current_round,
-            }
-            
+
+            task = self._build_mutation_task(parent, direction_id, bucket)
             self._mutation_idx += 1
             return task
-        
+
         # All mutation tasks complete, transition to next phase
         self._mutation_targets = []  # Reset for next mutation round
+        self._mutation_buckets = []
         self._mutation_idx = 0
         self._current_round += 1
 
@@ -574,24 +1059,47 @@ class EvolutionController:
     def _prepare_mutation_targets(self):
         """
         Prepare targets for current mutation round.
-        
+
         For the first mutation round (after original), mutate each original trajectory.
         For subsequent mutation rounds (after crossover), mutate each crossover result.
+
+        T6: each prev-phase parent is routed to a mutation BUCKET by its
+        evaluation verdict + diagnosability, not by its fitness rank (the old
+        rank+tail-cut routing bred the best parents and restarted the weakest --
+        backwards: the failures need refining, the winners go to crossover):
+
+          * REFINE        -- rejected (``admitted`` False) with a usable verdict
+                            (``diagnose().is_refinement()``): fix why it failed.
+          * ORTHOGONAL    -- ``NO_DATA`` / no usable verdict / an exhausted lever:
+                            nothing to diagnose, restart orthogonally.
+          * ADMITTED-PUSH -- a config-gated fraction (``admitted_push_fraction``)
+                            of admitted winners ALSO get a "push the edge further"
+                            refine; the rest are crossover-only.
+
+        Bucket priority REFINE > ORTHOGONAL > ADMITTED-PUSH so a push-further
+        never crowds out a failure-refine. Bucketing is per-parent and
+        order-independent, so the serial ``_get_mutation_task`` and the parallel
+        ``get_all_tasks_for_current_phase`` route identically.
         """
         self._mutation_targets = []
+        self._mutation_buckets = []
         self._mutation_idx = 0
-        
+        # One diagnose_parent per parent per round, reused by _build_mutation_task
+        # (see _cached_diagnosis). Cleared each round so a parent re-evaluated in a
+        # later round (e.g. a crossover child) gets a fresh directive.
+        self._diagnosis_cache = {}
+
         # Get the previous round's outputs
         prev_round = self._current_round - 1
-        
+
         if prev_round < 0:
             # This shouldn't happen - mutation should come after original
             logger.warning("Mutation round before any original rounds")
             return
-        
+
         # Get trajectories from the previous phase
         prev_phase_trajs = []
-        
+
         # After original round (round 0), we mutate original trajectories
         if self._current_round == 1:
             prev_phase_trajs = self.pool.get_by_phase(RoundPhase.ORIGINAL)
@@ -603,56 +1111,99 @@ class EvolutionController:
             if all_crossover:
                 max_crossover_round = max(t.round_idx for t in all_crossover)
                 prev_phase_trajs = [t for t in all_crossover if t.round_idx == max_crossover_round]
-        
+
         if not prev_phase_trajs:
             # Fallback: get all trajectories from previous round
             prev_phase_trajs = [t for t in self.pool.get_all() if t.round_idx == prev_round]
-        
-        # Do not mutate a factor that F_Theta rejected (treatment arm only).
+
+        # Do not mutate a factor that F_Theta rejected.
         prev_phase_trajs = self._admissible_parents(
             prev_phase_trajs, minimum=1, what="mutation targets"
         )
 
-        # Select mutation parents on FITNESS, not on arrival order.
-        #
-        # This sorted by direction_id and mutated everything, which is not a
-        # selection operator at all: the below-median half of the population was
-        # bred exactly as often as the best of it. Crossover has always ranked
-        # its parents (parent_selection_strategy); mutation never did, so half
-        # the evolutionary budget was spent on directions the evidence already
-        # said were not working. Measured consequence: marginal contribution had
-        # no resolvable trend across a run (t=+0.42 over 79 batches), i.e. the
-        # search was drifting rather than improving.
-        #
-        # mutation_top_fraction keeps a tail of weaker parents rather than
-        # breeding only the leader, because the fitness is noisy and a strict
-        # top-1 collapses diversity in a population this small.
-        prev_phase_trajs = self._rank_by_fitness(prev_phase_trajs)
+        # T6 bucket classification (see docstring). The directive computed here
+        # via ``_cached_diagnosis`` is the SAME one ``_build_mutation_task`` reuses,
+        # so the bucket decided here matches the task routed there by construction
+        # (no reliance on cross-call determinism).
+        refine_parents: list[StrategyTrajectory] = []
+        orthogonal_parents: list[StrategyTrajectory] = []
+        admitted_parents: list[StrategyTrajectory] = []
+        for t in prev_phase_trajs:
+            metrics = t.backtest_metrics or {}
+            if "U" not in metrics:
+                orthogonal_parents.append(t)  # no objective -> nothing to diagnose
+                continue
+            if bool(metrics.get("admitted", False)):
+                admitted_parents.append(t)  # winner -> crossover stock / push
+                continue
+            d = self._cached_diagnosis(t)
+            if d is not None and d.is_refinement():
+                refine_parents.append(t)
+            else:
+                # NO_DATA, an exhausted lever, or a non-refinement verdict.
+                orthogonal_parents.append(t)
+
+        # ADMITTED-PUSH: a config-gated fraction of admitted winners ALSO get a
+        # push-further refine (local-search exploitation). Default 0.0 = admitted
+        # are crossover-only (NOT mutated). The pushed fraction is the BEST
+        # winners by fitness (rank once, reuse); the rest -> DROP-TO-CROSSOVER.
+        push_frac = float(getattr(self.config, "admitted_push_fraction", 0.0) or 0.0)
+        admitted_ranked = self._rank_by_fitness(admitted_parents)
+        push_n = int(round(push_frac * len(admitted_ranked))) if push_frac > 0 else 0
+        push_n = max(0, min(push_n, len(admitted_ranked)))
+        admitted_push = admitted_ranked[:push_n]
+
+        # Rank REFINE best-first by fitness so ``mutation_top_fraction`` (if <1.0)
+        # drops the weakest refines, not the strongest. Routing is bucket-based;
+        # ranking only orders WITHIN a bucket for the optional cap.
+        refine_ranked = self._rank_by_fitness(refine_parents)
+        targets = (list(refine_ranked) + list(orthogonal_parents)
+                   + list(admitted_push))
+        buckets = ([_BUCKET_REFINE] * len(refine_ranked)
+                   + [_BUCKET_ORTHOGONAL] * len(orthogonal_parents)
+                   + [_BUCKET_ADMITTED_PUSH] * len(admitted_push))
+
+        # Optional total cap (mutation_top_fraction). Cuts from the back -- the
+        # lowest-priority ADMITTED-PUSH slots first, then ORTHOGONAL -- so every
+        # REFINE survives. frac==1.0 (the default) cuts nothing.
         frac = float(getattr(self.config, "mutation_top_fraction", 1.0) or 1.0)
-        if 0.0 < frac < 1.0 and len(prev_phase_trajs) > 1:
-            keep = max(1, int(round(frac * len(prev_phase_trajs))))
-            dropped = len(prev_phase_trajs) - keep
-            prev_phase_trajs = prev_phase_trajs[:keep]
-            logger.info(f"mutation: kept the top {keep} of {keep + dropped} "
-                        f"parent(s) by {_PRIMARY_METRIC}, dropped {dropped}")
-        self._mutation_targets = prev_phase_trajs
-        
-        # Update active branch count
-        self._active_branch_count = len(self._mutation_targets)
-        
-        logger.info(f"Prepared {len(self._mutation_targets)} mutation targets for round {self._current_round}")
+        if 0.0 < frac < 1.0 and len(targets) > 1:
+            keep = max(1, int(round(frac * len(targets))))
+            if keep < len(targets):
+                logger.info(f"mutation: capped {len(targets)} -> {keep} targets "
+                            f"(dropped {len(targets) - keep} lowest-priority)")
+                targets, buckets = targets[:keep], buckets[:keep]
+
+        self._mutation_targets = targets
+        self._mutation_buckets = buckets
+        self._mutation_idx = 0
+        self._active_branch_count = len(targets)
+
+        logger.info(
+            f"Prepared {len(targets)} mutation targets for round "
+            f"{self._current_round}: {len(refine_ranked)} REFINE, "
+            f"{len(orthogonal_parents)} ORTHOGONAL, {push_n} ADMITTED-PUSH "
+            f"({max(0, len(admitted_parents) - push_n)} admitted -> crossover-only)"
+        )
     
     def _prepare_crossover_groups(self):
         """
         Prepare crossover groups for the next crossover round.
-        
+
         Crossover candidates are selected from the two most recent rounds:
         - First crossover (after round 1): original (round 0) + mutation (round 1)
         - Subsequent crossovers: previous mutation + previous crossover
-        
+
         This ensures that crossover combines the latest evolutionary results,
         not arbitrarily old trajectories.
         """
+        # T6: a fresh strength-diagnosis cache per crossover batch (sibling of
+        # ``_diagnosis_cache`` cleared in ``_prepare_mutation_targets``). The two
+        # parents' ``diagnose_strength`` directives are computed once per parent
+        # here (via ``_cached_strength``) and reused by both the suffix and
+        # ``build_task_extras`` so they cannot diverge.
+        self._strength_cache = {}
+
         # Find the two most recent rounds to use as crossover candidates
         candidates = self._admissible_parents(
             self._get_crossover_candidates(),
@@ -682,6 +1233,45 @@ class EvolutionController:
         self._crossover_idx = 0
         logger.info(f"Prepared {len(self._crossover_groups)} crossover groups from {len(candidates)} candidates")
     
+    def _diagnosis_population(self, exclude: StrategyTrajectory | None = None) -> list:
+        """The prior attempts the diagnosis is allowed to see.
+
+        The search has never had this channel. Every hypothesis is generated
+        against an empty ``Trace`` (a fresh ``AlphaAgentLoop`` per task builds a
+        fresh one), so the generator proposes as if every round were the first --
+        which is measurably what happens: 0 of 7 rounds show round-over-round
+        improvement, and operators produce worse children than their parents
+        54 times to 15.
+
+        Sampled the way FunSearch samples its program database: the best-scoring
+        attempts so the model can see what worked, plus the most recent so it can
+        see what was just tried and failed. Deduplicated, parent excluded.
+        """
+        try:
+            everything = [t for t in self.pool.get_all()
+                          if (t.backtest_metrics or {}).get("U") is not None]
+        except Exception:
+            return []
+        if exclude is not None:
+            everything = [t for t in everything
+                          if t.trajectory_id != exclude.trajectory_id]
+        if not everything:
+            return []
+
+        half = max(1, _POPULATION_SAMPLE // 2)
+        scores = self._shrunk_fitness(everything)
+        best = sorted(everything,
+                      key=lambda t: scores.get(t.trajectory_id, float("-inf")),
+                      reverse=True)[:half]
+        recent = list(reversed(everything))[:half]
+
+        seen, out = set(), []
+        for t in best + recent:
+            if t.trajectory_id not in seen:
+                seen.add(t.trajectory_id)
+                out.append(t)
+        return out[:_POPULATION_SAMPLE]
+
     def _shrunk_fitness(
         self, trajectories: list[StrategyTrajectory]
     ) -> dict[str, float]:
@@ -705,8 +1295,8 @@ class EvolutionController:
         ``delta_mean`` stands.
 
         Falls back to ``get_primary_metric()`` (the point estimate, e.g. U for
-        the control arm) for any trajectory without ``delta_mean``, so arms that
-        do not run marginal_contribution mode are untouched.
+        the objective) for any trajectory without ``delta_mean``, so runs that
+        do not use marginal_contribution mode are untouched.
         """
         picks = []
         for t in trajectories:
@@ -823,8 +1413,8 @@ class EvolutionController:
         purely decorative: a rejected factor remains a fully eligible crossover
         and mutation parent, and the search happily breeds from it.
 
-        Only active under the treatment arm (`QA_REQUIRE_FEASIBLE=true`); the
-        control arm keeps today's unfiltered behaviour exactly.
+        Only active when `QA_REQUIRE_FEASIBLE=true`; otherwise the unfiltered
+        behaviour is kept exactly.
 
         Falls back to the unfiltered set when filtering would leave too few
         parents to continue. Feasibility can legitimately be rare early in a run,
@@ -950,6 +1540,16 @@ class EvolutionController:
     
     def _get_crossover_task(self) -> Optional[dict[str, Any]]:
         """Get next crossover round task."""
+        # Budget guard. The three phase getters call each other on every
+        # transition (original->mutation->crossover->mutation->...), and
+        # ``get_next_task``'s ``_rounds_exhausted`` check is only on the OUTER
+        # entry -- so once a transition chain starts, nothing re-checks it.
+        # Measured: a resumed controller whose pool has no minable parents
+        # recursed to round 1116+ with max_rounds=15 and QA_MAX_ROUNDS_CAP=60
+        # both set, i.e. the budget was bypassed entirely. Each getter now
+        # re-checks before doing any work.
+        if self._rounds_exhausted():
+            return None
         # If crossover is disabled, skip to mutation or stay in crossover loop
         if not self.config.crossover_enabled:
             if self.config.mutation_enabled:
@@ -981,13 +1581,19 @@ class EvolutionController:
         
         # Get next crossover group
         parents = self._crossover_groups[self._crossover_idx]
-        
+
+        # T6: compute each parent's strength directive ONCE (cached) so the
+        # suffix and build_task_extras see the same diagnosis (no double-diagnose
+        # divergence). Ancestors + the prior-attempts population are threaded by
+        # ``_cached_strength``.
+        strengths = [self._cached_strength(p) for p in parents]
+
         # Generate crossover guidance
-        suffix = self.crossover_op.generate_crossover_prompt_suffix(parents)
+        suffix = self.crossover_op.generate_crossover_prompt_suffix(parents, strengths)
         zc = self._build_zoo_context()
         if zc:
             suffix = suffix + "\n" + zc
-        
+
         task = {
             "phase": RoundPhase.CROSSOVER,
             "direction_id": self._crossover_idx,  # Use crossover index as direction
@@ -995,6 +1601,9 @@ class EvolutionController:
             "strategy_suffix": suffix,
             "round_idx": self._current_round,
         }
+        # Eq. 7: ship the two parents' validated strengths as constructor
+        # inspiration (not a literal splice). ``None`` when fewer than 2 parents.
+        task.update(self.crossover_op.build_task_extras(parents, strengths) or {})
         
         self._crossover_idx += 1
         return task
@@ -1035,9 +1644,8 @@ class EvolutionController:
         Only ORIGINAL tasks carry a real direction index (mutation/crossover
         use a task index), so this is called from the ORIGINAL branch only.
         ``admitted`` is surfaced by ``_extract_net_cost_metrics`` (Part E); the
-        ``feasible`` fallback keeps control-arm trajectories readable, though
-        the reseed gate (_has_treatment_data) means this tally only matters for
-        the treatment arm.
+        ``feasible`` fallback keeps trajectories readable when ``admitted`` is
+        absent.
         """
         if direction_id < 0 or direction_id >= len(self._direction_status):
             return
@@ -1076,11 +1684,39 @@ class EvolutionController:
         direction_id = task["direction_id"]
         round_idx = task["round_idx"]
         
-        # Generate trajectory ID
-        traj_id = StrategyTrajectory.generate_id(direction_id, round_idx, phase)
+        # Trajectory ID: reuse the one the executed task already carries.
+        #
+        # This used to call generate_id() a SECOND time. generate_id hashes
+        # datetime.now() to microseconds, so the id minted here could never equal
+        # the one factor_mining._run_evolution_task minted at its line 190 and
+        # wrote into the factor library. The pool therefore referenced one id
+        # space and the library another, and every ``parent_trajectory_ids``
+        # link pointed at an id the library did not contain -- measured on the
+        # live run: 27 factors carried parent links, **0 of them resolvable**.
+        #
+        # The consequence was silent and expensive: no parent-vs-child
+        # comparison is possible, so the system could not answer whether
+        # mutation or crossover actually improves on what it started from --
+        # which is the whole question the evolution loop exists to settle.
+        traj_id = (
+            task.get("trajectory_id")
+            or StrategyTrajectory.generate_id(direction_id, round_idx, phase)
+        )
         
         # Extract hypothesis info
         hypothesis_text = str(hypothesis) if hypothesis else ""
+        # Persist the pre-registered direction onto the trajectory. The
+        # AlphaAgentHypothesis object carries expected_ic_sign here; str() above
+        # discards it, so capture it before the object goes out of scope. A later
+        # diagnosis (this trajectory as a refine parent) reads it back via
+        # getattr(parent, "expected_ic_sign", "") to refreeze a child's
+        # direction; without it every expression-refine child is born directionless
+        # and the falsifiability gate rejects it no_mechanism (1817 run: 3/3 frozen
+        # children rejected for an empty sign).
+        expected_ic_sign = (
+            str(getattr(hypothesis, "expected_ic_sign", "") or "").strip().lower()
+            if hypothesis else ""
+        )
         hypothesis_details = {}
         if hypothesis:
             for attr in ["hypothesis", "reason", "concise_reason", "concise_observation",
@@ -1109,7 +1745,8 @@ class EvolutionController:
         backtest_metrics = {}
         backtest_result = getattr(experiment, "result", None) if experiment else None
         if backtest_result is not None:
-            backtest_metrics = self._extract_metrics(backtest_result)
+            backtest_metrics = self._extract_metrics(
+                backtest_result, [f.get("expression", "") for f in factors])
         
         # Extract feedback info
         feedback_text = str(feedback) if feedback else ""
@@ -1122,13 +1759,47 @@ class EvolutionController:
         
         # Get parent IDs
         parent_ids = [p.trajectory_id for p in task.get("parent_trajectories", [])]
-        
+
+        # T5: record the refine directive that PRODUCED this trajectory, so a
+        # descendant's diagnosis can detect an exhausted lever (fix #5). One
+        # entry per refine parent; orthogonal children carry none (no
+        # ``refine_directive`` on the task). A CROSSOVER child does carry one
+        # (refine_target="recombine", verdict="crossover") so its lineage records
+        # that it was recombined -- but ``repair_actions_summary`` skips those,
+        # since a recombination repaired no diagnosed weakness. The
+        # ``target_subtree_signatures`` are the levers pulled -- the canonical
+        # AST signatures from the T3 targets -- which a descendant compares to
+        # its own directive's targets.
+        refine_actions: list[dict] = []
+        rd = task.get("refine_directive")
+        if isinstance(rd, dict) and rd.get("verdict"):
+            refine_actions = [{
+                "round_idx": round_idx,
+                "verdict": rd.get("verdict"),
+                "weakness_dimension": rd.get("weakness_dimension"),
+                "refine_target": rd.get("refine_target"),
+                "mechanism_hint": rd.get("mechanism_hint", ""),
+                "target_subtree_signatures": [t.get("subtree_signature")
+                                               for t in (rd.get("targets") or [])
+                                               if t.get("subtree_signature")],
+            }]
+
+        # Eq.7 crossover audit: persist the two parents' strength directives
+        # that produced this child, so the recombination that was actually
+        # attempted is inspectable after the run (which validated decision was
+        # offered, from which parent) rather than only inferable from the prose.
+        extra_info: dict[str, Any] = {}
+        cx_strengths = task.get("crossover_strengths")
+        if cx_strengths:
+            extra_info["crossover_strengths"] = cx_strengths
+
         return StrategyTrajectory(
             trajectory_id=traj_id,
             direction_id=direction_id,
             round_idx=round_idx,
             phase=phase,
             hypothesis=hypothesis_text,
+            expected_ic_sign=expected_ic_sign,
             hypothesis_details=hypothesis_details,
             factors=factors,
             backtest_result=backtest_result,
@@ -1136,10 +1807,19 @@ class EvolutionController:
             feedback=feedback_text,
             feedback_details=feedback_details,
             parent_ids=parent_ids,
+            refine_actions=refine_actions,
+            extra_info=extra_info,
         )
     
-    def _extract_metrics(self, result: Any) -> dict[str, Optional[float]]:
-        """Extract metrics from backtest result."""
+    def _extract_metrics(self, result: Any,
+                         factor_exprs: list[str] | None = None) -> dict[str, Optional[float]]:
+        """Extract metrics from backtest result.
+
+        ``factor_exprs`` (the trajectory's own factor expressions, in order)
+        selects which per-factor tearsheet to promote to top-level when the
+        net-cost engine nests several under ``factor_tearsheets``; see
+        ``_extract_net_cost_metrics``.
+        """
         import pandas as pd
         
         metrics = {
@@ -1201,9 +1881,9 @@ class EvolutionController:
                                 break
 
             # Net-of-cost engine extras (E_theta / NetCostFactorRunner). Purely
-            # additive: the control arm's Qlib result carries none of these
-            # keys, so its behaviour is unchanged.
-            metrics.update(self._extract_net_cost_metrics(result))
+            # additive: a Qlib-only result carries none of these keys, so its
+            # behaviour is unchanged.
+            metrics.update(self._extract_net_cost_metrics(result, factor_exprs))
         except Exception as e:
             logger.warning(f"Failed to extract metrics: {e}")
 
@@ -1211,7 +1891,8 @@ class EvolutionController:
 
     # Keys emitted by NetCostFactorRunner._to_series, by coercion type.
     _NET_COST_FLOAT_KEYS = (
-        "U", "rho_max", "turnover_book", "turnover_solo", "cx", "cost_bps", "zoo_size",
+        "U", "rho_max", "rho_within", "turnover_book", "turnover_solo", "cx",
+        "cost_bps", "zoo_size",
         # Marginal contribution -- the fitness that anchors selection to the
         # book rather than to a percentile of a winners-only sample. delta_mean
         # / delta_se are the seed-averaged estimate and its standard error that
@@ -1226,15 +1907,56 @@ class EvolutionController:
         "net_ir", "net_arr", "tau_admit",
         "e_effectiveness", "e_arr", "e_stability", "e_turnover", "e_diversity",
         "e_overfit", "e_decay",
+        # The t-statistic behind the admission verdict (mean/se). Distinguishes a
+        # resolvably-negative contribution from an unresolved one -- the same
+        # distinction the ``reason`` string makes in prose -- in a scalar the
+        # diagnosis can branch on.
+        "delta_t",
+        # Deflated Sharpe (book) + its trial count -- written to the _to_series
+        # payload (net_cost_runner._to_series) but absent here, so the gloss's
+        # `dsr` line never rendered. Carried so the diagnosis sees the
+        # multiple-testing-discounted book Sharpe.
+        "dsr", "dsr_n_trials",
     )
-    _NET_COST_STR_KEYS = ("theta_hash", "zoo_hash", "failed_gates", "weakest_dimensions")
+    _NET_COST_STR_KEYS = (
+        "theta_hash", "zoo_hash", "failed_gates", "weakest_dimensions",
+        # The verdict string and its pathology sub-reason (admission.decide /
+        # check_pathology), plus the incumbent a replacement evicted. These were
+        # written to the ledger but dropped at _to_series, so the most diagnostic
+        # text in the pipeline never reached the trajectory -- which is what
+        # kept the mutation operator from turning a rejection into a directional
+        # refinement instruction. ``displaced`` is an expression string or None;
+        # the pd.notna guard below skips the None case so it reads as absent.
+        # ``verdict`` (T1) is the *structured* verdict (``Verdict.value``, e.g.
+        # "net_harmful") set at each decide() branch -- the authoritative form
+        # ``classify_verdict`` reads first, retiring the brittle substring parse
+        # of ``reason`` to a logged fallback.
+        "reason", "pathology", "displaced", "verdict",
+    )
+    # List-valued (object) keys that none of the float/str/bool coercions handle.
+    # ``delta_per_seed`` is the per-combiner-seed marginal-contribution vector --
+    # the reproducible evidence behind the verdict, kept for auditability. The
+    # diagnosis itself uses delta_mean/delta_se/reason; this is the raw record.
+    _NET_COST_LIST_KEYS = ("delta_per_seed",)
+    # Dict-valued keys (T4). ``factor_attribution`` is the per-factor combiner
+    # credit, keyed by expression -> {weight, weight_raw, weight_stability,
+    # ic_mean, ic_std, rank_ic, turnover_share}. pd.notna on a dict is truthy-
+    # ambiguous (same caveat as list keys), so it is guarded on type in the
+    # extract loop; the dict is carried through as-is so segment_profiling can
+    # fold the credit into each SegmentProfile.
+    # ``factor_tearsheets`` (per-factor admission scalars: t_nw, monotonicity,
+    # sign_predicted/realized, fdr_*, capacity, ...) is carried through as-is for
+    # lineage/debuggability; the CANDIDATE entry's scalars are ALSO promoted to
+    # top-level in _extract_net_cost_metrics so _METRIC_GLOSS finds them.
+    _NET_COST_DICT_KEYS = ("factor_attribution", "factor_tearsheets")
     # Bool flags from the net-cost runner. ``admitted`` is the live verdict the
     # digest and format_objective_note key on; ``in_zoo`` is its persistence
-    # counterpart. The control arm's Qlib Series carries neither, so these stay
-    # absent and its trajectories read exactly as before.
+    # counterpart. A Qlib-only Series carries neither, so these stay absent
+    # and its trajectories read exactly as before.
     _NET_COST_BOOL_KEYS = ("admitted", "in_zoo")
 
-    def _extract_net_cost_metrics(self, result: Any) -> dict[str, Any]:
+    def _extract_net_cost_metrics(self, result: Any,
+                                  factor_exprs: list[str] | None = None) -> dict[str, Any]:
         """Pull the E_theta metric vector off a result, when present."""
         import pandas as pd
 
@@ -1259,11 +1981,64 @@ class EvolutionController:
         for key in self._NET_COST_STR_KEYS:
             if key in series.index and pd.notna(series[key]):
                 extras[key] = str(series[key])
+        # List-valued keys (e.g. delta_per_seed). pd.notna on a list returns a
+        # bool array, which is truthy-ambiguous, so guard on type instead.
+        for key in self._NET_COST_LIST_KEYS:
+            if key in series.index:
+                val = series[key]
+                if isinstance(val, (list, tuple)):
+                    extras[key] = list(val)
+        # Dict-valued keys (T4): per-factor combiner credit. Same notna caveat
+        # as list keys, so guard on type; carry the dict through as-is.
+        for key in self._NET_COST_DICT_KEYS:
+            if key in series.index:
+                val = series[key]
+                if isinstance(val, dict):
+                    extras[key] = val
         if "feasible" in series.index and pd.notna(series["feasible"]):
             extras["feasible"] = bool(series["feasible"])
         for key in self._NET_COST_BOOL_KEYS:
             if key in series.index and pd.notna(series[key]):
                 extras[key] = bool(series[key])
+        # Per-factor tearsheet scalars -- the admission gate's per-factor
+        # measurement (t_nw, monotonicity, sign_predicted/realized, fdr_*,
+        # capacity, ...). _METRIC_GLOSS (llm_diagnosis) lists these as flat
+        # top-level keys, but _to_series nests them under
+        # factor_tearsheets[expr] and the dict allowlist above only passes the
+        # whole dict through -- so the diagnosis LLM's "everything measured"
+        # block rendered ~2 of 22 gloss lines (only the batch aggregates
+        # rho_max/cx/net_ir/...). Promote the CANDIDATE factor's scalars to
+        # top-level so the gloss finds them. sign_predicted is also the
+        # belt-and-braces source for the refreeze sign (the load-bearing source
+        # is the trajectory's expected_ic_sign; see
+        # create_trajectory_from_loop_result). turnover_solo is already a
+        # batch-aggregate float key, so it is NOT re-promoted here.
+        fts = series["factor_tearsheets"] if "factor_tearsheets" in series.index else None
+        sel = None
+        if isinstance(fts, dict) and fts:
+            for e in (factor_exprs or []):
+                if e and e in fts:
+                    sel = fts[e]
+                    break
+            if sel is None:
+                # factors_per_hypothesis=1 -> one entry; else the strongest signal.
+                sel = next(iter(fts.values())) if len(fts) == 1 else max(
+                    fts.values(), key=lambda v: abs(float((v or {}).get("t_nw") or 0)))
+        if isinstance(sel, dict):
+            for k in ("t_nw", "rank_ic_neutral", "monotonicity", "q_spread",
+                      "ls_sharpe", "sign_predicted", "sign_realized",
+                      "mechanism_validated", "fdr_t_required", "fdr_n_tests",
+                      "capacity_cny", "best_horizon", "ic_pos_frac",
+                      "exposure_size"):
+                if k in sel and k not in extras:
+                    v = sel[k]
+                    if pd.notna(v):
+                        if isinstance(v, bool):
+                            extras[k] = v
+                        elif isinstance(v, (int, float)):
+                            extras[k] = float(v)
+                        else:
+                            extras[k] = v
         return extras
     
     # ------------------------------------------------------------------
@@ -1271,28 +2046,14 @@ class EvolutionController:
     # regenerate NEW directions informed by the run's trial history.
     # ------------------------------------------------------------------
 
-    def _has_treatment_data(self) -> bool:
-        """True when any trajectory carries the net-of-cost objective vector.
-
-        The A/B gate for every reseed behaviour. The control arm (RankIC, no
-        ledger) never produces a ``U`` metric, so this returns False and the
-        whole reseed path is a no-op, keeping the arms comparable. Gating on
-        data presence rather than an env var is what makes the control arm
-        byte-for-byte unchanged.
-        """
-        for t in self.pool.get_all():
-            if "U" in (t.backtest_metrics or {}):
-                return True
-        return False
-
     def _zoo_size(self) -> int | None:
         """How many factors the repository holds, or None if unknowable here.
 
         The same source ``_rounds_exhausted`` sizes the target from, so the two
         cannot disagree about whether progress is being made. A missing ledger
-        yields 0 (``replay_repository`` returns {} rather than raising), which is
-        why ``_has_treatment_data`` is checked first: a control arm with an empty
-        default ledger path must not read as "stuck at 0" and trigger a reseed.
+        yields 0 (``replay_repository`` returns {} rather than raising); an empty
+        ledger reads 0, and 0 > -1 (the initial ``_best_zoo_size``) resets the
+        stale counter, so a run that has not admitted anything does not reseed.
         """
         try:
             from quantaalpha.eval.ledger import replay_repository
@@ -1302,53 +2063,96 @@ class EvolutionController:
             return None
 
     def _reseed_if_stale(self) -> bool:
-        """Regenerate informed directions when the repository stops growing.
+        """Regenerate informed directions when the repository grows too slowly.
 
         Returns True when the phase was reset to ORIGINAL, so the caller returns
-        an original task instead of its own transition. Keyed on repository
-        GROWTH rather than on rejections: a round can legitimately reject
-        everything while the repository is still climbing, and reseeding then
-        would discard parents that are working. Silent no-op for the control arm
-        (no ``U``) and when ``reseed_after_stale_rounds`` <= 0.
+        an original task instead of its own transition. Two triggers:
+
+        * STALE: the round admitted fewer than ``growth_floor`` factors for
+          ``reseed_after_stale_rounds`` consecutive rounds. Keyed on GROWTH, not
+          on rejections -- a round can legitimately reject everything while the
+          repository is still climbing. The growth-floor is the fix for the
+          creep: a zoo that admits one factor every few rounds used to reset the
+          stale counter every time (any growth at all reset it) and so never
+          reseeded, inbreeding the same directions until the round cap gave up
+          short of the target.
+        * SCHEDULED: every ``reseed_interval`` rounds, inject fresh informed
+          directions regardless of growth -- steady immigration that does not
+          wait for stagnation.
+
+        Silent no-op when ``reseed_after_stale_rounds`` <= 0 and
+        ``reseed_interval`` <= 0.
         """
-        if not self._has_treatment_data():
-            return False
         n = int(getattr(self.config, "reseed_after_stale_rounds", 0) or 0)
-        if n <= 0:
+        interval = int(getattr(self.config, "reseed_interval", 0) or 0)
+        if n <= 0 and interval <= 0:
             return False
         size = self._zoo_size()
         if size is None:
             return False
         if size > self._best_zoo_size:
             self._best_zoo_size = size
+        if self._zoo_size_at_last_check < 0:
+            # First check after (re)start: establish the baseline. Without this,
+            # the -1 init would read a spurious size+1 "growth" and mask a stall
+            # that is already in progress on a resumed run.
+            self._zoo_size_at_last_check = size
+            return False
+
+        # Per-round growth (admissions since the last check), not vs an all-time
+        # high -- a creeping zoo must still register as stale.
+        growth = size - self._zoo_size_at_last_check
+        self._zoo_size_at_last_check = size
+
+        growth_floor = int(getattr(self.config, "growth_floor", 1) or 0)
+        if growth >= growth_floor:
             self._stale_rounds = 0
+        else:
+            self._stale_rounds += 1
+
+        fire_stale = n > 0 and self._stale_rounds >= n
+        fire_scheduled = (
+            interval > 0
+            and self._current_round > 0
+            and (self._current_round % interval == 0)
+        )
+        if not (fire_stale or fire_scheduled):
             return False
-        self._stale_rounds += 1
-        if self._stale_rounds < n:
-            return False
-        # Stalled for n rounds: build the digest and ask for new directions.
+        reason = "stuck" if fire_stale else "scheduled-immigration"
+        return self._do_reseed(size, reason, n)
+
+    def _do_reseed(self, size: int, reason: str, stale_window: int) -> bool:
+        """Build the digest, generate fresh directions, return to ORIGINAL.
+
+        Shared by the stale and scheduled triggers. ``stale_window`` is the
+        ``reseed_after_stale_rounds`` value, used to decide which directions have
+        been dormant long enough to mark saturated.
+        """
         self._stale_rounds = 0
         digest = self._build_reseed_digest()
         if not digest:
             logger.warning(
-                "Repository stuck but no digestible trial history; skipping reseed"
+                f"Repository {reason} but no digestible trial history; skipping reseed"
             )
             return False
         new_dirs = self._generate_informed_directions(digest)
         if not new_dirs:
             logger.warning(
-                f"Repository stuck at {size} factor(s) for {n} round(s): "
-                "informed-direction generation returned nothing; retrying next stale window"
+                f"Repository {reason} at {size} factor(s): informed-direction "
+                "generation returned nothing; retrying next window"
             )
             return False
-        # Mark saturated directions: explored and no admission within the last n
-        # rounds. A direction that admitted recently keeps its headroom and
-        # stays eligible; a never-admitted or long-dormant one is skipped so the
-        # ORIGINAL phase spends its budget on the new directions instead.
+        # Mark saturated directions: explored and no admission within the last
+        # `window` rounds. A direction that admitted recently keeps its headroom
+        # and stays eligible; a never-admitted or long-dormant one is skipped so
+        # the ORIGINAL phase spends its budget on the new directions. The window
+        # is lenient (>= 2) regardless of the tight stale trigger, so a direction
+        # that admitted last round is not prematurely marked explored-out.
+        window = max(2, stale_window)
         for st in self._direction_status:
             recent = (
                 st["last_admit_round"] >= 0
-                and (self._current_round - st["last_admit_round"]) < n
+                and (self._current_round - st["last_admit_round"]) < window
             )
             st["saturated"] = bool(st["attempts"] >= 1 and not recent)
         # Grow the direction list (never replace -- working parents stay).
@@ -1368,7 +2172,7 @@ class EvolutionController:
         }
         self._current_phase = RoundPhase.ORIGINAL
         logger.warning(
-            f"Repository stuck at {size} factor(s) for {n} round(s): generated "
+            f"Repository {reason} at {size} factor(s): generated "
             f"{len(new_dirs)} informed direction(s) (reseed #{self._reseed_count}); "
             "returning to ORIGINAL with new material. Mutation and crossover can "
             "only recombine what already exists, so a stalled search needs new "
@@ -1398,6 +2202,7 @@ class EvolutionController:
             return ""
 
         lines: list[str] = []
+        all_admitted_exprs: list[str] = []  # for operator-coverage measurement
         for did in sorted(by_dir):
             trajs = by_dir[did]
             st = self._direction_status[did]
@@ -1407,6 +2212,11 @@ class EvolutionController:
                 if bool((t.backtest_metrics or {}).get(
                     "admitted", (t.backtest_metrics or {}).get("feasible", True)))
             ]
+            for t in admitted:
+                for f in (t.factors or []):
+                    expr = f.get("expression", "") if isinstance(f, dict) else ""
+                    if expr:
+                        all_admitted_exprs.append(expr)
             redundant = net_harmful = marginal = 0
             for t in trajs:
                 if t in admitted:
@@ -1437,10 +2247,34 @@ class EvolutionController:
                 )
             parts.append(f"  SATURATED={'yes' if st['saturated'] else 'no'}")
             lines.append("\n".join(parts))
+
+        # Operator-coverage measurement across every admitted factor in the
+        # repository. This is the "lesson summary of what was learned" enriched
+        # with operator-class coverage: the reseed LLM already sees WHICH
+        # directions admitted/saturated above, and now also sees WHICH operator
+        # classes the population has exhausted and which it has never touched --
+        # so the informed directions can broaden toward REGBETA/RSI/MACD/COUNT
+        # deliberately, not just toward unused signal space. Measurement only;
+        # the block states the convergence and closes "yours to determine", so
+        # it prescribes no remedy and carries no market prior.
+        try:
+            from quantaalpha.factors.operator_coverage import coverage_block
+            cov = coverage_block(all_admitted_exprs)
+            if cov:
+                lines.append("")
+                lines.append("Operator coverage across admitted factors:")
+                lines.append(cov)
+        except Exception:
+            logger.exception("operator-coverage block failed; omitting from reseed digest")
         return "\n".join(lines)
 
     def _generate_informed_directions(self, digest: str) -> list[str]:
-        """Ask the LLM for new orthogonal directions from the digest."""
+        """Ask the LLM for new orthogonal directions from the digest.
+
+        Falls back to canned templates if the LLM returns nothing -- a reseed
+        that injects zero directions is useless, and a canned opposite-direction
+        restart beats inbreeding the same exhausted space.
+        """
         prompt_path = getattr(self.config, "informed_prompt_path", None)
         if not prompt_path or not Path(prompt_path).exists():
             logger.warning("No informed-planning prompt path configured; cannot reseed")
@@ -1448,58 +2282,412 @@ class EvolutionController:
         from quantaalpha.pipeline.planning import generate_informed_directions
 
         n = max(1, int(getattr(self.config, "num_directions", 2) or 2))
+        common = dict(
+            initial_direction=getattr(self.config, "initial_direction", "") or "",
+            n=n,
+            prompt_file=Path(prompt_path),
+            history_summary=digest,
+            use_llm=True,
+            seed_in_generation=getattr(self.config, "seed_in_generation", True),
+        )
+        # The canned-fallback retry that used to sit here is gone (2026-08-15).
+        # It re-called the planner with allow_fallback=True, which returned n
+        # hardcoded "{base} + volatility regime switch"-style directions -- author
+        # priors entering the search as if the planner had reasoned to them. A
+        # reseed that produces nothing simply does not reseed this round; the
+        # search continues on the directions it already has, which is honest and
+        # visible in the log.
         try:
-            return generate_informed_directions(
-                initial_direction=getattr(self.config, "initial_direction", "") or "",
-                n=n,
-                prompt_file=Path(prompt_path),
-                history_summary=digest,
-                use_llm=True,
-                allow_fallback=False,
-            )
+            dirs = generate_informed_directions(**common)
         except Exception as exc:
             logger.warning(f"Informed direction generation failed: {exc}")
-            return []
+            dirs = []
+        if not dirs:
+            logger.warning(
+                "Informed-direction generation returned nothing; NOT substituting "
+                "canned directions -- this round does not reseed"
+            )
+        return dirs
+
+    def _coverage_and_headroom(self) -> str:
+        """What the repository ALREADY SPANS, and what it leaves unexplained.
+
+        Two measurements, both diagnosis rather than instruction (the system
+        rule: state what was measured, never a remedy):
+
+        **Coverage.** The repository's admitted signals are clustered by their
+        pairwise rank correlation. Listing factor expressions -- which is all the
+        context did before -- tells the generator what exists but not what SPACE
+        is occupied: 9 factors spanning 5 correlated clusters look like 9
+        directions and behave like 5. A new factor landing inside an occupied
+        cluster cannot register as a contribution no matter how sound it is,
+        because the gate measures contribution BEYOND the book.
+
+        **Headroom.** The book's own IC against forward returns, and the IC that
+        remains in the residual (return minus the book's prediction). This is the
+        residual-targeting signal: it says how much predictable variation the
+        book has NOT captured, so "there is nothing left to find" and "you keep
+        proposing what is already held" are distinguishable states rather than
+        the same silence.
+
+        Correlations are measured in RANK space -- what the ICIR combiner fits on
+        -- so ``X`` and ``RANK(X)`` count as one direction, not two.
+
+        Cached on the repository's expression set: recomputed only when the zoo
+        changes, and degrades to "" on any failure so a missing signal cache can
+        never break generation.
+        """
+        try:
+            import json
+            import os
+
+            ledger = os.environ.get("QA_LEDGER")
+            if not ledger or not Path(ledger).exists():
+                return ""
+            exprs: list[str] = []
+            with open(ledger, encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("admitted") in (True, "True"):
+                        fe = rec.get("factor_exprs") or []
+                        if isinstance(fe, str):
+                            import ast as _ast
+                            fe = _ast.literal_eval(fe)
+                        exprs.extend(fe or [])
+            exprs = list(dict.fromkeys(exprs))
+            if len(exprs) < 2:
+                return ""
+            key = tuple(exprs)
+            if getattr(self, "_coverage_key", None) == key:
+                return self._coverage_text
+
+            from quantaalpha.eval.data import align_signal, load_factor_signal
+            from quantaalpha.eval.metrics import (
+                _cross_sectional_corr, _slice, label_frame, rho_max,
+            )
+            from quantaalpha.eval.operator import EvaluationOperator
+            from quantaalpha.eval.protocol import default_protocol_path, load_protocol
+
+            theta = load_protocol(os.environ.get("QA_PROTOCOL") or default_protocol_path())
+            op = EvaluationOperator(theta)
+            start, end, win = op._windows(False)
+            panel = op._panel(start, end)
+            label = label_frame(panel, theta)
+
+            sigs = {}
+            for e in exprs:
+                try:
+                    sigs[e] = align_signal(load_factor_signal(e), panel)
+                except Exception:
+                    continue
+            if len(sigs) < 2:
+                return ""
+
+            # Greedy clustering at |rho| >= 0.5 -- the same notion of "one
+            # direction" the de-dup screen uses.
+            names = list(sigs)
+            unassigned, clusters = set(names), []
+            for a in names:
+                if a not in unassigned:
+                    continue
+                fam = [a]
+                unassigned.discard(a)
+                for b in list(unassigned):
+                    c = _cross_sectional_corr(sigs[a], sigs[b], "spearman")
+                    if not c.empty and abs(float(c.mean())) >= 0.5:
+                        fam.append(b)
+                        unassigned.discard(b)
+                clusters.append(fam)
+
+            # Headroom: how much of the label the book's own signals leave.
+            ics = []
+            for e, s in sigs.items():
+                ic = _cross_sectional_corr(_slice(s, win), label, "spearman").dropna()
+                if len(ic):
+                    ics.append(abs(float(ic.mean())))
+            best_ic = max(ics) if ics else float("nan")
+
+            lines = [
+                "## Repository coverage (measured, not a target)",
+                f"- {len(sigs)} admitted signals occupy {len(clusters)} distinct "
+                f"directions at |rank corr| >= 0.5.",
+            ]
+            for i, fam in enumerate(clusters, 1):
+                head = fam[0][:64]
+                extra = f" (+{len(fam)-1} correlated with it)" if len(fam) > 1 else ""
+                lines.append(f"  - direction {i}: {head}{extra}")
+            lines.append(
+                f"- Strongest single-factor |rank IC| currently held: "
+                f"{best_ic:.4f}."
+            )
+
+            # RESIDUAL HEADROOM. Fit the book on the admitted signals, then ask
+            # how much of the forward return its prediction does NOT explain.
+            # This is what makes "the space is exhausted" and "you keep
+            # re-proposing what is already held" distinguishable: if the book's
+            # own IC is small, predictable variation remains and the failure is
+            # duplication; if it is large, the book already holds the signal.
+            try:
+                from quantaalpha.eval import combiner as _comb
+
+                pred, _attr = _comb.fit_predict(sigs, None, panel, theta)
+                book_ic = _cross_sectional_corr(
+                    _slice(pred, win), label, "spearman").dropna()
+                if len(book_ic):
+                    b = float(book_ic.mean())
+                    lines.append(
+                        f"- The book's combined prediction has rank IC "
+                        f"{b:+.4f} against the forward return it is fitted to. "
+                        f"The remaining cross-sectional variation is what a new "
+                        f"factor would have to predict; a factor that only "
+                        f"re-explains what this prediction already captures "
+                        f"scores zero on the gate."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"residual headroom unavailable: {exc}")
+            lines.append(
+                "- A candidate whose rank correlation with any listed direction "
+                "is high cannot be measured as a contribution: the gate scores "
+                "what a factor adds BEYOND the book, and a duplicate adds "
+                "nothing measurable however sound its premise."
+            )
+            self._coverage_key = key
+            self._coverage_text = "\n".join(lines)
+            return self._coverage_text
+        except Exception as exc:  # noqa: BLE001 -- context must never break generation
+            logger.warning(f"coverage context unavailable: {exc}")
+            return ""
 
     def _build_zoo_context(self) -> str:
         """Cumulative repository summary appended to mutation/crossover guidance.
 
         Tells the breeder what the book already captures so mutations and
         crossovers aim at ORTHOGONAL signal rather than re-saturating the same
-        space. Empty for the control arm (no ``U``), so its ``strategy_suffix``
-        and the resulting ``effective_direction`` (loop.py) are byte-identical to
-        today. Capped at 8 admitted trajectories to bound the token cost.
+        space. Capped at 8 admitted trajectories to bound the token cost.
+
+        Also carries the REJECTIONS. This is the only channel that survives
+        across batches: ``AlphaAgentLoop.__init__`` builds a fresh
+        ``Trace(scen=scen)`` per batch, so ``trace.hist`` is always empty at
+        generation time and every batch is prompted as if it were the first
+        round. The 20260815 run showed the cost -- the generator DISCOVERED the
+        market's reversal structure in round 0 (feedback said "directionally
+        supports the reversal hypothesis") and then un-learned it: factor
+        descriptions mentioning reversal/inverse fell 33% -> 0% -> 17% -> 11%
+        across rounds. Passing only the 5 ADMITTED trajectories meant the 19
+        REJECTIONS -- which is where the "this failed, and here is the measured
+        sign" evidence lives -- never reached the next hypothesis.
+
+        Rejections are shown with their verdict and their SIGNED RankIC, because
+        on this market the sign is the lesson: essentially every mined factor
+        has negative raw RankIC (short-horizon mean reversion), and a generator
+        that never sees that keeps proposing momentum-framed ideas.
         """
-        if not self._has_treatment_data():
-            return ""
-        admitted = [
-            t for t in self.pool.get_all()
-            if bool((t.backtest_metrics or {}).get(
-                "admitted", (t.backtest_metrics or {}).get("feasible", True)))
-        ][:8]
-        if not admitted:
-            return ""
-        lines = ["## Repository Context (what the book already captures)"]
-        for t in admitted:
+        all_trajs = self.pool.get_all()
+
+        def _is_admitted(t) -> bool:
+            """Did this batch actually HELP -- not merely: was it let in.
+
+            Split on the VERDICT, never on the ``admitted`` flag. Under
+            ``admission.blocking: false`` the flag is True for almost
+            everything (that is the whole point -- the pool accumulates), so a
+            flag-based split silently empties the "what has already FAILED"
+            section below. That section is the only place the signed-RankIC
+            lesson survives across batches, and losing it would undo the memory
+            channel while looking like it still worked.
+            """
             m = t.backtest_metrics or {}
-            exprs = [f.get("expression", "")[:60] for f in (t.factors or [])[:2]]
+            v = str(m.get("verdict") or "").strip().lower()
+            if v:
+                return v in ("admitted", "replaced", "bootstrap")
+            # Pre-verdict records: fall back to the old flag.
+            return bool(m.get("admitted", m.get("feasible", True)))
+
+        def _has_content(t) -> bool:
+            """A row worth sending: it names a factor, or it carries a number.
+
+            Without this, a trajectory holding neither renders as
+            ``- [] U=N/A rho_max=N/A`` -- a Repository Context header followed
+            by rows with an empty expression and no measurements. That is not
+            merely wasted tokens: an empty ``[]`` under "what the book already
+            captures" reads as a repository holding nameless factors.
+            """
+            m = t.backtest_metrics or {}
+            if any((f.get("expression") or "").strip() for f in (t.factors or [])):
+                return True
+            return any(m.get(k) is not None
+                       for k in ("U", "rho_max", "rank_ic", "verdict"))
+
+        all_trajs = [t for t in all_trajs if _has_content(t)]
+        admitted = [t for t in all_trajs if _is_admitted(t)][:8]
+        # Most recent rejections first: the newest failures are the ones the
+        # next hypothesis should avoid repeating.
+        rejected = [t for t in all_trajs if not _is_admitted(t)][-6:]
+
+        if not admitted and not rejected:
+            return ""
+
+        lines = []
+        if admitted:
+            lines.append("## Repository Context (what the book already captures)")
+            for t in admitted:
+                m = t.backtest_metrics or {}
+                exprs = [f.get("expression", "")[:60] for f in (t.factors or [])[:2]]
+                lines.append(
+                    f"- [{' | '.join(exprs)}] U={format_metric(m.get('U'))} "
+                    f"rho_max={format_metric(m.get('rho_max'))}"
+                )
+            # Was: "Aim for ORTHOGONAL signal not already in the book; do not
+            # duplicate the admitted factor logic above." That is an instruction
+            # about what to produce. The coverage block below states the same
+            # situation as a MEASUREMENT -- which directions are occupied and why
+            # a duplicate cannot score -- and leaves what to do about it open.
+            cov = self._coverage_and_headroom()
+            if cov:
+                lines.append("")
+                lines.append(cov)
+
+        # --- accumulated failure PATTERNS, not just recent rejections --------
+        # Storing "batch 14 scored -0.08" teaches nothing. Counting WHY factors
+        # failed, across the whole run, produces a lesson that transfers: "nine
+        # factors so far had their entire edge removed by size neutralization"
+        # is actionable in a way no per-batch scalar is.
+        pattern = self._failure_patterns(all_trajs)
+        if pattern:
+            if lines:
+                lines.append("")
+            lines.extend(pattern)
+
+        if rejected:
+            if lines:
+                lines.append("")
+            lines.append("## What has already FAILED (do not repeat these)")
+            for t in rejected:
+                m = t.backtest_metrics or {}
+                exprs = [f.get("expression", "")[:60] for f in (t.factors or [])[:1]]
+                verdict = m.get("verdict") or "rejected"
+                # The FACTOR'S own signed IC, never the composite book's. See
+                # the note on `rank_ic_own` in net_cost_runner._to_series: this
+                # line used to render the book number, which was positive on
+                # every prompt while the factors were negative 71% of the time.
+                ric = m.get("rank_ic_own")
+                if ric is None:
+                    ric = m.get("rank_ic_neutral")
+                ric_s = f" RankIC={format_metric(ric)}" if ric is not None else ""
+                lines.append(f"- [{' | '.join(exprs)}] {verdict}{ric_s}")
+            # THE AGGREGATE, stated once. Every prompt carried at most 3 signed
+            # observations (median 0), and no prompt in the whole run stated the
+            # overall direction. A 71/29 split is not inferable from 0-3 points,
+            # so the generator was asked to learn a base rate it was never shown:
+            # measured sign accuracy 54% against a 71% base rate, i.e. worse
+            # than answering with the majority every time.
+            signed = []
+            for t in all_trajs:
+                mm = t.backtest_metrics or {}
+                vv = mm.get("rank_ic_own", mm.get("rank_ic_neutral"))
+                try:
+                    vv = float(vv)
+                except (TypeError, ValueError):
+                    continue
+                if vv == vv:
+                    signed.append(vv)
+            if len(signed) >= 8:
+                neg = sum(1 for v in signed if v < 0)
+                lines.append("")
+                lines.append(
+                    f"## Direction, measured across this run\n"
+                    f"- {neg} of {len(signed)} factors scored so far realized a "
+                    f"NEGATIVE information coefficient "
+                    f"({100.0 * neg / len(signed):.0f}%).\n"
+                    f"- This is the measured outcome on this market over this "
+                    f"period, not an assumption. What it implies for the next "
+                    f"hypothesis is yours to determine.")
             lines.append(
-                f"- [{' | '.join(exprs)}] U={format_metric(m.get('U'))} "
-                f"rho_max={format_metric(m.get('rho_max'))}"
+                "These were measured and REJECTED. Read the RankIC SIGN as "
+                "evidence, not decoration: if the realized sign is consistently "
+                "OPPOSITE to what the rejected premise predicted, then that "
+                "premise was directionally wrong and restating it -- however "
+                "reworded -- will fail again. If the sign matched but the "
+                "magnitude was too small, the premise pointed the right way and "
+                "what it was measured through is where the shortfall sits. "
+                "What to do with either reading is yours to determine."
             )
-        lines.append(
-            "Aim for ORTHOGONAL signal not already in the book; do not duplicate "
-            "the admitted factor logic above."
-        )
         return "\n".join(lines)
+
+    def _failure_patterns(self, trajectories: list) -> list[str]:
+        """Aggregate WHY factors have failed, across the whole run so far.
+
+        Six failures that used to arrive as one scalar are now distinguishable
+        measurements, so they can be counted. A running tally is the closest
+        thing the search has to a lesson: it survives batches, it names a cause
+        rather than a score, and it says which causes are recurring.
+
+        Every line is a count of something measured. No line says what to do
+        about it -- the counts are the evidence, and what follows from them is
+        the model's to work out.
+        """
+        buckets = {
+            "size_exposure": 0, "no_signal": 0, "tails_only": 0,
+            "duplicate": 0, "unstable": 0, "fast_decay": 0,
+        }
+        n = 0
+        for t in trajectories:
+            m = t.backtest_metrics or {}
+            sheets = m.get("factor_tearsheets")
+            rows = list(sheets.values()) if isinstance(sheets, dict) else ([m] if m else [])
+            for sheet in rows:
+                if not isinstance(sheet, dict):
+                    continue
+                raw_ic = sheet.get("rank_ic")
+                neu_ic = sheet.get("rank_ic_neutral")
+                exp_sz = sheet.get("exposure_size")
+                t_nw = sheet.get("t_nw")
+                mono = sheet.get("monotonicity")
+                rho = sheet.get("rho_max")
+                pos = sheet.get("ic_pos_frac")
+                if neu_ic is None and t_nw is None:
+                    continue
+                n += 1
+                try:
+                    if (exp_sz is not None and abs(float(exp_sz)) > 0.4
+                            and raw_ic and neu_ic is not None
+                            and abs(float(neu_ic)) < 0.4 * abs(float(raw_ic))):
+                        buckets["size_exposure"] += 1
+                    if t_nw is not None and abs(float(t_nw)) < 3.0:
+                        buckets["no_signal"] += 1
+                    if mono is not None and mono == mono and abs(float(mono)) < 0.30:
+                        buckets["tails_only"] += 1
+                    if rho is not None and float(rho) >= 0.60:
+                        buckets["duplicate"] += 1
+                    if pos is not None and float(pos) < 0.52:
+                        buckets["unstable"] += 1
+                except (TypeError, ValueError):
+                    continue
+        if not n:
+            return []
+
+        label = {
+            "size_exposure": "had most of their edge removed by size neutralization "
+                             "(the raw correlation was largely company size)",
+            "no_signal":     "did not reach |t| = 3 on their neutralized correlation",
+            "tails_only":    "moved only in the extreme deciles, with no gradient between",
+            "duplicate":     "correlated 0.60 or higher with a factor already held",
+            "unstable":      "kept their sign on barely half the days",
+        }
+        out = [f"## What the measurements have shown so far ({n} factors scored)"]
+        for key, count in sorted(buckets.items(), key=lambda kv: -kv[1]):
+            if count and key in label:
+                out.append(f"- {count} of {n} {label[key]}")
+        return out if len(out) > 1 else []
 
     def _rounds_exhausted(self) -> bool:
         """Should evolution stop?
 
-        Normally ``max_rounds`` decides. But when the treatment arm gates
+        Normally ``max_rounds`` decides. But when the objective gates
         admission on ``U``, a fixed round count produces a repository whose size
         depends on how many batches happened to clear the bar -- and factor
-        count moves the combiner independently of factor quality, so an arm that
+        count moves the combiner independently of factor quality, so a run that
         mines the same amount but admits less is handicapped for a reason that
         has nothing to do with its objective.
 
@@ -1509,12 +2697,56 @@ class EvolutionController:
         rate is not known before the run and drifts as the repository improves,
         which is the whole point of an adaptive bar.
 
-        ``QA_MAX_ROUNDS_CAP`` bounds the cost. Hitting it means the arm could
+        ``QA_MAX_ROUNDS_CAP`` bounds the cost. Hitting it means the search could
         not reach the target, which is itself a result and is logged as such
         rather than being retried forever.
         """
         if self._current_round < self.config.max_rounds:
             return False
+
+        cap = int(os.environ.get("QA_MAX_ROUNDS_CAP", self.config.max_rounds * 3))
+
+        # QA_TARGET_MINED -- stop when the LIBRARY reaches N factors.
+        #
+        # This exists because QA_TARGET_ZOO was being used for a job it cannot
+        # do. The canonical 150 came from ``expected_factor_count(10,10,5,3)``,
+        # whose own docstring says "how many factors a run of this shape is
+        # expected to MINE" -- a GENERATION count. Setting it as the ADMISSION
+        # target asked for 150 admitted out of 150 generated: a 100% admission
+        # rate, i.e. a gate that never rejects. With crossover_n cut to 5 the
+        # shape generates only 105, so the standing config asked for 143%.
+        #
+        # Worse, the target is unreachable in principle, not just in practice:
+        # admission is MARGINAL contribution to the existing book, so every
+        # admitted factor raises the bar for the next one. The rate falls toward
+        # zero by construction. A library target is the honest way to ask for
+        # "150 factors"; the zoo then settles wherever the objective says.
+        mined_target = os.environ.get("QA_TARGET_MINED")
+        if mined_target:
+            try:
+                mined_n = int(mined_target)
+            except ValueError:
+                logger.warning(f"QA_TARGET_MINED={mined_target!r} is not an integer; ignoring")
+                mined_n = 0
+            if mined_n > 0:
+                mined = self._library_size()
+                if mined >= mined_n:
+                    logger.info(
+                        f"Evolution complete: library holds {mined} mined factor(s) "
+                        f">= QA_TARGET_MINED={mined_n} after round {self._current_round}"
+                    )
+                    return True
+                if self._current_round >= cap:
+                    logger.warning(
+                        f"Evolution stopping at the cap ({cap} rounds) with "
+                        f"{mined}/{mined_n} mined factors."
+                    )
+                    return True
+                logger.info(
+                    f"Extending evolution: {mined}/{mined_n} mined factor(s) "
+                    f"after round {self._current_round} (cap {cap})"
+                )
+                return False
 
         target = os.environ.get("QA_TARGET_ZOO")
         if not target:
@@ -1524,8 +2756,6 @@ class EvolutionController:
         except ValueError:
             logger.warning(f"QA_TARGET_ZOO={target!r} is not an integer; ignoring")
             return True
-
-        cap = int(os.environ.get("QA_MAX_ROUNDS_CAP", self.config.max_rounds * 3))
         try:
             from quantaalpha.eval.ledger import replay_repository
 
@@ -1543,7 +2773,7 @@ class EvolutionController:
         if self._current_round >= cap:
             logger.warning(
                 f"Evolution stopping at the cap ({cap} rounds) with {admitted}/{target_n} "
-                f"admitted factors. The arm could not reach the target: its admission "
+                f"admitted factors. The search could not reach the target: its admission "
                 f"rate is too low for this budget, which is a result, not a retry condition."
             )
             return True
@@ -1552,6 +2782,38 @@ class EvolutionController:
             f"factor(s) after round {self._current_round} (cap {cap})"
         )
         return False
+
+    @staticmethod
+    def _library_size() -> int:
+        """How many factors the run has MINED so far (the library, not the zoo).
+
+        Reads the same file ``loop.py`` writes: ``data/factorlib/
+        all_factors_library_<FACTOR_LIBRARY_SUFFIX>.json``. Counts every entry,
+        admitted or not -- the library is the record of everything the search
+        produced, which is the quantity ``QA_TARGET_MINED`` bounds.
+
+        Returns 0 when the file does not exist yet or cannot be read, so a
+        missing library reads as "keep going" rather than stopping the run.
+        """
+        import json
+        from pathlib import Path
+
+        suffix = os.environ.get("FACTOR_LIBRARY_SUFFIX", "")
+        name = f"all_factors_library_{suffix}.json" if suffix else "all_factors_library.json"
+        # controller.py -> evolution -> pipeline -> quantaalpha -> <project root>
+        path = Path(__file__).resolve().parents[3] / "data" / "factorlib" / name
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        factors = data.get("factors")
+        if isinstance(factors, dict):
+            return len(factors)
+        meta = data.get("metadata") or {}
+        try:
+            return int(meta.get("total_factors") or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def is_complete(self) -> bool:
         """Check if evolution is complete."""
@@ -1581,6 +2843,10 @@ class EvolutionController:
             "active_branch_count": self._active_branch_count,
             "mutation_idx": self._mutation_idx,
             "mutation_target_ids": [t.trajectory_id for t in self._mutation_targets],
+            # T6 per-target routing buckets (REFINE/ORTHOGONAL/ADMITTED-PUSH),
+            # parallel to mutation_target_ids. Absent in pre-T6 state files; the
+            # loader re-derives them when missing.
+            "mutation_buckets": list(self._mutation_buckets),
             # Learning-aware reseed state: the grown direction list and the
             # per-direction outcome tally must survive a restart or a resumed
             # run would forget it had already saturated those directions.
@@ -1588,6 +2854,7 @@ class EvolutionController:
             "direction_status": list(self._direction_status),
             "best_zoo_size": self._best_zoo_size,
             "stale_rounds": self._stale_rounds,
+            "zoo_size_at_last_check": self._zoo_size_at_last_check,
             "config": {
                 "num_directions": self.config.num_directions,
                 "max_rounds": self.config.max_rounds,
@@ -1637,14 +2904,26 @@ class EvolutionController:
             ]
         self._best_zoo_size = int(state.get("best_zoo_size", -1))
         self._stale_rounds = int(state.get("stale_rounds", 0))
+        self._zoo_size_at_last_check = int(state.get("zoo_size_at_last_check", -1))
 
-        # Restore mutation targets from IDs
+        # Restore mutation targets from IDs. Re-derive the T6 routing buckets from
+        # each restored target's current metrics when the state file carries none
+        # (pre-T6 files) -- an admitted parent that IS a mutation target was
+        # selected for ADMITTED-PUSH (the rest are crossover-only and absent), so
+        # the re-derivation matches the classification in _prepare_mutation_targets.
         mutation_target_ids = state.get("mutation_target_ids", [])
+        saved_buckets = state.get("mutation_buckets")
         self._mutation_targets = []
-        for tid in mutation_target_ids:
+        self._mutation_buckets = []
+        for i, tid in enumerate(mutation_target_ids):
             traj = self.pool.get(tid)
-            if traj:
-                self._mutation_targets.append(traj)
+            if not traj:
+                continue
+            self._mutation_targets.append(traj)
+            if isinstance(saved_buckets, list) and i < len(saved_buckets):
+                self._mutation_buckets.append(str(saved_buckets[i]))
+            else:
+                self._mutation_buckets.append(self._classify_mutation_bucket(traj))
         
         # Re-prepare crossover groups if in crossover phase
         if self._current_phase == RoundPhase.CROSSOVER:

@@ -19,10 +19,10 @@ import hashlib
 from quantaalpha.log import logger
 
 # Which scalar the evolutionary search maximizes, and whether hard feasibility
-# is required. Arm A (control) sets neither and reproduces today's behaviour
-# exactly; Arm B (treatment) sets QA_PRIMARY_METRIC=U and
-# QA_REQUIRE_FEASIBLE=true. RankIC stays in backtest_metrics either way, so the
-# two arms remain mutually reportable.
+# is required. U is the primary metric under the net-cost objective
+# (QA_PRIMARY_METRIC=U, QA_REQUIRE_FEASIBLE=true). RankIC stays in
+# backtest_metrics either way, so trajectories stay mutually reportable with
+# the canonical Qlib names.
 _PRIMARY_METRIC = os.environ.get("QA_PRIMARY_METRIC", "RankIC")
 _REQUIRE_FEASIBLE = os.environ.get("QA_REQUIRE_FEASIBLE", "false").lower() in ("1", "true", "yes")
 
@@ -49,18 +49,18 @@ def format_metric(value) -> str:
 def is_admissible(traj) -> bool:
     """Did this trajectory's factor pass F_Theta?
 
-    Defaults to True when the key is absent, so control-arm trajectories (whose
-    Qlib results carry no feasibility flag) are never filtered out.
+    Defaults to True when the key is absent, so a trajectory whose
+    Qlib results carry no feasibility flag is never filtered out.
     """
     return bool((traj.backtest_metrics or {}).get("feasible", True))
 
 
 def format_objective_note(traj) -> str:
-    """Admissibility line for the evolution prompts, or "" under the control arm.
+    """Admissibility line for the evolution prompts, or "" when no ``U`` is present.
 
-    Gated on the *presence* of `U` rather than on an env var: a control-arm
+    Gated on the *presence* of `U` rather than on an env var: a
     trajectory carries Qlib metrics with no `U`, so its prompts render exactly
-    as they do today and the A/B stays comparable.
+    as they do today.
 
     The point is that a parent which was REJECTED must say so, and say why. A
     bare `failed_gates: rank_icir` in a metric dump is not actionable; "RankICIR
@@ -75,14 +75,47 @@ def format_objective_note(traj) -> str:
     # `admitted` is the live signal: U gates entry to the repository, and the
     # runner records the decision. `feasible` is the older absolute-gate flag,
     # kept as a fallback so a re-enabled gate still reports. Defaulting both to
-    # True means a control-arm trajectory reads exactly as it always did.
+    # True means a trajectory without ``U`` reads with the feasible fallback.
     admitted = metrics.get("admitted", metrics.get("feasible", True))
     if admitted:
         parts.append("ADMITTED to the repository")
+        # Admitted parents ARE the crossover stock and (when push-fraction > 0)
+        # the ADMITTED-PUSH refine stock, so the generator needs the same WHY it
+        # gets for rejections: the verdict (REPLACED names the incumbent this
+        # factor displaced; ADMITTED carries the t-stat; BOOTSTRAP flags an
+        # under-sized zoo) and the laggard axes relative to the repository. The
+        # data is written for admitted trajectories too (net_cost_runner sets
+        # weakest_dimensions / reason / verdict regardless of admission) -- it
+        # was simply never rendered here, so a winner looked like a bare
+        # "ADMITTED" with no steer for recombination or push-further refinement.
+        reason = metrics.get("reason")
+        if not reason:
+            reason = metrics.get("pathology")
+        if reason:
+            parts.append(f"verdict: {reason}")
+        weak = metrics.get("weakest_dimensions")
+        if weak:
+            parts.append(f"weakest dimensions relative to the repository: {weak}")
+            parts.append(
+                "These are this admitted factor's laggard axes relative to the "
+                "repository. What to do about them is yours to determine"
+            )
     else:
         tau = metrics.get("tau_admit")
         bar = f" < admission bar {format_metric(tau)}" if tau is not None else ""
         parts.append(f"REJECTED{bar} -- these factors did NOT enter the repository")
+        # The verdict string from admission.decide -- the single most diagnostic
+        # line in the pipeline ("contribution is resolvably NEGATIVE ...", "rho_max
+        # ... (duplicate)", "coverage ... (too sparse to price)"). Until T0.1 this
+        # was written to the ledger and dropped before it could reach the prompt,
+        # so a rejected parent could only tell the generator THAT it failed, not
+        # WHY. ``pathology`` is the structured sub-reason (or None); ``reason``
+        # already embeds it, so prefer reason and fall back to pathology.
+        reason = metrics.get("reason")
+        if not reason:
+            reason = metrics.get("pathology")
+        if reason:
+            parts.append(f"verdict: {reason}")
         weak = metrics.get("weakest_dimensions")
         if weak:
             # The whole point of surfacing this: "rejected" alone is not
@@ -157,6 +190,13 @@ class StrategyTrajectory:
     # Hypothesis information
     hypothesis: str = ""
     hypothesis_details: dict[str, Any] = field(default_factory=dict)
+    # The pre-registered directional commitment ("positive"/"negative"/"") the
+    # hypothesis made when it was evaluated. Captured at trajectory creation
+    # (controller.create_trajectory_from_loop_result) from the AlphaAgentHypothesis
+    # object before str() discards it, so that when this trajectory later acts as
+    # a refine PARENT its direction can be refrozen onto the child. Without it the
+    # falsifiability gate rejects every expression-refine child no_mechanism.
+    expected_ic_sign: str = ""
     
     # Factor information
     factors: list[dict[str, Any]] = field(default_factory=list)
@@ -171,6 +211,14 @@ class StrategyTrajectory:
     
     # Evolution lineage
     parent_ids: list[str] = field(default_factory=list)
+    # T5 lineage-aware diagnosis: the refine directive(s) that PRODUCED this
+    # trajectory -- one entry per refine parent (crossover/orthogonal children
+    # leave it empty). Each entry: {round_idx, verdict, weakness_dimension,
+    # refine_target, mechanism_hint, target_subtree_signatures}. A descendant's
+    # diagnosis walks its ancestors' ``refine_actions`` to detect a lever pulled
+    # >=K times without admission (fix #5). Plain dict/list data so it round-trips
+    # through ``asdict``/``from_dict`` automatically (no to_dict/from_dict edit).
+    refine_actions: list[dict[str, Any]] = field(default_factory=list)
     
     # Metadata
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -184,7 +232,7 @@ class StrategyTrajectory:
         return hashlib.md5(content.encode()).hexdigest()[:12]
     
     def get_primary_metric(self) -> Optional[float]:
-        """Get the primary metric for comparison (RankIC, or U under Arm B)."""
+        """Get the primary metric for comparison (RankIC, or U under the net-cost objective)."""
         return self.backtest_metrics.get(_PRIMARY_METRIC)
 
     def is_successful(self) -> bool:
@@ -209,7 +257,11 @@ class StrategyTrajectory:
             factor_strs = []
             for f in self.factors[:5]:  # Limit to 5 factors
                 name = f.get("name", "unknown")
-                expr = f.get("expression", "")[:100]
+                # Full expression, not a 100-char truncation: the orthogonal-
+                # mutation LLM must see the whole parent construction to propose
+                # a genuinely orthogonal direction, and a nested expression cut
+                # at 100 chars hides the construction it is meant to diverge from.
+                expr = f.get("expression", "")
                 factor_strs.append(f"  - {name}: {expr}")
             parts.append("Factors:\n" + "\n".join(factor_strs))
 
@@ -324,6 +376,37 @@ class TrajectoryPool:
     def get_all(self) -> list[StrategyTrajectory]:
         """Get all trajectories."""
         return list(self._trajectories.values())
+
+    def get_ancestors(self, trajectory_id: str) -> list[StrategyTrajectory]:
+        """All ancestors of a trajectory (parents, grandparents, ...), nearest first.
+
+        Walks ``parent_ids`` up the lineage -- the parent chain is already stored
+        on each trajectory, so no separate reverse index is needed. Defensive
+        against cycles and missing IDs (returns whatever it can resolve). Used by
+        T5's lineage-aware diagnosis to detect a refinement lever pulled >=K times
+        along a lineage without admission (fix #5): each ancestor's
+        ``refine_actions`` records the lever, and its ``backtest_metrics["admitted"]``
+        records whether that lever paid off.
+        """
+        out: list[StrategyTrajectory] = []
+        seen: set[str] = {trajectory_id}
+        frontier = list(self._parent_ids_of(trajectory_id))
+        while frontier:
+            tid = frontier.pop(0)
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            traj = self._trajectories.get(tid)
+            if traj is None:
+                continue
+            out.append(traj)
+            frontier.extend(self._parent_ids_of(tid))
+        return out
+
+    def _parent_ids_of(self, tid: str) -> list[str]:
+        """The parent IDs recorded on a trajectory (empty if unknown)."""
+        traj = self._trajectories.get(tid)
+        return list(getattr(traj, "parent_ids", []) or []) if traj else []
     
     def get_latest_round_idx(self) -> int:
         """Get the highest round index across all trajectories."""

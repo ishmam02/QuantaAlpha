@@ -21,6 +21,8 @@ is *used*.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import logging
 
 import numpy as np
@@ -56,21 +58,71 @@ def _cross_sectional_corr(a: pd.DataFrame, b: pd.DataFrame, method: str) -> pd.S
 
     This is the shape ``runner.py:47-73`` already computed for the (dead)
     de-duplication path; reviving it here is what makes ``rho_max`` cheap.
+
+    The pearson path is computed as whole-array sums rather than a Python loop
+    over dates. This function was the single largest cost in an evaluation
+    (~37% of it): ``rho_max`` calls it once per repository member, so the
+    per-date pandas indexing was paid |zoo| times per evaluation and grew as
+    the repository grew. The vectorised form measured 58-72x faster and matches
+    the loop to 3e-16 with an identical index, skip rules included. The
+    spearman branch still ranks row-by-row (ties need per-row handling) but
+    masks and correlates in the same vectorised pass.
     """
     b = b.reindex(index=a.index, columns=a.columns)
-    out = {}
-    for date in a.index:
-        x, y = a.loc[date], b.loc[date]
-        mask = x.notna() & y.notna()
-        if int(mask.sum()) < 3:
-            continue
-        xs, ys = x[mask], y[mask]
-        if method == "spearman":
-            xs, ys = xs.rank(), ys.rank()
-        if xs.std() == 0 or ys.std() == 0:
-            continue
-        out[date] = float(np.corrcoef(xs.to_numpy(), ys.to_numpy())[0, 1])
-    return pd.Series(out, dtype=float).sort_index()
+    A = a.to_numpy(dtype=float)
+    B = b.to_numpy(dtype=float)
+    if A.size == 0:
+        return pd.Series(dtype=float)
+    mask = np.isfinite(A) & np.isfinite(B)
+    n = mask.sum(axis=1)
+
+    if method == "spearman":
+        A = _rank_rows(A, mask)
+        B = _rank_rows(B, mask)
+
+    cnt = n.astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        # Means over the pairwise-present entries only, then centred sums --
+        # the same quantities np.corrcoef forms on the masked slice.
+        ma = np.where(mask, A, 0.0).sum(axis=1) / cnt
+        mb = np.where(mask, B, 0.0).sum(axis=1) / cnt
+        Ac = np.where(mask, A - ma[:, None], 0.0)
+        Bc = np.where(mask, B - mb[:, None], 0.0)
+        saa = (Ac * Ac).sum(axis=1)
+        sbb = (Bc * Bc).sum(axis=1)
+        corr = (Ac * Bc).sum(axis=1) / np.sqrt(saa * sbb)
+
+    # The loop skipped a date with <3 pairwise points or zero variance on
+    # either side; zero centred sum-of-squares is exactly that zero-variance
+    # test, so those dates are dropped from the index rather than carried as NaN.
+    keep = (n >= 3) & (saa > 0) & (sbb > 0) & np.isfinite(corr)
+    return pd.Series(corr[keep], index=a.index[keep], dtype=float).sort_index()
+
+
+def _rank_rows(m: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Per-row average ranks over the masked entries (pandas ``.rank()`` semantics).
+
+    Ranks are 1-based with ties averaged, computed only over the entries the
+    pairwise mask keeps -- matching ``x[mask].rank()`` in the loop this
+    replaces.
+    """
+    # Vectorised via pandas' Cython ranker. The previous form was a Python loop
+    # over dates (~1200) with an inner while-loop for tie runs, which made the
+    # spearman path **43.65x slower than pearson** (718 ms vs 16.5 ms per pair).
+    # That only became load-bearing when ``rho_max`` switched to spearman to
+    # measure redundancy in the space the combiner actually fits in -- at which
+    # point one rho_max call over a 9-factor zoo cost 6.5 SECONDS and grew
+    # linearly with the repository.
+    #
+    # ``DataFrame.rank(axis=1)`` defaults to method="average" and leaves NaN as
+    # NaN, which is exactly the 1-based average-rank-over-masked-entries
+    # semantics implemented above; masked-out cells are set to NaN first so they
+    # are excluded from the ranking rather than ranked as values.
+    return (
+        pd.DataFrame(np.where(mask, m, np.nan))
+        .rank(axis=1)
+        .to_numpy(dtype=float)
+    )
 
 
 _LABEL_FIELDS = {"$close": "close", "$open": "open", "$vwap": "vwap"}
@@ -90,15 +142,54 @@ def label_frame(panel: PanelBundle, theta: Protocol) -> pd.DataFrame:
     only shape the wide-panel form can express. Anything else raises rather
     than falling back to close and being quietly wrong about it.
     """
+    # Delegates to the horizon-aware form so IC measures the SAME return the
+    # combiner trains on and the book holds. Training on a 20-day target while
+    # scoring IC on a 1-day one would report a quality the strategy never
+    # realises -- the two must move together, which is why this is one call and
+    # not two parallel implementations.
+    h = int(getattr(theta.execution, "label_horizon", 1) or 1)
     expr = theta.execution.label_expr
     field = next((f for f in _LABEL_FIELDS if f in expr), None)
-    if field is None or "Ref(" not in expr or "-2" not in expr or "-1" not in expr:
+    if field is None or "Ref(" not in expr:
         raise ValueError(
             f"label_frame cannot express {expr!r}. It understands "
-            f"Ref(P,-2)/Ref(P,-1)-1 for P in {sorted(_LABEL_FIELDS)}; anything "
-            "else must be evaluated through Qlib rather than on the panel.")
+            f"Ref(P,-(1+h))/Ref(P,-1)-1 for P in {sorted(_LABEL_FIELDS)}; "
+            "anything else must be evaluated through Qlib rather than on the panel.")
+    return label_frame_at(panel, theta, h)
+
+
+def label_frame_at(panel: PanelBundle, theta: Protocol, horizon: int) -> pd.DataFrame:
+    """The training label generalised to an ``horizon``-day holding period.
+
+    ``label_frame`` is this at ``horizon=1``: ``P[t+2]/P[t+1] - 1``, a one-day
+    forward return measured from the fill. The generalisation keeps the FILL
+    anchored at ``t+1`` and moves only the exit::
+
+        horizon h  ->  P[t+1+h] / P[t+1] - 1
+
+    so every horizon measures a return the book could actually have earned
+    starting from the same entry, and h=1 reproduces ``label_frame`` exactly.
+
+    **This does not change the book's holding period.** It is used to ask
+    whether a factor is predictive at a longer horizon, for ADMISSION; the
+    portfolio still rebalances daily. A factor that predicts 20-day returns is
+    valuable precisely because it decays slowly and is therefore cheap to hold
+    -- the cost model already rewards that through turnover.
+
+    Why this matters: with a single horizon every mined factor competes to
+    approximate the SAME target, which is a large part of why the search
+    saturates at a handful of independent ideas. Signals predictive at 1 day
+    and at 20 days are different economics, not variants of one.
+    """
+    h = max(1, int(horizon))
+    expr = theta.execution.label_expr
+    field = next((f for f in _LABEL_FIELDS if f in expr), None)
+    if field is None or "Ref(" not in expr:
+        raise ValueError(
+            f"label_frame_at cannot express {expr!r}; it understands "
+            f"Ref(P,-2)/Ref(P,-1)-1 for P in {sorted(_LABEL_FIELDS)}")
     price = getattr(panel, _LABEL_FIELDS[field])
-    return price.shift(-2) / price.shift(-1) - 1.0
+    return price.shift(-(1 + h)) / price.shift(-1) - 1.0
 
 
 def cx(expr: str) -> int:
@@ -139,17 +230,123 @@ def rho_max(signal, zoo_signals: dict[str, object]) -> float:
     carries no new information either.
 
     Defined as ``0.0`` for an empty zoo: the first factor is trivially novel.
+
+    Measured with **spearman**, not pearson, because that is the space the
+    combiner actually fits in: ``combiner.py`` applies ``_cs_rank_norm`` to every
+    feature before use, so ``X`` and ``RANK(X)`` become the *same* column. Raw
+    pearson does not see that. Measured on the live 9-factor zoo 2026-08-15,
+    ``Up_Down_Volume_Ratio_10D`` vs ``Volume_Weighted_Return_Sign_10D``:
+    pearson **0.628** (passes ``rho_bar`` 0.80) but rank-space **0.998** -- the
+    gate admitted a pair the combiner then treated as one feature. Monotone
+    re-expressions (RANK/ZSCORE/log of an existing factor) are exactly what the
+    generator produces when asked for variants of one idea, so this was the
+    common case, not a corner case.
+    """
+    return rho_max_arg(signal, zoo_signals)[0]
+
+
+def rho_max_arg(signal, zoo_signals: dict[str, object]) -> tuple[float, str | None]:
+    """``rho_max`` plus the identity of the incumbent that produced it.
+
+    The scalar alone says "this duplicates something we hold" and throws away
+    WHICH something. That is the difference between a rejection the generator
+    can act on and one it cannot -- and it is also what a replacement decision
+    needs: to know whether a near-duplicate is BETTER than the incumbent it
+    resembles, you have to know which incumbent that is.
     """
     if not zoo_signals:
-        return 0.0
+        return 0.0, None
     candidate = _to_wide(signal)
-    best = 0.0
+    best, best_expr = 0.0, None
     for expr, other in zoo_signals.items():
-        corr = _cross_sectional_corr(candidate, _to_wide(other), "pearson")
+        corr = _cross_sectional_corr(candidate, _to_wide(other), "spearman")
         if corr.empty:
             continue
-        best = max(best, abs(float(corr.mean())))
-    return float(best)
+        r = abs(float(corr.mean()))
+        if r > best:
+            best, best_expr = r, expr
+    return float(best), best_expr
+
+
+def _abs_spearman(a, b) -> float:
+    """Time-average absolute cross-sectional Spearman between two wide signals.
+
+    Factored out of :func:`spearman_abs_matrix` so the marginal-er gate's
+    incremental path (:func:`effective_rank_cached`) computes its extra-block
+    entries with the SAME primitive as the full matrix. The cached and
+    freshly-computed entries are then bit-identical, so caching the repo-repo
+    block does not change the gate's verdict by a single eigenvalue.
+    """
+    c = _cross_sectional_corr(a, b, "spearman")
+    return abs(float(c.mean())) if not c.empty else 0.0
+
+
+def spearman_abs_matrix(signals: dict) -> "np.ndarray":
+    """|Spearman| cross-sectional correlation matrix of a dict of wide signals.
+
+    The same construction ``operator.evaluate`` uses for the book's effective
+    rank: entry (i, j) is the time-average of the absolute per-date
+    cross-sectional Spearman correlation between signal i and j. Expects
+    wide (date x instrument) frames (what ``_to_wide`` returns).
+    """
+    keys = list(signals)
+    n = len(keys)
+    R = np.eye(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            v = _abs_spearman(signals[keys[i]], signals[keys[j]])
+            R[i, j] = R[j, i] = v
+    return R
+
+
+def effective_rank_cached(R_repo: "np.ndarray", repo_signals: dict,
+                          extra_signals: dict) -> float:
+    """``effective_rank`` of ``repo_signals + extra_signals`` reusing the
+    precomputed repo-repo |Spearman| block ``R_repo``.
+
+    The repo-repo block is invariant across a batch's candidates -- the
+    repository changes only on a *replace*, which the caller handles by
+    invalidating the cache -- so recomputing it per candidate made the
+    marginal-er gate ``O(zoo**2)`` per batch (measured ~88s at zoo=14,
+    heading to ~700s at zoo=40). Reusing the cached block leaves only the
+    extra-involving entries (the kept batch-mates and the candidate), making
+    the gate ``O(zoo)`` per candidate. ``R_repo``'s axes must be ordered as
+    ``list(repo_signals)``. The result equals
+    ``effective_rank(spearman_abs_matrix({**repo_signals, **extra_signals}))``
+    -- eigenvalues are invariant to simultaneous row/column permutation, so
+    the key ordering does not matter -- so the gate's verdict is unchanged.
+    """
+    rk = list(repo_signals)
+    ek = list(extra_signals)
+    n, m = len(rk), len(ek)
+    R = np.eye(n + m)
+    if n:
+        R[:n, :n] = R_repo
+    sigs = {**repo_signals, **extra_signals}
+    order = rk + ek
+    for i in range(n, n + m):
+        si = sigs[order[i]]
+        for j in range(i):
+            v = _abs_spearman(si, sigs[order[j]])
+            R[i, j] = R[j, i] = v
+    return effective_rank(R)
+
+
+def effective_rank(R: "np.ndarray") -> float:
+    """Effective rank = exp(entropy) of the normalised eigenvalue spectrum.
+
+    The standard participation-ratio form: 1.0 for one dominant direction, n
+    for n uncorrelated signals. Matches the inline computation in
+    ``operator.evaluate`` (operator.py:235-238) and the audit scripts, so a
+    gate that uses it and the reported ``effective_rank`` metric are the same
+    number. Eigenvalues <= 1e-12 are dropped to match.
+    """
+    ev = np.linalg.eigvalsh(R)[::-1]
+    ev = ev[ev > 1e-12]
+    if len(ev) == 0:
+        return float("nan")
+    p = ev / ev.sum()
+    return float(np.exp(-(p * np.log(p)).sum()))
 
 
 # --------------------------------------------------------------------------
@@ -240,9 +437,9 @@ def prediction_metrics(
 ) -> dict:
     """IC statistics of the COMBINED model prediction on the evaluation window.
 
-    This is the quantity Arm A reports: Qlib's ``SigAnaRecord`` computes IC and
+    This is the quantity Qlib's ``SigAnaRecord`` reports: it computes IC and
     Rank IC of the combined model's output, never of an individual factor. So
-    measuring the same thing here is what makes the two arms comparable.
+    measuring the same thing here keeps the numbers comparable to Qlib.
 
     Also reports the IS→OOS gap, using the training window as IS.
     """
@@ -326,13 +523,164 @@ def strategy_metrics(
     }
 
 
+
+# --------------------------------------------------------------------------
+# Research tear sheet -- signal quality, with no portfolio anywhere
+# --------------------------------------------------------------------------
+# These answer the researcher's question ("does this signal carry alpha") rather
+# than the trader's ("does this improve my book"). Deliberately optimizer-free:
+# the whole reason selection moved here is that scoring candidates through a
+# constrained long-only book measured a ~10pp/yr size exposure the factor did
+# not cause and could not fix.
+
+def quantile_metrics(signal, panel: PanelBundle, theta: Protocol,
+                     window: tuple[str, str], n_q: int = 10,
+                     horizon: int | None = None) -> dict:
+    """Decile response of a signal -- monotonicity, spread, and a long/short leg.
+
+    Built by cross-sectional RANK only: no optimizer, no cost model, no
+    benchmark. The long/short leg is dollar-neutral by construction, which is
+    what makes the transfer coefficient ~1 here and removes the benchmark, beta
+    and long-only distortions from the measurement.
+
+    ``monotonicity`` is the Spearman correlation between decile index and decile
+    mean return. It is the number that distinguishes a usable signal from a
+    tails-only one: a factor whose Q1 and Q10 differ sharply but whose middle is
+    noise scores a wide ``q_spread`` and a monotonicity near zero, and it will
+    die under any position cap -- the book holds ~34 of 300 names and cannot
+    take a position that only exists in the extreme tail.
+    """
+    h = int(horizon if horizon is not None else getattr(theta.execution, "label_horizon", 1))
+    wide = _to_wide(signal).reindex(index=panel.dates, columns=panel.instruments)
+    wide = wide.where(panel.universe)
+    label = label_frame_at(panel, theta, h)
+
+    sig = _slice(wide, window)
+    lab = label.reindex(index=sig.index, columns=sig.columns)
+
+    # Per-date decile assignment on the signal's cross-sectional rank.
+    ranks = sig.rank(axis=1, pct=True)
+    per_q: list[pd.Series] = []
+    for q in range(n_q):
+        lo, hi = q / n_q, (q + 1) / n_q
+        mask = (ranks > lo) & (ranks <= hi) if q else (ranks >= 0.0) & (ranks <= hi)
+        per_q.append(lab.where(mask).mean(axis=1))
+
+    q_means = [float(s.mean()) if s.notna().any() else float("nan") for s in per_q]
+    if not np.isfinite(q_means).all():
+        return {"monotonicity": np.nan, "q_spread": np.nan, "q_spread_t": np.nan,
+                "ls_sharpe": np.nan, "ls_mdd": np.nan, "q_means": q_means}
+
+    # Spearman of decile index vs decile mean return.
+    idx = np.arange(n_q, dtype=float)
+    mono = float(pd.Series(q_means).corr(pd.Series(idx), method="spearman"))
+
+    # Dollar-neutral long/short: top decile minus bottom decile, daily.
+    ls = (per_q[-1] - per_q[0]).dropna()
+    spread = float(ls.mean())
+    sd = float(ls.std())
+    n = len(ls)
+    # Overlapping labels share h-1 of their h days, so the effective sample is
+    # n/h, not n -- the same correction the standalone admission path applies.
+    n_eff = max(n / float(max(h, 1)), 2.0)
+    t = spread / (sd / n_eff ** 0.5) if sd > 0 else float("nan")
+    ppy = float(theta.periods_per_year)
+    sharpe = float(spread / sd * (ppy / max(h, 1)) ** 0.5) if sd > 0 else float("nan")
+
+    return {
+        "monotonicity": mono,
+        "q_spread": spread,
+        "q_spread_t": float(t),
+        "ls_sharpe": sharpe,
+        "ls_mdd": max_drawdown(ls),
+        "q_means": q_means,
+        "q_n_obs": n,
+    }
+
+
+def ic_decay_curve(signal, panel: PanelBundle, theta: Protocol,
+                   window: tuple[str, str],
+                   horizons: Sequence[int] = (1, 2, 3, 5, 10, 20)) -> dict:
+    """RankIC at each forecast horizon, and the horizon that maximises it.
+
+    This is what should SET the holding period. The protocol currently fixes
+    ``label_horizon: 1`` by assertion, never having measured whether the signal
+    is a one-day or a ten-day effect -- and a factor predictive at 20 days is a
+    different alpha from one predictive at 1 day, not a worse version of it.
+
+    The reported ``t`` carries the overlapping-returns correction (``n_eff =
+    n/h``). Without it long horizons win mechanically: consecutive observations
+    of a horizon-h label share h-1 of their h days, so the naive t is inflated
+    by roughly sqrt(h).
+    """
+    wide = _to_wide(signal).reindex(index=panel.dates, columns=panel.instruments)
+    wide = wide.where(panel.universe)
+    sig = _slice(wide, window)
+
+    curve: dict[int, dict] = {}
+    for h in horizons:
+        lab = label_frame_at(panel, theta, int(h))
+        ric = _cross_sectional_corr(sig, lab, "spearman").dropna()
+        if len(ric) < 30 or not ric.std():
+            curve[int(h)] = {"rank_ic": np.nan, "t": np.nan, "n": len(ric)}
+            continue
+        n_eff = max(len(ric) / float(h), 2.0)
+        curve[int(h)] = {
+            "rank_ic": float(ric.mean()),
+            "t": float(ric.mean() / (ric.std() / n_eff ** 0.5)),
+            "n": int(len(ric)),
+        }
+
+    usable = {h: v for h, v in curve.items() if v["rank_ic"] == v["rank_ic"]}
+    best = max(usable, key=lambda h: abs(usable[h]["rank_ic"])) if usable else None
+    return {
+        "curve": curve,
+        "best_horizon": best,
+        "best_rank_ic": usable[best]["rank_ic"] if best else np.nan,
+        "best_t": usable[best]["t"] if best else np.nan,
+    }
+
+
+def newey_west_t(series: pd.Series, lag: int | None = None) -> float:
+    """t-statistic of a mean under HAC (Newey-West) standard errors.
+
+    An IC series is autocorrelated -- from overlapping labels, and from the
+    signal itself being persistent -- so the ordinary t overstates significance,
+    often by 2-3x. ``lag`` defaults to the Newey-West rule of thumb
+    ``floor(4 * (n/100)^(2/9))``.
+    """
+    x = pd.Series(series).dropna().to_numpy(dtype=float)
+    n = x.size
+    if n < 8:
+        return float("nan")
+    mu = x.mean()
+    e = x - mu
+    L = int(lag) if lag is not None else int(np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0)))
+    L = max(0, min(L, n - 2))
+
+    gamma0 = float(e @ e) / n
+    var = gamma0
+    for k in range(1, L + 1):
+        w = 1.0 - k / (L + 1.0)          # Bartlett kernel
+        gk = float(e[k:] @ e[:-k]) / n
+        var += 2.0 * w * gk
+    if var <= 0:
+        return float("nan")
+    return float(mu / np.sqrt(var / n))
+
 __all__ = [
     "complexity_diagnostics",
     "cx",
+    "effective_rank",
     "label_frame",
     "max_drawdown",
     "per_factor_metrics",
+    "quantile_metrics",
+    "ic_decay_curve",
+    "newey_west_t",
     "rho_max",
+    "rho_max_arg",
     "solo_turnover",
+    "spearman_abs_matrix",
     "strategy_metrics",
 ]

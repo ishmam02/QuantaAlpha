@@ -25,6 +25,21 @@ from quantaalpha.llm.config import LLM_SETTINGS
 
 DEFAULT_QLIB_DOT_PATH = Path("./")
 
+# When QA_FULL_LLM_LOG=1 the FULL prompt + response text is logged with no
+# truncation, so the filled mutation / refine / restart / crossover prompts can
+# be reviewed verbatim from the log. Read once at import time (the launch script
+# exports the env var before Python starts). Default off keeps the log compact.
+_FULL_LLM_LOG = os.environ.get("QA_FULL_LLM_LOG", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _log_text(s: str, limit: int = 200) -> str:
+    """Truncate ``s`` to ``limit`` chars with a ``[N chars]`` tail -- unless
+    ``QA_FULL_LLM_LOG`` is set, in which case the full text is returned."""
+    if _FULL_LLM_LOG or not s:
+        return s
+    return s[:limit] + f"... [{len(s)} chars]" if len(s) > limit else s
+
 
 def md5_hash(input_string: str) -> str:
     hash_md5 = hashlib.md5(usedforsecurity=False)
@@ -748,10 +763,7 @@ class APIBackend:
         for m in messages:
             role = m['role']
             content = m['content']
-            if len(content) > max_prompt_length:
-                display_content = content[:max_prompt_length] + f"... [{len(content)} chars]"
-            else:
-                display_content = content
+            display_content = _log_text(content, max_prompt_length)
             
             log_messages += (
                 f"\n{LogColors.MAGENTA}{LogColors.BOLD}Role:{LogColors.END}"
@@ -796,7 +808,7 @@ class APIBackend:
             cache_result = self.cache.chat_get(input_content_json)
             if cache_result is not None:
                 if LLM_SETTINGS.log_llm_chat_content:
-                    display_cr = cache_result[:200] + f"... [{len(cache_result)} chars]" if len(cache_result) > 200 else cache_result
+                    display_cr = _log_text(cache_result)
                     logger.info(f"{LogColors.CYAN}Response(cached):{display_cr}{LogColors.END}", tag="llm_messages")
                 return cache_result, None
 
@@ -893,14 +905,14 @@ class APIBackend:
                         finish_reason = chunk.choices[0].finish_reason
 
                 if LLM_SETTINGS.log_llm_chat_content:
-                    display_resp = resp[:200] + f"... [{len(resp)} chars]" if len(resp) > 200 else resp
+                    display_resp = _log_text(resp)
                     logger.info(f"{LogColors.CYAN}Response:{display_resp}{LogColors.END}", tag="llm_messages")
 
             else:
                 resp = response.choices[0].message.content
                 finish_reason = response.choices[0].finish_reason
                 if LLM_SETTINGS.log_llm_chat_content:
-                    display_resp = resp[:200] + f"... [{len(resp)} chars]" if len(resp) > 200 else resp
+                    display_resp = _log_text(resp)
                     logger.info(f"{LogColors.CYAN}Response:{display_resp}{LogColors.END}", tag="llm_messages")
                     logger.info(
                         json.dumps(

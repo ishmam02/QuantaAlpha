@@ -61,6 +61,24 @@ class Splits:
     oos_proxy: DateRange | None = None
     search_is: str = "train"
     search_oos: str = "valid"
+    # Gap inserted between a training window and the window it is validated on.
+    #
+    # A label of horizon h at date t is realised at t+1+h, so a training row
+    # near the boundary is scored on returns that fall INSIDE the validation
+    # window -- the model is fitted on part of its own test set. Purging drops
+    # those rows; the embargo drops a further gap, because serial correlation
+    # outlives the label itself.
+    #
+    # 21 days is the conventional setting (about one trading month). At
+    # ``label_horizon: 1`` the leak this closes is a single day, which is why it
+    # went unnoticed; the moment the horizon moves to 5 or 20 -- which the IC
+    # decay curve exists to decide -- it becomes material at every boundary.
+    embargo_days: int = 21
+    # Floor for the dollar-neutral long/short research gate. China permitted
+    # short selling from March 2010, so a long/short result before then is not
+    # tradeable and must not be claimed. The long-only book is unaffected and
+    # may use the full history.
+    research_start: str = "2010-01-01"
 
     def window(self, name: str) -> DateRange:
         """Resolve a split name (including the ``search_*`` aliases)."""
@@ -82,7 +100,20 @@ class Splits:
     def oos_window(self) -> DateRange:
         return self.window("search_oos")
 
-    def walk_forward_folds(self, n: int) -> list[tuple[DateRange, DateRange]]:
+    def train_window_purged(self, horizon: int = 1) -> DateRange:
+        """``train`` with the last ``horizon + embargo_days`` removed.
+
+        The combiner fits on this rather than on ``train`` itself, because a row
+        at the very end of the training window carries a label realised after
+        the window closes -- inside the data the fit is about to be judged on.
+        """
+        import pandas as pd
+
+        end = pd.Timestamp(self.train[1]) - pd.Timedelta(
+            days=int(self.embargo_days) + int(horizon))
+        return (self.train[0], end.strftime("%Y-%m-%d"))
+
+    def walk_forward_folds(self, n: int, horizon: int = 1) -> list[tuple[DateRange, DateRange]]:
         """``n`` expanding-window (train, validate) folds ending at the current split.
 
         Markets regime-shift, and a single train/validate block can sit entirely
@@ -104,18 +135,23 @@ class Splits:
         import pandas as pd
 
         if n <= 1:
-            return [(self.train, self.valid)]
+            return [(self.train_window_purged(horizon), self.valid)]
 
         v_start, v_end = pd.Timestamp(self.valid[0]), pd.Timestamp(self.valid[1])
         t_start = pd.Timestamp(self.train[0])
         span = v_end - v_start
         day = pd.Timedelta(days=1)
 
+        # Purge + embargo: the training window stops short of the validation
+        # window by the label horizon plus the embargo, so no training label is
+        # realised inside the window it is validated on.
+        gap = pd.Timedelta(days=int(self.embargo_days) + int(horizon))
+
         folds: list[tuple[DateRange, DateRange]] = []
         for k in range(n):
             shift = (span + day) * k
             fv_start, fv_end = v_start - shift, v_end - shift
-            ft_end = fv_start - day
+            ft_end = fv_start - gap
             if ft_end <= t_start:
                 # Not enough history left to train this fold; stop rather than
                 # emit a degenerate window.
@@ -184,6 +220,24 @@ class Portfolio:
     topk: int = 50
     n_drop: int = 5
     signed: bool = False
+    # Strip known risk exposures from the COMPOSITE PREDICTION before the book
+    # is built (Barra-style exposure-neutral construction).
+    #
+    # Standard practice for a benchmark-relative long-only book is to maximise
+    # target-factor exposure against TRACKING ERROR while constraining exposure
+    # to non-target factors. Constraining the optimizer directly needs the
+    # benchmark's weight vector; neutralising the alpha it optimises achieves
+    # the same exposure result and needs only the factor itself.
+    #
+    # This matters here because the measured defect is an uncontrolled size bet
+    # worth ~10pp/yr: equal-weight versus cap-weighted CSI300 reproduces the
+    # search's per-fold sign pattern with zero alpha involved. Factors are now
+    # SELECTED on neutralized significance, so a book built from the raw
+    # composite still trades the exposure that selection just rejected.
+    #
+    # Off by default: it changes what the book holds, and that is a deliberate
+    # decision rather than a silent upgrade.
+    neutralize_prediction: bool = False
     gross_leverage: float = 1.0
     cost_aware_dropout: bool = False
     # --- mean-variance member (construction: "mean_variance") ---
@@ -249,7 +303,7 @@ class Portfolio:
     #
     # "train" was the original choice and it is the window the combiner was
     # FITTED on, so beta measures the model's in-sample edge. The measured
-    # IS->OOS RankIC gap is +0.28 for both arms against +0.03 for the un-mined
+    # IS->OOS RankIC gap is +0.28 for the objective against +0.03 for the un-mined
     # baseline, which means the optimiser is told to expect roughly the edge the
     # model shows on data it has already seen. It then trades for that edge and
     # pays real costs for it. "valid" calibrates on a window the model did not
@@ -275,9 +329,9 @@ class Portfolio:
 class Constraints:
     """Hard A-share feasibility limits (see ``eval/tradability.py``).
 
-    These are market mechanics, not costs, and they apply to both arms: a
-    comparison in which one objective is allowed to trade the untradeable is
-    not a comparison. Defaults are the main-board rules; ``enabled: false``
+    These are market mechanics, not costs, and they apply to the objective: a
+    run that is allowed to trade the untradeable is not a meaningful
+    evaluation. Defaults are the main-board rules; ``enabled: false``
     restores the unconstrained behaviour for backwards comparison.
     """
 
@@ -439,6 +493,110 @@ class Admission:
     # absolute quality gates that were removed for starving the repository.
     min_coverage: float = 0.30
 
+    # --- research-gate thresholds (admission.mode == "standalone") ---------
+    # Fraction of days on which the IC must carry its own sign. A factor whose
+    # edge comes from a handful of outlier days clears a |t| bar while being
+    # untradeable; this is the cheapest check that catches it.
+    # Forecast horizons the gate scores a factor against, in days.
+    #
+    # Was an env var (QA_LABEL_HORIZONS) defaulting to [1], set nowhere -- so
+    # every factor was scored ONLY at one day. A signal that predicts 5- or
+    # 20-day returns was measured on its weakest horizon and rejected, and the
+    # search could not discover slow effects because it never looked for them.
+    # Promoted to Theta because it decides what gets ADMITTED.
+    #
+    # The overlapping-returns correction (n_eff = n/h) is what makes the
+    # comparison across horizons fair: a horizon-h label sampled daily shares
+    # h-1 of its h days, inflating a naive t by roughly sqrt(h), so without the
+    # correction long horizons win mechanically.
+    label_horizons: tuple[int, ...] = (1, 5, 20)
+
+    # Implementability floor. A signal whose ranking churns every day pays the
+    # spread repeatedly for the same edge, and one that needs more than a few
+    # percent of a name's daily volume cannot be held at size. Both are
+    # properties of the FACTOR, checkable before any book is built.
+    #
+    # 0 disables. max_solo_turnover is one-way daily fraction of the book;
+    # min_capacity_cny is the NAV the factor could carry at
+    # `capacity_participation` of median ADV.
+    # Cross-sectional clip, in median absolute deviations, applied before the
+    # neutralization fit. The canonical pipeline is winsorize -> standardize ->
+    # neutralize; this was the missing first step. 0 disables.
+    winsor_mad: float = 5.0
+
+    # Benjamini-Hochberg false-discovery rate across the candidates scored in a
+    # batch. |t| >= 3 is a per-factor bar, but the SEARCH is a multiple-testing
+    # machine -- 150 factors mined means 150 chances for noise to clear any
+    # fixed threshold. Harvey-Liu-Zhu recommend FDR precisely for factor zoos.
+    # 0 disables.
+    fdr_q: float = 0.10
+
+    # Require a stated economic mechanism on an admitted factor. A factor with
+    # no plausible mechanism is a likely false discovery regardless of t-stat;
+    # the model already writes one to propose the factor, so this only enforces
+    # that it survives to the library rather than adding work.
+    require_mechanism: bool = True
+    # Does the pre-registered IC sign have to match the realized one?
+    #
+    # The hypothesis format already demands "EXACTLY ONE of positive or
+    # negative" and tells the model the commitment WILL be checked. Checking it
+    # is the only objective plausibility test available: it needs no market
+    # prior and no LLM judgment, and a story contradicted by the measurement is
+    # a story that does not explain the factor.
+    #
+    # The obvious objection -- "a coin flip halves the admission rate" -- is the
+    # gate working rather than a cost. A real economic mechanism predicts a
+    # direction; only a factor with no mechanism gets the sign right half the
+    # time, and that is exactly the false discovery this is meant to catch.
+    require_sign_match: bool = True
+
+    max_solo_turnover: float = 0.50
+    min_capacity_cny: float = 0.0
+    capacity_participation: float = 0.05
+
+    min_ic_pos_frac: float = 0.50
+    # Decile monotonicity floor. A signal whose Q1 and Q10 differ sharply but
+    # whose middle is noise shows a wide spread and a monotonicity near zero,
+    # and it dies under any position cap -- the book holds ~34 of 300 names and
+    # cannot express a bet that exists only in the far tail. 0.0 disables.
+    min_monotonicity: float = 0.30
+    # How often the full net-of-cost BOOK is priced, in batches.
+    #
+    # 1 keeps the current behaviour (every batch). Under `mode: standalone` the
+    # book is no longer the gate -- a factor is admitted on its own neutralized
+    # significance -- so pricing a full three-fold book for every candidate buys
+    # reporting detail at the cost of the most expensive thing in the loop (the
+    # capped-simplex projection dominates the book build, and eval cost is
+    # linear in |zoo|). Raising this runs the book as a periodic trader-side
+    # check over the library instead of a per-candidate gate.
+    book_eval_every: int = 1
+
+    # Cap on the library. Measured: at |zoo|=150 a new factor holds 0.69% of the
+    # ICIR composite, so it cannot move a top-34 selection -- the dilution is the
+    # search reporting that the library is too large and too correlated, not a
+    # bug in the combiner. Published LLM-mining work caps at 40 with a 0.60
+    # correlation ceiling.
+    max_library: int = 40
+
+    # Whether the statistical bar BLOCKS, or merely observes.
+    #
+    # False is the learning configuration. The contribution, its standard error
+    # and the verdict are all still computed and recorded -- the diagnosis needs
+    # them, and they are the only signal the search has about what worked -- but
+    # a batch that fails the bar still enters the pool.
+    #
+    # The bar was blocking 141 of 150 factors, from only 2 of 7 rounds, and the
+    # 9 that survived were 3 ideas in 3 near-clones each. A gate that rejects
+    # 94% of what the generator produces is not selecting, it is starving; and
+    # because the verdict also routes the refinement, every rejection spent the
+    # next round's budget on a directive derived from a bar the audit showed is
+    # ~15x looser than it claims and measures the wrong variance anyway.
+    #
+    # Pathologies (constant, too sparse, duplicate) still block whatever this is
+    # set to. Those are validity checks -- a constant signal cannot be traded --
+    # not quality bars.
+    blocking: bool = True
+
 
 @dataclass(frozen=True)
 class Protocol:
@@ -460,6 +618,41 @@ class Protocol:
     utility: Utility
     admission: Admission = field(default_factory=Admission)
     walk_forward: WalkForward = field(default_factory=WalkForward)
+    # Return basis of the benchmark series.
+    #
+    #   "price"           SH000300 close-to-close -- what the raw index gives.
+    #   "estimated_total" price return PLUS an estimated dividend return, so the
+    #                     benchmark is measured the way the book is.
+    #
+    # The book prices with ADJUSTED closes, i.e. dividends reinvested. Scoring
+    # it against a price-return index credits the strategy with the market's
+    # entire dividend yield. Measured on CSI300 members: +5.26 / +4.46 / +3.03
+    # pp for 2019 / 2020 / 2021, mean +4.25 pp per year -- larger than the alpha
+    # the search is looking for. Defaulted to "price" ONLY so existing runs stay
+    # reproducible; set "estimated_total" for an honest excess return.
+    benchmark_basis: str = "price"
+    # How the benchmark PORTFOLIO is built.
+    #
+    #   "index"  the published cap-weighted index (SH000300)
+    #   "equal"  an equal-weight portfolio of the same point-in-time members
+    #
+    # "equal" is the MATCHED comparison for this book and is the primary number.
+    # A benchmark exists to separate skill from the passive exposure actually
+    # taken, and `max_weight: 0.03` forces a near-equal-weight book: a name at 6%
+    # index weight can be held at most 3%, a permanent -3% active position. Scored
+    # against a cap-weighted index that book is measured on a size bet nobody
+    # chose, worth -9.8pp (2019), -13.1pp (2020), +6.0pp (2021).
+    #
+    # Removing that bet from the CONSTRUCTION needs free-float weights, and those
+    # are not obtainable: Tushare gates index_weight behind a points tier, CSI and
+    # akshare publish only the current month, baostock has none. A circulating-cap
+    # reconstruction was tried and fails by +13-15%/yr because circulating market
+    # cap overweights state holdings (measured tracking error 3.58%/yr).
+    #
+    # So the bet is removed from the COMPARISON instead, which is exact and needs
+    # no data. Report "index" alongside as the conventional number, with the
+    # alpha-vs-beta size decomposition.
+    benchmark_construction: str = "index"
 
     def __post_init__(self) -> None:
         # Copy mutable containers so a caller holding a reference to the parsed
@@ -592,6 +785,10 @@ def load_protocol(path: str | os.PathLike[str] | None = None) -> Protocol:
         protocol_id=str(raw["protocol_id"]),
         market=str(raw["market"]),
         benchmark=str(raw["benchmark"]),
+        # Read explicitly: the loader constructs Protocol field-by-field, so a
+        # new top-level YAML key is silently ignored until it is named here.
+        benchmark_basis=str(raw.get("benchmark_basis", "price")),
+        benchmark_construction=str(raw.get("benchmark_construction", "index")),
         periods_per_year=int(raw["periods_per_year"]),
         splits=splits,
         execution=_build(Execution, dict(raw["execution"])),

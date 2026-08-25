@@ -8,20 +8,34 @@
 
 mutation:
   system: |
-    You are a quantitative finance strategy expert specializing in generating diversified factor mining strategies.
+    You are a quantitative researcher proposing the next hypothesis to test after
+    an earlier one has been measured.
 
-    Your task is to generate a new, orthogonal strategy direction based on an existing parent strategy.
+    You are given a parent hypothesis together with what it actually did: its
+    realized metrics, and the evaluation's verdict on it. Read that evidence
+    first. What you propose next is your judgement.
 
-    "Orthogonal" means the new strategy should:
-    1. Explore a completely different market hypothesis from the parent
-    2. Use different data dimensions or feature types
-    3. Be based on different investment logic or market perspectives
-    4. Avoid generating factors highly correlated with the parent strategy
+    Two facts about how this search is scored, so you know what the proposal is
+    up against:
 
-    You need to ensure the generated strategy has sufficient differentiation to expand the diversity of the exploration space.
+    * A hypothesis is kept or discarded on its MARGINAL contribution to an
+      existing book of factors, measured net of trading cost, over five
+      bootstrap samples. A premise that is true but already expressed by the
+      book contributes nothing measurable.
+    * Redundancy against the book is measured separately and enforced at
+      admission. You do not need to optimise for being different; that is
+      already checked. Difference from the parent is not itself worth anything
+      -- an unrelated hypothesis with no edge scores the same as a duplicate.
+
+    So the question to answer is not "what is unlike the parent" but "given what
+    the parent's measurement showed, what is worth testing next". Those coincide
+    when the parent's premise was measured to be wrong or exhausted; they do not
+    coincide when the parent found something real and the next question is what
+    else follows from it.
 
   user: |
-    Based on the following parent strategy, generate an orthogonal new strategy direction.
+    Below is a parent hypothesis and what it measured. Propose the hypothesis
+    worth testing next.
 
     ## Parent Strategy Information
 
@@ -41,25 +55,34 @@ mutation:
 
     ## Requirements
 
-    Please generate a new strategy direction that is **orthogonal** to the parent strategy, including:
+    Start from the parent's measurement, then state the hypothesis worth testing
+    next and why that evidence points there.
 
-    1. **New Hypothesis**: Propose a market hypothesis completely different from the parent
-    2. **Exploration Direction**: Describe the data dimensions and feature types the new strategy will explore
-    3. **Orthogonality Reasoning**: Explain why this new strategy is orthogonal to the parent
-    4. **Expected Characteristics**: Expected characteristics of factors from the new strategy
+    1. **Reading of the parent**: what its metrics and verdict establish. Was the
+       premise wrong, was it right but already captured by the book, or was it
+       right and incompletely expressed? Say which, and on what number.
+    2. **New Hypothesis**: the economic mechanism you now propose to test, stated
+       so that it could be shown false.
+    3. **Why this follows**: how the parent's measurement led you here. If it led
+       you to abandon the parent's premise, say what ruled it out. If it led you
+       to a neighbouring question, say what the parent established that makes the
+       neighbour worth asking.
+    4. **Expected Characteristics**: what the resulting factors should look like
+       if the mechanism is real, including the sign you expect and over what
+       horizon.
 
-    Please ensure:
-    - The new strategy has minimal correlation with the parent
-    - Explore market patterns not covered by the parent
-    - Maintain feasibility and reasonableness
+    Whether the result resembles the parent or not is an outcome of that
+    reasoning, not a target to hit.
 
     Output in JSON format:
     ```json
     {{
-        "new_hypothesis": "Description of the new market hypothesis",
-        "exploration_direction": "Exploration direction description",
-        "orthogonality_reason": "Reasoning for orthogonality with parent",
-        "expected_characteristics": "Expected factor characteristics"
+        "parent_reading": "What the parent's measurement establishes, citing the metric",
+        "expected_ic_sign": "EXACTLY ONE of \"positive\" or \"negative\". The sign of the cross-sectional IC you predict between this factor and forward returns. This is a COMMITMENT that will be checked against the realized RankIC. A premise that predicts no direction cannot be contradicted by any measurement, and an unfalsifiable claim is not evidence.",
+        "new_hypothesis": "The economic mechanism to test next, stated falsifiably",
+        "exploration_direction": "Data dimensions and feature types this implies",
+        "evidence_link": "How the parent's measurement led to this hypothesis",
+        "expected_characteristics": "Expected factor behaviour, including sign and horizon"
     }}
     ```
 
@@ -77,31 +100,123 @@ mutation:
 
     ## Mutation Round Guidance
 
-    This is a mutation exploration round that requires generating an orthogonal new strategy based on the parent strategy.
+    An earlier hypothesis has been measured. This round proposes what to test next.
 
     ### Parent Strategy Summary
     {parent_summary}
 
-    ### Mutation Direction Suggestions
-    - **New Hypothesis Direction**: {new_hypothesis}
+    ### What the parent's measurement establishes
+    {parent_reading}
+
+    ### Proposed next hypothesis
+    - **Hypothesis**: {new_hypothesis}
     - **Exploration Dimension**: {exploration_direction}
-    - **Orthogonality Reasoning**: {orthogonality_reason}
+    - **How the parent's evidence led here**: {evidence_link}
 
-    ### Important Notes
-    1. Your new hypothesis must be orthogonal to the parent strategy to avoid repeated exploration
-    2. Prioritize exploring data dimensions and market patterns not covered by the parent
-    3. Generated factors should have low correlation with parent factors
+    ### What this round is scored on
+    1. The marginal contribution of the resulting factors to the existing book,
+       net of trading cost. A premise the book already expresses contributes
+       nothing measurable, however sound it is.
+    2. Redundancy against the book is measured separately and enforced at
+       admission, so being different from the parent is not itself worth
+       anything. An unrelated hypothesis with no edge scores the same as a
+       duplicate.
 
-    Please propose your new hypothesis based on the above mutation guidance.
+    Resemblance to the parent is an outcome of your reasoning, not a target.
+    Propose the hypothesis the evidence points to.
 
   # Fallback hypotheses when LLM fails
-  fallback_templates:
-    - "Explore mean reversion characteristics opposite to price momentum"
-    - "Study nonlinear relationships between volume and price"
-    - "Analyze trend transition signals across cycles"
-    - "Mine liquidity features in market microstructure"
-    - "Build factors based on volatility regime switching"
-    - "Explore the relationship between sector rotation and individual stock alpha"
+  # fallback_templates REMOVED 2026-08-15.
+  #
+  # Six canned strategy ideas ("mean reversion opposite to price momentum",
+  # "volatility regime switching", "sector rotation vs individual stock alpha",
+  # ...) that were injected whenever an LLM call failed. They are author priors,
+  # not measured findings, and once injected they are indistinguishable from a
+  # hypothesis the system reasoned to -- so any factor descended from one would
+  # credit the search with an answer it was handed. A failed call now skips the
+  # slot instead (mutation.py: generate_mutation returns {}).
+
+
+# ============================================================
+# REFINEMENT OPERATOR PROMPTS (diagnose-and-refine mutation, Eq. 6)
+# Improve a parent that already mined an edge, rather than restart orthogonally.
+# The directive is produced deterministically by evolution/diagnosis.py; these
+# templates only render it into the prompt (the artifact side-channel).
+# ============================================================
+
+refine:
+  # Suffix appended to the hypothesis generator's direction. Carries the
+  # verdict + directive + parent summary so the LLM sees WHY the parent fell
+  # short (AlphaEvolve's "rendered evaluation results" side-channel). The
+  # structured refine_directive (threaded separately) drives freeze-vs-refine;
+  # this text is the guidance the LLM reads.
+  suffix_template: |
+    ---
+
+    ## Refinement Round Guidance
+
+    This is a REFINEMENT round, not an orthogonal restart. You are improving a
+    PARENT factor that already mined a real edge -- build on its construction,
+    do not discard it for an unrelated idea.
+
+    ### Parent Strategy (the prefix to build on)
+    {parent_summary}
+
+    ### Diagnosis -- why the parent fell short, and what to change
+    {directive_text}
+
+    ### What to keep / what to change
+    {keep_change_note}
+
+    Refine the parent per the diagnosis above. Preserve what worked; change
+    only what the diagnosis names as the weakness.
+
+  # Block injected into the factor-construction prompt when the hypothesis is
+  # FROZEN and only the expressions are refined (the cost-stall case: the
+  # premise is sound, the construction is too expensive).
+  frozen_prefix_factors: |
+    ### Factors to REFINE -- the parent's construction (do NOT discard it)
+    {parent_factors}
+
+    ### Refinement directive
+    {directive_text}
+
+    The hypothesis is FROZEN. Produce REFINED factor expressions that address
+    the directive while preserving the parent's signal. Reuse the parent's
+    construction as the starting point and modify only what the directive names
+    as the weakness. Do not propose an unrelated factor.
+
+  # Block injected into the hypothesis-revision prompt when the signal itself
+  # is the fault (refine_target=hypothesis). The parent hypothesis is the
+  # thing to revise, not to keep.
+  revise_hypothesis_block: |
+    ### Parent hypothesis to revise (the premise did not produce a real edge)
+    {parent_hypothesis}
+
+    ### Diagnosis -- why the premise failed
+    {directive_text}
+
+    Revise the HYPOTHESIS per the diagnosis (strengthen the signal / change the
+    premise), then the factor expressions will be re-derived from the revised
+    hypothesis. Keep what was directionally right; change what produced no edge.
+
+    The parent's realized RankIC is in its metrics above, and the parent
+    hypothesis stated the direction it PREDICTED. Compare the two: whether the
+    realized sign matched the prediction, and by what magnitude, is evidence
+    about which part of the premise survived measurement. What that evidence
+    implies for the revision is your judgement to make.
+
+    This is a REVISION contract, not a free proposal. Your output MUST be a
+    revised version of the parent hypothesis above -- it shares the parent's
+    market view and construction, with the diagnosed weakness removed or
+    strengthened. If your proposed hypothesis shares no construction or premise
+    with the parent, you have RESTARTED, not refined; re-derive from the parent
+    instead. State briefly in concise_justification what you kept and what you
+    changed relative to the parent.
+
+  keep_change:
+    expression: "KEEP the hypothesis (the premise is sound). REFINE the factor expressions to address the diagnosed weakness."
+    hypothesis: "REVISE the hypothesis (the premise itself is the weakness). The factor expressions will be re-derived from the revised premise."
 
 
 # ============================================================
@@ -110,60 +225,11 @@ mutation:
 # ============================================================
 
 crossover:
-  system: |
-    You are a quantitative finance strategy fusion expert, specializing in combining the advantages of multiple strategies into a stronger hybrid strategy.
-
-    Your task is to analyze multiple parent strategies, identify their respective strengths and weaknesses, and generate a hybrid strategy that takes the best from each.
-
-    When fusing strategies, consider:
-    1. The core hypotheses and market views of each parent strategy
-    2. Factor types and features that performed well
-    3. Complementarity and potential synergies between strategies
-    4. Avoid inheriting common weaknesses from parent strategies
-
-    You need to generate a hybrid strategy that is both innovative and feasible.
-
-  user: |
-    Based on the following multiple parent strategies, generate a fused hybrid strategy.
-
-    ## Parent Strategy Information
-
-    {parent_summaries}
-
-    ---
-
-    ## Requirements
-
-    Please analyze the above parent strategies and generate a hybrid strategy that combines their strengths:
-
-    1. **Hybrid Hypothesis**: A new market hypothesis that fuses the advantages of all parents
-    2. **Fusion Logic**: Explain how to combine the strengths of each parent
-    3. **Innovation Points**: New characteristics brought by the hybrid strategy
-    4. **Expected Benefits**: Why the hybrid strategy may outperform individual parents
-
-    Please ensure:
-    - The hybrid strategy inherits the advantages of all parents
-    - Avoid common weaknesses of all parents
-    - Potential for synergistic effects
-
-    Output in JSON format:
-    ```json
-    {{
-        "hybrid_hypothesis": "Description of the fused market hypothesis",
-        "fusion_logic": "Fusion logic explanation",
-        "innovation_points": "Innovation points description",
-        "expected_benefits": "Expected benefits explanation"
-    }}
-    ```
-
-  simple_user: |
-    Please combine the advantages of the following strategies to generate a hybrid hypothesis:
-
-    {parent_summaries}
-
-    Output the fused new hypothesis text directly.
-
-  # Template for formatting parent trajectory summary
+  # Template for formatting a parent trajectory summary (used by the suffix
+  # below via _format_parent_summary). The crossover round has no separate
+  # "draft a fusion" LLM step -- the hypothesis generator authors the child
+  # fresh from the suffix, so only parent_template / phase_names / suffix_template
+  # are live here.
   parent_template: |
     ### Parent {idx}: {phase_name}
     **Direction ID**: {direction_id}
@@ -176,35 +242,73 @@ crossover:
     {feedback}
     ---
 
-  # Prompt suffix template for hypothesis generator
+  # Phase name translations (used by _format_parent_summary).
+  phase_names:
+    original: "Original Round"
+    mutation: "Mutation Round"
+    crossover: "Crossover Round"
+
+  # Prompt suffix appended to the hypothesis generator on a crossover round.
+  # Eq. 7: recombine the VALIDATED IDEAS of the two best parents into a NEW
+  # hypothesis -- not a literal splice of the two expressions, not a plain
+  # average. The two parents' strength diagnoses (what each parent's
+  # measurement validated, including the lineage-validated segments) are
+  # rendered below as inspiration, not as the child. The child is authored
+  # fresh by the hypothesis generator, which states which validated decision it
+  # inherits from which parent (credible lineage) and pre-registers an IC sign.
   suffix_template: |
     ---
 
     ## Crossover Round Guidance
 
-    This is a crossover fusion exploration round that requires generating a hybrid strategy by combining multiple parent strategies.
+    This is a crossover round. Two of the best-performing parents in the
+    repository have been selected, and the construction decisions each one's
+    measurements VALIDATED have been located. Author a NEW factor whose
+    hypothesis combines those validated ideas -- not a literal splice of the
+    two expressions, and not a plain average of them.
 
     ### Parent Strategy Summaries
     {parent_summaries}
 
-    ### Fusion Direction Suggestions
-    - **Hybrid Hypothesis Direction**: {hybrid_hypothesis}
-    - **Fusion Logic**: {fusion_logic}
-    - **Innovation Points**: {innovation_points}
+    ### What each parent's measurement validated
+    {strength_block}
 
-    ### Important Notes
-    1. Your new hypothesis should fuse the advantages of all parent strategies
-    2. Avoid inheriting common weaknesses of the parents
-    3. Look for synergistic effects between parent strategies
-    4. Generated factors should capture the comprehensive characteristics of the combined strategies
+    ### What the measurements say about recombination
 
-    Please propose your fusion hypothesis based on the above crossover guidance.
+    The repository records what happened to previous children, and two facts are
+    worth knowing before you choose a form:
 
-  # Phase name translations
-  phase_names:
-    original: "Original Round"
-    mutation: "Mutation Round"
-    crossover: "Crossover Round"
+    * Children that were a bare product / interaction of two parents
+      (`A * B`, `A_x_B`, "conditioned on") have essentially never outperformed
+      the better of their two parents on either IC or ICIR in this system.
+    * Parents whose realized RankIC have OPPOSITE signs have produced children
+      whose edge was weaker than either parent -- the two contributions worked
+      against each other.
+
+    Those are observations about outcomes, not instructions. Each parent's
+    realized RankIC and turnover are shown above; the combination form is your
+    decision, justified from the parents' measured behaviour rather than from
+    convention.
+
+    ### What the child has to earn
+
+    1. It must be DIFFERENT from a plain average of its parents. The downstream
+       combiner already computes a weighted linear blend of every admitted
+       factor automatically -- a child that is only "parent A plus parent B"
+       adds nothing the repository does not already have. State what the child
+       captures that neither parent captures alone.
+    2. It must not inherit a weakness that ALL its parents share. If every
+       parent is weak on the same measured dimension, averaging them leaves that
+       weakness intact.
+    3. It must state, explicitly, which validated decision it inherits from
+       which parent -- the lineage the parents' measurements earned. A child
+       that carries no identified decision from a parent is not a recombination
+       of that parent.
+    4. It must be justified by the parents' MEASURED behaviour shown above --
+       their RankIC (including sign), turnover, and repository overlap -- not by
+       a generic recombination recipe.
+
+    Author a new hypothesis that combines the validated ideas above.
 
 
 # ============================================================

@@ -117,7 +117,7 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         a result and retries.
 
         Extracted so both the control runner and NetCostFactorRunner share it.
-        Without it the treatment arm raises FactorEmptyError the moment a single
+        Without it the runner raises FactorEmptyError the moment a single
         factor is missing its output, skips the loop, and never reaches
         `E_theta.evaluate()` at all -- producing a full run with no metrics.
         """

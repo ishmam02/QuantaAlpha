@@ -187,8 +187,115 @@ def load_panel(theta: Protocol, start: str, end: str) -> PanelBundle:
     return PanelBundle(universe=universe, **masked)
 
 
+def estimated_dividend_return(start: str, end: str,
+                              max_daily: float = 0.25) -> pd.Series:
+    """Daily dividend return of the universe.
+
+    The income component is the gap between a TOTAL-return series and a
+    PRICE-return series: qlib's ``$close`` is already adjusted, and dividing by
+    ``$factor`` recovers the raw quoted price, so::
+
+        dividend_return = mean(adjusted.pct_change()) - mean(raw.pct_change())
+
+    Take the cross-sectional MEAN, not the median. An earlier version used the
+    median to stop a handful of ex-dates dominating a day -- but that is exactly
+    backwards: dividends are paid on scattered ex-dates by a MINORITY of names,
+    so the median is zero on almost every day and the whole correction silently
+    evaluated to +0.00%. An index's dividend return IS the weighted average
+    across its constituents, so the mean is the estimator that matches it.
+
+    ``max_daily`` rejects only implausible single-day income (bad prints,
+    unhandled splits). It must NOT be a quantile trim: dividends come from a
+    minority of names on any day, so trimming the tail deletes the ex-dividend
+    names themselves.
+    """
+    _init_qlib()
+    from qlib.data import D
+
+    raw = D.features(D.instruments("csi300"), ["$close", "$factor"],
+                     start_time=start, end_time=end)
+    if raw.empty:
+        return pd.Series(dtype=float)
+    adj = raw["$close"].unstack(level="instrument").sort_index()
+    fac = raw["$factor"].unstack(level="instrument").sort_index()
+    adj.index = pd.to_datetime(adj.index)
+    fac.index = pd.to_datetime(fac.index)
+    px = adj / fac                       # raw quoted price -> price return
+
+    diff = adj.pct_change() - px.pct_change()
+    # Guard against DATA ERRORS only, never against the signal. Quantile
+    # trimming was tried and removed: dividends are paid by a minority of names
+    # on any given day, so trimming the top of the cross-section deletes exactly
+    # the ex-dividend names and the estimate collapses (+0.21%/yr against a
+    # measured +4.25%/yr). A single-day income component above `max_daily` is a
+    # bad print or an unhandled split, not a payout.
+    diff = diff.where(diff.abs() <= max_daily)
+    div = diff.mean(axis=1).fillna(0.0).clip(lower=0.0)
+    div.name = "dividend"
+    return div
+
+
+def equal_weight_benchmark(theta: Protocol, start: str, end: str) -> pd.Series:
+    """Equal-weight portfolio of the POINT-IN-TIME index members.
+
+    The matched comparison for a book whose position cap forces near-equal
+    weights. Membership is resolved per date from qlib's spells, so a name
+    contributes only while it was actually in the index -- survivorship-free,
+    the same basis the book trades on.
+
+    Returns are computed on the same price basis as the book (adjusted closes),
+    so ``benchmark_basis`` does not apply here: both sides already include
+    dividends and there is nothing to correct.
+    """
+    _init_qlib()
+    from qlib.data import D
+
+    market = getattr(theta, "market", None) or "csi300"
+    raw = D.features(D.instruments(market), ["$close"], start_time=start, end_time=end)
+    if raw.empty:
+        raise ValueError(f"no member data for {market} over {start}..{end}")
+    close = raw["$close"].unstack(level="instrument").sort_index()
+    close.index = pd.to_datetime(close.index)
+
+    ret = close.pct_change()
+    ret = ret.where(_membership_mask(market, ret.index, ret.columns))
+    out = ret.mean(axis=1)          # equal weight across the members trading that day
+    out.name = "benchmark"
+    return out
+
+
+def _membership_mask(market: str, dates: pd.Index, instruments: pd.Index) -> pd.DataFrame:
+    """Point-in-time membership from qlib's spell file.
+
+    ``D.features`` returns the UNION of everything ever in the index -- measured
+    at a median 447 names for a 300-name index -- so weighting or averaging its
+    output without this mask silently uses a larger, different universe.
+    """
+    path = Path.home() / ".qlib/qlib_data/cn_data/instruments" / f"{market}.txt"
+    mask = pd.DataFrame(False, index=dates, columns=instruments)
+    if not path.exists():
+        return ~mask.astype(bool) | True        # no spell file -> keep everything
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        inst, lo, hi = parts[0], pd.Timestamp(parts[1]), pd.Timestamp(parts[2])
+        if inst in mask.columns:
+            mask.loc[(mask.index >= lo) & (mask.index <= hi), inst] = True
+    return mask
+
+
 def load_benchmark(theta: Protocol, start: str, end: str) -> pd.Series:
-    """Daily simple return of the protocol's benchmark (default SH000300)."""
+    """Daily simple return of the protocol's benchmark (default SH000300).
+
+    Honours ``theta.benchmark_basis``. The book prices with ADJUSTED closes --
+    dividends reinvested -- so a price-return benchmark hands the strategy the
+    market's whole dividend yield as if it were alpha (+4.25 pp/yr on CSI300
+    2019-2021). ``estimated_total`` puts both sides on the same basis.
+    """
+    if str(getattr(theta, "benchmark_construction", "index")).lower() == "equal":
+        return equal_weight_benchmark(theta, start, end)
+
     _init_qlib()
     from qlib.data import D
 
@@ -198,6 +305,12 @@ def load_benchmark(theta: Protocol, start: str, end: str) -> pd.Series:
     close = raw["$close"].droplevel("instrument")
     close.index = pd.to_datetime(close.index)
     ret = close.sort_index().pct_change()
+
+    basis = str(getattr(theta, "benchmark_basis", "price")).strip().lower()
+    if basis in ("estimated_total", "total"):
+        div = estimated_dividend_return(start, end)
+        if not div.empty:
+            ret = ret.add(div.reindex(ret.index).fillna(0.0), fill_value=0.0)
     ret.name = "benchmark"
     return ret
 
@@ -256,6 +369,61 @@ def load_factor_signal(
     )
 
 
+def aligned_cache_path(expression: str, panel: PanelBundle,
+                       cache_dir: str | os.PathLike[str] | None = None) -> Path:
+    """Path of a factor's signal ALREADY aligned to ``panel``'s grid.
+
+    Keyed by the expression AND the grid it was aligned to (first date, last
+    date, instrument count) -- an aligned frame is only reusable on the panel it
+    was cut for, so a protocol re-split must miss rather than silently return a
+    frame with the wrong dates.
+    """
+    root = Path(cache_dir or DEFAULT_FACTOR_CACHE_DIR) / "aligned"
+    dates = panel.dates
+    grid = (f"{pd.Timestamp(dates[0]).date()}_{pd.Timestamp(dates[-1]).date()}"
+            f"_{len(dates)}x{len(panel.instruments)}")
+    key = hashlib.md5(f"{expression}||{grid}".encode()).hexdigest()
+    return root / f"{key}.pkl"
+
+
+def load_aligned_signal(expression: str, panel: PanelBundle,
+                        cache_dir: str | os.PathLike[str] | None = None) -> pd.DataFrame:
+    """``align_signal(load_factor_signal(expr), panel)`` with the RESULT cached.
+
+    Why this exists. A cached signal is a ``(datetime, instrument)`` Series over
+    the whole 4138 x 5982 factor cache -- 14.2M rows. Putting it on the panel
+    grid costs a full ``unstack`` of that MultiIndex, measured at 3.43s, and
+    ``_align`` then discards 95% of the result to reach 2610 x 668. The
+    repository rehydrates EVERY incumbent on EVERY batch, so that 3.4s is paid
+    per factor per batch: measured 5.0s/factor across 59 live batches, making
+    backtest time ``100s + 5.0s * |zoo|`` -- the search gets slower the better
+    it does.
+
+    The aligned frame is ~14 MB and depends only on (expression, grid), both of
+    which are immutable for a run. Caching it turns the per-batch cost into a
+    ~0.05s read and makes batch time flat in ``|zoo|``.
+
+    Falls back to computing (and, on any write failure, to simply returning the
+    computed frame) so a cache problem can never block an evaluation.
+    """
+    path = aligned_cache_path(expression, panel, cache_dir)
+    if path.exists():
+        try:
+            return pd.read_pickle(path)
+        except Exception:      # corrupt/partial file -- recompute over it
+            logger.warning("aligned-signal cache unreadable, recomputing: %s", path.name)
+
+    frame = align_signal(load_factor_signal(expression, cache_dir), panel)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pkl.tmp")   # atomic: a reader never sees a partial file
+        frame.to_pickle(tmp)
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning("could not cache aligned signal (%s); continuing uncached", exc)
+    return frame
+
+
 def align_signal(signal: pd.Series | pd.DataFrame, panel: PanelBundle) -> pd.DataFrame:
     """Put a factor signal onto the panel grid as a wide ``(T × N)`` frame."""
     if isinstance(signal, pd.DataFrame):
@@ -276,6 +444,8 @@ __all__ = [
     "DEFAULT_FACTOR_CACHE_DIR",
     "PanelBundle",
     "align_signal",
+    "aligned_cache_path",
+    "load_aligned_signal",
     "factor_cache_path",
     "load_benchmark",
     "load_factor_signal",

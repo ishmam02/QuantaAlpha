@@ -9,8 +9,8 @@ Four charges, all in units of NAV per period::
 
 ``κ₀ = 0.0020`` is set to the existing Qlib round trip
 (``open_cost 0.0005 + close_cost 0.0015``) precisely so that this engine
-**nests** the published baseline's flat-fee exposure: the control arm is not a
-zero-cost control, it is a flat-fee one, and κ₀ reproduces it exactly.
+**nests** the published baseline's flat-fee exposure: the baseline is a
+flat-fee reference, and κ₀ reproduces it exactly.
 
 Every trailing statistic goes through :func:`_trailing`, which shifts before
 rolling. That is the single place a look-ahead bug could enter, so it is the
@@ -53,26 +53,42 @@ def trailing_vol(close: pd.DataFrame, window: int) -> pd.DataFrame:
 def dollar_volume(panel, theta: Protocol) -> pd.DataFrame:
     """Daily traded value in CNY, recovered from Qlib's scaled ``$amount``.
 
-    Qlib's cn_data does not store turnover in yuan. Empirically, for every
-    instrument and date::
+    Qlib's cn_data stores ``$amount`` in THOUSANDS of yuan, already consistent
+    with the *adjusted* ``$close`` and ``$volume`` it ships alongside::
 
-        $amount / $volume = $close / 10
+        true_CNY = $amount · 1000
 
-    with ``$volume`` in lots (100 shares) and ``$close`` the *adjusted* price,
-    so that ``$amount = true_CNY · $factor / 1000`` and therefore
+    **This previously divided by ``$factor`` as well, which double-counted the
+    price adjustment and overstated ADV by 1/factor** — about 3.5x at the median
+    factor (~0.29) and up to ~19x for heavily-adjusted names.
 
-        true_CNY = $amount · 1000 / $factor
+    The old docstring cited SH601398 (ICBC) on 2020-06-01 -- ``$amount``
+    540,140.9, ``$factor`` 0.5412 ⟹ ¥9.98e8 -- as matching ICBC's ~¥1bn daily
+    turnover. That reasoning is circular: it accepts the ``/factor`` form
+    because the result lands near a remembered figure. An independent check on
+    the same date, using **no** ``$amount`` at all, settles it::
 
-    Verified against SH601398 (ICBC) on 2020-06-01: ``$amount`` 540,140.9,
-    ``$factor`` 0.5412 ⟹ ¥9.98e8, matching ICBC's ~¥1bn daily turnover. Taking
-    ``$amount`` at face value instead understates ADV by three to four orders
-    of magnitude, which silently turns every trade into a market-moving one —
-    the impact term then dominates every other cost by ~50x.
+        raw price  = $close / $factor = 2.793 / 0.5412 = 5.16 CNY
+                     (ICBC genuinely traded ~5.0-5.3 CNY in June 2020)
+        raw shares = $volume · $factor · 100          ($volume is in lots)
+        notional   = 5.16 · raw shares = ¥5.42e8
+
+    ``$amount · 1000`` = ¥5.40e8 reproduces that to 0.4%; ``$amount · 1000 /
+    $factor`` = ¥9.98e8 is 1.85x too high. Cross-checked on 2021 large caps
+    against known turnover (Kweichow Moutai traded roughly ¥3-5bn/day):
+    SH600519 ¥72.9e8 plain vs ¥578e8 with ``/factor``; SH601318 ¥40.8e8 vs
+    ¥770e8; SH600036 ¥30.0e8 vs ¥57.9e8.
+
+    Consequence of the old form: ADV overstated ⇒ participation understated ⇒
+    market impact understated. ``kappa2`` is the only capacity-aware cost term,
+    so the backtest was optimistic about how much size the book could carry
+    (real capacity is ~3.5x smaller than it implied). Factor *selection* was
+    unaffected at ``nav`` = 1e8, where impact is ~0.001 bps either way.
 
     The scale lives in Θ (``costs.adv_scale``) so it is covered by the protocol
     hash rather than buried as a magic number.
     """
-    return panel.amount * float(theta.costs.adv_scale) / panel.factor
+    return panel.amount * float(theta.costs.adv_scale)
 
 
 def trailing_adv(panel, theta: Protocol) -> pd.DataFrame:
@@ -80,7 +96,8 @@ def trailing_adv(panel, theta: Protocol) -> pd.DataFrame:
     return _trailing(dollar_volume(panel, theta), int(theta.costs.adv_window)).mean()
 
 
-def impact(dw: pd.Series, adv_w: pd.Series, theta: Protocol) -> pd.Series:
+def impact(dw: pd.Series, adv_w: pd.Series, theta: Protocol,
+           sigma: pd.Series | None = None) -> pd.Series:
     """φ — market impact, charged per unit of NAV.
 
     ``adv_w`` is ADV expressed as a *portfolio weight* (dollar ADV / NAV), so
@@ -122,7 +139,25 @@ def impact(dw: pd.Series, adv_w: pd.Series, theta: Protocol) -> pd.Series:
             )
     liquidity = liquidity.clip(lower=_ADV_FLOOR)
 
-    return float(theta.costs.kappa2) * magnitude.pow(p_exp) / liquidity.pow(p_exp - 1.0)
+    charge = float(theta.costs.kappa2) * magnitude.pow(p_exp) / liquidity.pow(p_exp - 1.0)
+
+    # Volatility scaling. Without it the model prices a 1%-of-ADV trade the same
+    # in every name, which no standard impact model does. sigma is the trailing
+    # daily return volatility already computed for the slippage term, so this
+    # costs nothing extra to evaluate.
+    if bool(getattr(theta.costs, "impact_vol_scaled", False)):
+        if sigma is None:
+            raise ValueError(
+                "costs.impact_vol_scaled is on but no sigma was supplied; the "
+                "caller must pass the per-name volatility rather than let the "
+                "scaling silently drop out")
+        vol = sigma.reindex(charge.index)
+        # A missing volatility must not zero the charge -- that would make an
+        # unmeasured name look free to trade. Fall back to the cross-sectional
+        # median.
+        vol = vol.fillna(vol.median() if vol.notna().any() else 0.02)
+        charge = charge * vol
+    return charge
 
 
 def borrow_cost(w: pd.Series, theta: Protocol, offlist: pd.Series | None = None) -> float:
@@ -166,7 +201,7 @@ def cost(
     slippage = float(theta.costs.kappa1) * float((vol * dw.abs()).sum())
 
     adv_w = adv.reindex(dw.index) / float(theta.costs.nav)
-    market_impact = float(impact(dw, adv_w, theta).sum())
+    market_impact = float(impact(dw, adv_w, theta, sigma=vol).sum())
 
     return flat + slippage + market_impact + borrow_cost(aligned_w, theta, offlist)
 
@@ -191,7 +226,7 @@ def net_return(
     them unshifted differences two series one day out of step, which does not
     hedge the market -- it adds a second, independent copy of it.
 
-    Measured on Arm B's book over 2022-2025: ``corr(book, bench) = +0.025`` at
+    Measured on the book over 2022-2025: ``corr(book, bench) = +0.025`` at
     the old alignment against ``+0.688`` at ``shift(-1)``, and the excess
     volatility was *higher* than either input (0.2795 annualised, against 0.2185
     for the book and 0.1798 for the benchmark) -- the signature of subtracting

@@ -293,7 +293,7 @@ class CustomFactorCalculator:
             result = self.calculate_factor(factor_name, factor_expr)
             
             if result is not None:
-                results[factor_name] = result
+                results[factor_name] = self._clamp_to_panel(result)
                 success_count += 1
             else:
                 fail_count += 1
@@ -345,7 +345,7 @@ class CustomFactorCalculator:
                     result = self._load_from_cache_location(cache_location)
                     if result is not None:
                         cache_location_hit_count += 1
-                        results[factor_name] = result
+                        results[factor_name] = self._clamp_to_panel(result)
                         success_count += 1
                         print(f"  [{i+1}/{total}] ✓ H5 cache: {factor_name}")
                         continue
@@ -354,7 +354,7 @@ class CustomFactorCalculator:
                 result = self._load_from_cache(factor_expr)
                 if result is not None:
                     cache_hit_count += 1
-                    results[factor_name] = result
+                    results[factor_name] = self._clamp_to_panel(result)
                     success_count += 1
                     print(f"  [{i+1}/{total}] ✓ MD5 cache: {factor_name}")
                     continue
@@ -428,7 +428,7 @@ class CustomFactorCalculator:
                     
                     if result is not None and len(result) > 0:
                         if not result.isna().all():
-                            results[factor_name] = result
+                            results[factor_name] = self._clamp_to_panel(result)
                             success_count += 1
                             compute_count += 1
                             print(f" ✓ ({elapsed:.1f}s)")
@@ -455,12 +455,17 @@ class CustomFactorCalculator:
         aligned_results = {}
         reference_index = None
         
-        for name, series in results.items():
+        # Pop rather than iterate: this loop used to hold `results` and
+        # `aligned_results` simultaneously, i.e. two full copies of every signal
+        # at peak. Popping frees each original as soon as it is aligned.
+        for name in list(results.keys()):
+            series = results.pop(name)
             if reference_index is None:
                 reference_index = series.index
             validated = self._validate_and_align_result(series, name, reference_index)
             if validated is not None:
                 aligned_results[name] = validated
+            del series
         
         if aligned_results:
             result_df = pd.DataFrame(aligned_results)
@@ -469,6 +474,47 @@ class CustomFactorCalculator:
         
         return pd.DataFrame()
     
+
+    def _clamp_to_panel(self, result):
+        """Shrink a cached signal to what this backtest can actually use.
+
+        Cached signals are stored over the FULL history and the FULL instrument
+        list (2008-2026 x 5,982 names, ~163 MB each as float64). The caller
+        accumulates every signal into ``results`` BEFORE aligning any of them, so
+        a large library holds all of them at full size simultaneously: measured
+        23.8 GB for the 150-factor library, which OOM-killed the run at factor
+        139/150 on a 16 GB machine three times.
+
+        Two reductions, both loss-free for this backtest:
+
+        * **Date clamp** to ``QA_BT_START``/``QA_BT_END`` when set. The backtest
+          config already restricts to 2016-2025, so earlier rows are dropped
+          downstream regardless. Off when the env vars are unset.
+        * **float32**. Signals are cross-sectionally rank-normalised before the
+          model sees them, so ~7 significant digits is far more precision than
+          the ranking can use.
+
+        NOTE: this deliberately does NOT reindex onto ``self.data_df.index``. An
+        earlier attempt did, and produced all-NaN: alignment in this class is
+        signal-to-signal (``reference_index`` is the FIRST signal's index), and
+        ``self.data_df`` may be absent or carry a different index order.
+        """
+        if result is None or not hasattr(result, "index"):
+            return result
+        try:
+            lo = os.environ.get("QA_BT_START")
+            hi = os.environ.get("QA_BT_END")
+            if lo and hi and isinstance(result.index, pd.MultiIndex):
+                dt = result.index.get_level_values(0)
+                keep = (dt >= pd.Timestamp(lo)) & (dt <= pd.Timestamp(hi))
+                if keep.any():
+                    result = result[keep]
+            if getattr(result, "dtype", None) == "float64":
+                result = result.astype("float32")
+        except Exception:
+            return result
+        return result
+
     def _validate_and_align_result(self, result: pd.Series, factor_name: str, 
                                     reference_index: Optional[pd.Index] = None) -> Optional[pd.Series]:
         """Validate and align cached result index."""
