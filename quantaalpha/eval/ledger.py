@@ -82,8 +82,20 @@ def replay_repository(path: str | os.PathLike[str] | None = None) -> dict[str, d
     to keep mining), so the two cannot disagree about what was admitted.
     """
     repo: dict[str, dict] = {}
+    # QA_RESTORE_CAP_EVICTED=1 skips library_cap evictions on replay: those
+    # factors were removed ONLY by the count cap (admission.max_library /
+    # QA_MAX_LIBRARY), not by any quality gate, so raising or removing the cap
+    # should let them back into the zoo. Read here -- not at each caller -- so
+    # the runner rehydrate, the evolution controller, and the _zoo.json writer
+    # all agree on the same zoo (the "cannot disagree" invariant this function
+    # exists to enforce). Default off (env unset) is byte-identical to the old
+    # behavior. Pair with QA_MAX_LIBRARY on restart.
+    _skip_cap = os.environ.get("QA_RESTORE_CAP_EVICTED") == "1"
     for record in Ledger(path).read():
-        for expr in record.get("evicted_exprs") or []:
+        _ev = record.get("evicted_exprs") or []
+        if _skip_cap and record.get("eviction_rule") == "library_cap":
+            _ev = []  # keep cap-evicted factors; the cap that removed them is overridden
+        for expr in _ev:
             repo.pop(expr, None)
         metrics = record.get("metrics") or {}
         # The per-factor tear sheet (t_nw, rank_ic_neutral, ic_breakeven_book,

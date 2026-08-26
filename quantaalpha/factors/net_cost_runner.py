@@ -1566,23 +1566,33 @@ class NetCostFactorRunner(QlibFactorRunner):
         return t * min(1.0, ic / bar) ** 0.5
 
     def _enforce_library_cap(self) -> list[str]:
-        """Hold the library at ``admission.max_library`` by dropping the weakest.
+        """Optionally hold the library at a size cap by dropping the weakest.
 
-        The cap is what makes mining MORE valuable rather than less. Uncapped,
-        the ICIR composite dilutes as 1/N -- at |zoo|=150 a new factor holds
-        0.69% of it and cannot move a top-34 book, so additional mining actively
-        degrades the result. Capped with replacement, a new factor can only get
-        in by displacing an incumbent, so every extra factor mined is a chance
-        to improve the library and never a chance to dilute it.
+        ``QA_MAX_LIBRARY`` overrides ``admission.max_library`` (read here at
+        call time); ``0`` disables eviction entirely via the ``cap <= 0``
+        early-return below. Default (env unset) = ``admission.max_library``
+        (40), byte-identical to the frozen protocol.
 
-        Sizing: the measured effective rank of a 150-factor library on this data
-        is **34.8** (entropy rank; 45 principal components reach 90% of the
-        variance structure). A cap near 40 therefore sits just above the
-        information content of the whole 150 -- it is calibrated to the data,
-        not borrowed from a paper.
+        The cap is OPTIONAL, not load-bearing. The admission gates
+        (|delta_t|, monotonicity, mechanism+sign, FDR, rho_max, rho_within,
+        marginal_er) are the quality filter; this cap is only a count guard,
+        and it evicts by |t_nw| -- a DIFFERENT criterion than admission
+        (delta_t), so it can remove factors the gate admitted for marginal
+        contribution. Under the live ICIR combiner's ``shrinkage=0.5`` net_ir
+        GROWS with zoo size with diminishing returns (measured +10.5% |IC| at
+        15 factors -> +6.1% at 37); it does not dilute as 1/N. The gates
+        self-limit (rho_max and marginal_er tighten as the zoo fills the
+        direction space), so an uncapped zoo plateaus where non-redundant
+        strong factors run out, not at infinity. The earlier "1/N dilution /
+        calibrated to a 34.8 effective-rank ceiling" rationale is refuted -- a
+        98-factor mined library measures er=27.5 and er grows with factor count
+        (no ~14/34.8 ceiling; see qa-ohlcv-ceiling-14-refuted). Pair an
+        uncap/raise with ``QA_RESTORE_CAP_EVICTED`` (ledger.replay_repository)
+        so factors removed only by the count cap re-enter the zoo on rehydrate.
         """
         adm = self.theta.admission
-        cap = int(getattr(adm, "max_library", 0) or 0)
+        _mlib = os.environ.get("QA_MAX_LIBRARY")
+        cap = int(_mlib) if _mlib not in (None, "") else int(getattr(adm, "max_library", 0) or 0)
         if cap <= 0 or len(self._repository) <= cap:
             return []
 
