@@ -347,6 +347,17 @@ class NetCostFactorRunner(QlibFactorRunner):
         self._contributions: dict[str, float] = {}
         # Cadence counter for contribution-based eviction.
         self._rounds_since_evict = 0
+        # Across-batch cache for the marginal-er gate's repo-repo |Spearman|
+        # block (the O(zoo**2) term). The block is a pure function of the held
+        # signals on the eval panel, so it is keyed by the repo COMPOSITION
+        # plus the (start, end) window the panel was built on. A reject batch
+        # leaves the zoo unchanged -> the key matches -> the block is reused
+        # instead of rebuilt (O(zoo**2) -> O(1) on ~60% of batches). An
+        # admit/replace/evict changes the composition -> key mismatch ->
+        # rebuild once, then cached. n_factors is 1 (one candidate per batch),
+        # which is what made the old per-call local cache a build-and-discard
+        # no-op and the instance cache the actual win. One entry only.
+        self._mer_cache = None
         # One EvaluationOperator per admission test seed, reused for the
         # whole run so the panel and baseline caches survive across batches.
         self._seed_ops: dict[int, EvaluationOperator] = {}
@@ -816,11 +827,10 @@ class NetCostFactorRunner(QlibFactorRunner):
 
         kept, notes, replaced = [], [], []
         self._last_tearsheets = {}
-        # Marginal-er gate cache: the repo-repo |Spearman| block is invariant
-        # across a batch's candidates -- the repository changes only on a
-        # replace, which clears the cache at the pop below -- so rebuild it
-        # once per batch, not per candidate. None = "not built yet this batch".
-        _mer_repo_cache = None
+        # Marginal-er gate cache is instance-level now (self._mer_cache, set up
+        # in __init__): the repo-repo |Spearman| block survives across batches,
+        # keyed by repo composition + eval window, so a reject batch reuses the
+        # prior block instead of rebuilding it every batch.
 
         for expr, signal in candidates.items():
             sig_raw = align_signal(signal, panel)
@@ -1146,7 +1156,11 @@ class NetCostFactorRunner(QlibFactorRunner):
                     # actually stand, otherwise two near-clones can both "beat"
                     # an incumbent that only one of them replaces.
                     self._repository.pop(near, None)
-                    _mer_repo_cache = None      # a row/column of R_repo left
+                    # a row/column left the repo -> the block is stale. The
+                    # key check at the next candidate would catch this too (the
+                    # composition changed); drop it now defensively so the
+                    # rebuild happens on the post-pop zoo, not the cached one.
+                    self._mer_cache = None
                     replaced.append((near, expr, cand_score, inc_score, rho))
                     logger.info("repository: REPLACE %s (|t| %.2f) with %s "
                                 "(|t| %.2f), rho %.3f",
@@ -1181,17 +1195,25 @@ class NetCostFactorRunner(QlibFactorRunner):
             if _min_mer and _held:
                 try:
                     # Reuse the cached repo-repo |Spearman| block; only the
-                    # kept batch-mates and this candidate are fresh. The
-                    # eigenvalues are identical to the uncached path
-                    # (permutation-invariant), so the verdict is unchanged --
-                    # only the redundant held-held rebuild is dropped, taking
-                    # the gate from O(zoo**2) to O(zoo) per candidate.
-                    if _mer_repo_cache is None:
+                    # kept batch-mates and this candidate are fresh. The block
+                    # is keyed by the repo COMPOSITION + the eval window the
+                    # panel was built on -- a pure function of those -- so a
+                    # matching key means the cached R_repo is valid. A reject
+                    # batch (zoo unchanged) hits and skips the O(zoo**2) build;
+                    # an admit/replace/evict changes the composition and misses.
+                    # Within a batch the repo changes only on a replace (the
+                    # pop below); across batches only on admit/replace/evict,
+                    # so the key is the exact invalidation signal. Eigenvalues
+                    # are permutation-invariant, so the cached path is
+                    # bit-identical to the uncached one (verdict unchanged).
+                    _mer_key = (tuple(sorted(self._repository)), start, end)
+                    if self._mer_cache is None or self._mer_cache[0] != _mer_key:
                         _repo_sigs = {
                             e: s for e, (s, _) in self._repository.items()}
-                        _mer_repo_cache = (
-                            spearman_abs_matrix(_repo_sigs), _repo_sigs)
-                    _R_repo, _repo_sigs = _mer_repo_cache
+                        self._mer_cache = (
+                            _mer_key, spearman_abs_matrix(_repo_sigs),
+                            _repo_sigs)
+                    _R_repo, _repo_sigs = self._mer_cache[1], self._mer_cache[2]
                     _kept_sigs = {e: s for e, s, _t, _r, _h in kept}
                     _er_held = effective_rank_cached(
                         _R_repo, _repo_sigs, _kept_sigs)

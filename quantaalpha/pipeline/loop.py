@@ -440,7 +440,16 @@ class AlphaAgentLoop(LoopBase, metaclass=LoopMeta):
             # except for factors that failed to produce a signal, but they are
             # different objects and the head-to-head consumes the zoo.
             zoo_path = library_path.with_name(library_path.stem + "_zoo.json")
-            n_zoo = manager.write_admitted_subset(zoo_path)
+            # The zoo is the ledger's active repository -- admissions minus
+            # evictions, replayed in order -- which is what the combiner/book
+            # actually run on. NOT the library's `admitted` flag: that is set on
+            # admission and never cleared on eviction, so selecting on it
+            # re-exports factors the cap/prune/replace paths removed and the
+            # deliverable overcounts the live zoo (see qa-zoo-json-contaminated).
+            # replay_repository is the same source the runner rehydrates from on
+            # resume, so the _zoo.json matches the live zoo exactly.
+            from quantaalpha.eval.ledger import replay_repository
+            n_zoo = manager.write_zoo_subset(zoo_path, replay_repository(self.runner.ledger.path))
             logger.info(
                 f"Saved factors to library: {library_path} (phase={evolution_phase}); "
                 f"zoo subset: {zoo_path} ({n_zoo} factor(s))"

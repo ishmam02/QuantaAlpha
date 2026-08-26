@@ -42,8 +42,10 @@ from quantaalpha.eval.execution import fill_prices, grinold_alpha, prediction_sc
 from quantaalpha.eval.metrics import (
     _cross_sectional_corr,
     cx,
+    effective_rank_cached,
     prediction_metrics,
     rho_max,
+    spearman_abs_matrix,
     strategy_metrics,
 )
 from quantaalpha.eval.portfolio import build_book
@@ -88,6 +90,16 @@ class EvaluationOperator:
         # Baseline books keyed by (zoo_hash, window) -- one fit per repository
         # state, not per candidate.
         self._baselines: dict[tuple, dict] = {}
+        # Cached zoo x zoo |Spearman| block for the effective_rank metric (the
+        # O(zoo**2) term). Single entry: (key, R_zoo) or None. Keyed by the
+        # ORDERED zoo tuple + eval_window + report -- the block is a pure
+        # function of the held signals on the panel, so a matching key reuses
+        # it (O(zoo**2) -> O(1)) and only the candidate-vs-zoo tail is rebuilt
+        # (O(zoo)); an admit/replace/evict changes the tuple -> miss -> rebuild.
+        # The ordered key (not the order-independent zoo_hash) guarantees the
+        # same axis order on a hit, so the cached block is bit-identical to a
+        # fresh build (no permutation float noise).
+        self._er_zoo_cache = None
         self._masks: dict[tuple, object] = {}
 
     # ------------------------------------------------------------------
@@ -225,17 +237,43 @@ class EvaluationOperator:
             _keys = list(_all)
             if len(_keys) >= 2:
                 _n = len(_keys)
-                _R = np.eye(_n)
-                for _i in range(_n):
-                    for _j in range(_i + 1, _n):
-                        _c = _cross_sectional_corr(_all[_keys[_i]], _all[_keys[_j]],
-                                                   "spearman")
-                        _v = abs(float(_c.mean())) if not _c.empty else 0.0
-                        _R[_i, _j] = _R[_j, _i] = _v
-                _ev = np.linalg.eigvalsh(_R)[::-1]
-                _ev = _ev[_ev > 1e-12]
-                _pp = _ev / _ev.sum()
-                _er = float(np.exp(-(_pp * np.log(_pp)).sum()))
+                # Effective rank of the book = zoo + new factors (unchanged
+                # semantics). The zoo x zoo |Spearman| block is invariant across
+                # reject batches (the runner holds the zoo fixed), so cache it
+                # keyed by the ordered zoo tuple + window + report: a hit reuses
+                # the block (O(zoo**2) -> O(1)) and only the candidate-vs-zoo tail
+                # is rebuilt (O(zoo)); an admit/replace/evict changes the tuple
+                # -> miss -> rebuild. Bit-identical to the inline double loop:
+                # spearman_abs_matrix uses the same _abs_spearman primitive, and
+                # effective_rank_cached slots the block in and computes only the
+                # tail; eigenvalues are permutation-invariant and the ordered
+                # key guarantees the same axis order on a hit. Guard: only when
+                # no candidate expression duplicates a zoo one -- the inline path
+                # dedupes via the dict merge ({**zoo, **cands} keeps one) while
+                # effective_rank_cached would carry both, so a collision falls
+                # back to the full inline build, which is always bit-identical.
+                if not (aligned_zoo.keys() & aligned_cands.keys()):
+                    _er_key = (tuple(aligned_zoo), eval_window, report)
+                    if (self._er_zoo_cache is None
+                            or self._er_zoo_cache[0] != _er_key):
+                        _R_zoo = spearman_abs_matrix(aligned_zoo)
+                        self._er_zoo_cache = (_er_key, _R_zoo)
+                    else:
+                        _R_zoo = self._er_zoo_cache[1]
+                    _er = effective_rank_cached(
+                        _R_zoo, aligned_zoo, aligned_cands)
+                else:
+                    _R = np.eye(_n)
+                    for _i in range(_n):
+                        for _j in range(_i + 1, _n):
+                            _c = _cross_sectional_corr(
+                                _all[_keys[_i]], _all[_keys[_j]], "spearman")
+                            _v = abs(float(_c.mean())) if not _c.empty else 0.0
+                            _R[_i, _j] = _R[_j, _i] = _v
+                    _ev = np.linalg.eigvalsh(_R)[::-1]
+                    _ev = _ev[_ev > 1e-12]
+                    _pp = _ev / _ev.sum()
+                    _er = float(np.exp(-(_pp * np.log(_pp)).sum()))
                 metrics["effective_rank"] = _er
                 metrics["rank_density"] = _er / _n
                 metrics["book_n_factors"] = _n

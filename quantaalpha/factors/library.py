@@ -184,6 +184,58 @@ class FactorLibraryManager:
         logger.info(f"Wrote {len(ids)} admitted factor(s) to {out}")
         return len(ids)
 
+    def write_zoo_subset(self, path, exprs) -> int:
+        """Write a library JSON containing only the factors currently in the zoo.
+
+        ``exprs`` is the active repository -- admissions minus evictions,
+        replayed in order -- which is what the combiner/book actually run on.
+        Same schema as ``write_admitted_subset``, so it drops straight into
+        ``run_backtest --factor-json``.
+
+        Why this exists separately from ``write_admitted_subset``: the
+        ``admitted`` flag is set on admission and never cleared when a factor is
+        later evicted by the cap, prune, or replace paths, so selecting on it
+        re-exports factors the gate explicitly removed -- the deliverable
+        overcounts the live zoo by every eviction. Selecting on the ledger-
+        reconstructed zoo (the same source the runner rehydrates from on resume)
+        keeps the ``_zoo.json`` honest. Returns the count written.
+        """
+        want = set(exprs)
+        factors = self.data.get("factors", {})
+        # One entry per zoo expression. The library can hold several entries
+        # for the same expression (a factor re-proposed across rounds); keep
+        # only the one that earned admission, falling back to the first seen,
+        # so the deliverable never carries redundant copies of one signal.
+        picked: dict[str, str] = {}
+        for fid, f in factors.items():
+            if not isinstance(f, dict):
+                continue
+            expr = f.get("factor_expression")
+            if expr not in want:
+                continue
+            cur = picked.get(expr)
+            if cur is None or (f.get("admitted") and not factors[cur].get("admitted")):
+                picked[expr] = fid
+        subset_factors = {fid: factors[fid] for fid in picked.values()}
+        # Drop the main library's `admitted_count`/`admitted_factor_ids`: they
+        # count the cumulative-ever-admitted set (stale on eviction) and would
+        # sit next to `total_factors` showing two different numbers. The active
+        # zoo is described by `total_factors` + `subset`, not by admission flags.
+        meta = {k: v for k, v in self.data.get("metadata", {}).items()
+                if k not in ("admitted_count", "admitted_factor_ids")}
+        meta.update({
+            "derived_from": str(self.library_path),
+            "subset": "active_zoo",
+            "total_factors": len(subset_factors),
+        })
+        subset = {"metadata": meta, "factors": subset_factors}
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(subset, f, ensure_ascii=False, indent=2, default=str)
+        logger.info(f"Wrote {len(subset_factors)} active-zoo factor(s) to {out}")
+        return len(subset_factors)
+
     def _save(self):
         self.data["metadata"]["last_updated"] = datetime.now().isoformat()
         self.data["metadata"]["total_factors"] = len(self.data["factors"])
