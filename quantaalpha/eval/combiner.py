@@ -174,6 +174,105 @@ _PREDICTION_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
 # prediction cache (and its byte-identical re-reindex on hit) is untouched.
 _ATTRIBUTION_CACHE: dict[tuple[str, str, str], list | None] = {}
 
+# Preprocessed base+zoo design-matrix block -- the ICIR combiner's per-batch
+# hot spot. The block (base features + every zoo signal, preprocessed) is a
+# function of (zoo, panel, theta.combiner.base_features/label_expr/engine)
+# ONLY: preprocessing is per-column (CSRankNorm ranks each column within a
+# date independently; fillna and the label-notna row mask are column-agnostic),
+# and the fold split only masks the TRAIN rows inside _fit_predict_icir -- it
+# never touches the design matrix. So one build serves every fold AND every
+# reject batch that holds the same zoo; only the candidate column is fresh.
+#
+# This is NOT cleared by clear_cache (which exists to bound _PREDICTION_CACHE,
+# one entry per candidate expression ever seen). The block is bounded instead
+# by _BLOCK_CACHE_MAX: the zoo changes one factor at a time, so the current
+# zoo's block is the only one needed and a 2-entry ring covers it + the prev.
+# Keyed fold-invariantly (theta.hash changes per fold via splits, so it would
+# defeat the cross-fold hit); the key covers every input the block depends on.
+#
+# Byte-identical to the per-batch rebuild: ICIR's ``feat_mat @ weights`` is a
+# permutation-invariant sum (each weight tracks its own column), so appending
+# the candidate as a trailing CAND column reproduces the interleaved-by-sort
+# order the old combined-dict build produced. LightGBM is column-order
+# sensitive, so it stays on the legacy combined build below and does NOT use
+# this cache. Verified by an evaluate() before/after equality test.
+_BLOCK_CACHE: dict[str, tuple] = {}
+_BLOCK_CACHE_MAX = 2
+
+
+def _block_key(zoo_signals: dict[str, pd.DataFrame], panel, theta: Protocol) -> str:
+    """Fold-invariant identity of the preprocessed base+zoo block."""
+    panel_fp = (len(panel.dates), len(panel.instruments),
+                str(panel.dates[0]), str(panel.dates[-1]))
+    engine = getattr(theta.combiner, "engine", "native")
+    base = tuple(theta.combiner.base_features)
+    label_expr = theta.execution.label_expr
+    raw = f"{zoo_hash(zoo_signals)}|{panel_fp}|{engine}|{base}|{label_expr}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _build_block(zoo_signals, panel, theta: Protocol):
+    """Preprocess base+zoo exactly as the inline path did, minus the candidate."""
+    columns: dict[str, pd.Series] = {}
+    base = _base_features(panel, theta)
+    for col in base.columns:
+        columns[col] = base[col]
+    col_to_expr: dict[str, str] = {}
+    for i, (expr, sig) in enumerate(sorted(zoo_signals.items())):
+        columns[f"ZOO{i}"] = _wide_to_long(
+            sig.reindex(index=panel.dates, columns=panel.instruments), f"ZOO{i}")
+        col_to_expr[f"ZOO{i}"] = expr
+    features = pd.DataFrame(columns)
+    # The combined-dict build unions base with zoo signals that are reindexed to
+    # the full panel, so its index is the full (date x instrument) product
+    # whenever any signal is present. With an EMPTY zoo the block would shrink
+    # to the base-features index (a strict subset -- measured 782k vs 1.74M
+    # full-panel cells), and the appended candidate would be ranked over a
+    # smaller cross-section than the combined build it must reproduce -- the
+    # one real divergence (0.284 at zoo=0; ~1e-16 elsewhere). Anchor the block
+    # to the full panel index so the candidate lands on the same rows the
+    # combined build used. A no-op when the zoo already expanded the frame.
+    full_idx = pd.MultiIndex.from_product(
+        [panel.dates, panel.instruments], names=list(base.index.names))
+    if not features.index.equals(full_idx):
+        features = features.reindex(full_idx)
+    label = _label(panel, theta).reindex(features.index)
+    if getattr(theta.combiner, "engine", "native") == "backtest_v2":
+        features, label = _preprocess_v2(features, label)
+    else:
+        features = features.fillna(0.0)
+        keep = label.notna()
+        features, label = features[keep], label[keep]
+        features = _cs_rank_norm(features)
+        label = _cs_rank_norm(label.to_frame()).iloc[:, 0]
+        features = features.fillna(0.0)
+    return features, label, col_to_expr
+
+
+def _preprocess_candidate(sig, panel, keep_index, theta: Protocol) -> pd.Series:
+    """Preprocess one candidate column identically to the inline full-frame path.
+
+    Mirrors each engine's step order exactly. The native path ranks AFTER the
+    label-notna row mask; the backtest_v2 path ranks BEFORE it (its rank-first
+    fix). ``keep_index`` is the block's post-mask MultiIndex, so the candidate
+    lands on the same rows the cached block already holds.
+    """
+    col = _wide_to_long(
+        sig.reindex(index=panel.dates, columns=panel.instruments), "_CAND")
+    if getattr(theta.combiner, "engine", "native") == "backtest_v2":
+        # _preprocess_v2 order: replace inf -> fillna -> rank(full) -> keep -> fillna
+        col = col.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        col = col.groupby(level="datetime", group_keys=False).rank(pct=True) - 0.5
+        col = col.reindex(keep_index)
+        col = col.fillna(0.0)
+    else:
+        # native order: fillna -> keep -> CSRankNorm -> fillna
+        col = col.fillna(0.0)
+        col = col.reindex(keep_index)
+        col = _cs_rank_norm(col.to_frame()).iloc[:, 0]
+        col = col.fillna(0.0)
+    return col
+
 
 def _per_date_ic(x: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     """Per-date cross-sectional rank IC of each feature with the label.
@@ -467,6 +566,7 @@ def fit_predict(
     panel: PanelBundle,
     theta: Protocol,
     candidate_expr: str = "CANDIDATE",
+    candidate_signals: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[pd.DataFrame, list[dict] | None]:
     """Refit ``A`` on ``zoo ∪ {f}`` and return the composite prediction ŷ.
 
@@ -476,48 +576,100 @@ def fit_predict(
     ``candidate_signal=None`` fits the **baseline** book on ``zoo`` alone, which
     is what marginal contribution is measured against. With an empty zoo that
     baseline is the null model: the four base features and nothing else.
+
+    ``candidate_signals`` (a dict) is the batch's fresh factors, held separate
+    from the stable ``zoo_signals`` so the preprocessed base+zoo block can be
+    cached across folds and batches (ICIR only). The combined-dict call style
+    (everything in ``zoo_signals``, ``candidate_signal=None``) still works
+    byte-identically -- it just does not get the block cache.
     """
-    key = (
-        zoo_hash(zoo_signals),
-        "baseline" if candidate_signal is None else signal_hash(candidate_expr),
-        theta.hash,
-    )
+    if candidate_signals:
+        cand_id = hashlib.md5("|".join(sorted(candidate_signals)).encode()).hexdigest()[:8]
+    elif candidate_signal is not None:
+        cand_id = signal_hash(candidate_expr)
+    else:
+        cand_id = "baseline"
+    key = (zoo_hash(zoo_signals), cand_id, theta.hash)
     cached = _PREDICTION_CACHE.get(key)
     if cached is not None:
         return cached.reindex(index=panel.dates, columns=panel.instruments), \
             _ATTRIBUTION_CACHE.get(key)
 
-    # ---- design matrix: base features + every zoo signal + the candidate ----
-    columns: dict[str, pd.Series] = {}
-    base = _base_features(panel, theta)
-    for col in base.columns:
-        columns[col] = base[col]
-    # T4: ZOO{i}/CAND -> expression mapping, so the ICIR attribution can report
-    # per-factor credit (the base features are intentionally not in the map and
-    # are excluded from the per-factor credit).
-    col_to_expr: dict[str, str] = {}
-    for i, (expr, sig) in enumerate(sorted(zoo_signals.items())):
-        columns[f"ZOO{i}"] = _wide_to_long(sig.reindex(index=panel.dates, columns=panel.instruments), f"ZOO{i}")
-        col_to_expr[f"ZOO{i}"] = expr
-    if candidate_signal is not None:
-        columns["CAND"] = _wide_to_long(
-            candidate_signal.reindex(index=panel.dates, columns=panel.instruments), "CAND"
-        )
-        col_to_expr["CAND"] = candidate_expr
-
-    features = pd.DataFrame(columns)
-    label = _label(panel, theta).reindex(features.index)
-
-    if getattr(theta.combiner, "engine", "native") == "backtest_v2":
-        features, label = _preprocess_v2(features, label)
+    model = getattr(theta.combiner, "model", "lightgbm")
+    if model == "icir":
+        # ---- ICIR: preprocessed base+zoo block (cached) + fresh candidate cols ----
+        # The block is fold-invariant and zoo-invariant across reject batches, so
+        # this is one build per zoo state; only the candidate column is rebuilt.
+        bkey = _block_key(zoo_signals, panel, theta)
+        block = _BLOCK_CACHE.get(bkey)
+        if block is None:
+            block = _build_block(zoo_signals, panel, theta)
+            if len(_BLOCK_CACHE) >= _BLOCK_CACHE_MAX:
+                _BLOCK_CACHE.pop(next(iter(_BLOCK_CACHE)))
+            _BLOCK_CACHE[bkey] = block
+        features_block, label, col_to_expr = block
+        col_to_expr = dict(col_to_expr)
+        cand_cols: dict[str, pd.Series] = {}
+        if candidate_signals:
+            for j, (expr, sig) in enumerate(sorted(candidate_signals.items())):
+                if expr in zoo_signals:
+                    continue  # already a ZOO column (same expr -> same signal)
+                name = f"CAND{j}"
+                cand_cols[name] = _preprocess_candidate(sig, panel, features_block.index, theta)
+                col_to_expr[name] = expr
+        elif candidate_signal is not None:
+            cand_cols["CAND"] = _preprocess_candidate(
+                candidate_signal, panel, features_block.index, theta)
+            col_to_expr["CAND"] = candidate_expr
+        features = pd.concat([features_block, pd.DataFrame(cand_cols)], axis=1) \
+            if cand_cols else features_block
+        # Reorder the signal columns to the combined-dict build's sorted-expr
+        # order. The ICIR prediction is feat_mat @ weights; appending the
+        # candidate last would sum the matmul in a different floating-point
+        # order than the pre-change combined build (~1e-16, which the MV
+        # optimizer can amplify to ~1e-9 in the book). The combined build sorts
+        # ALL signals (zoo+candidate) by expression, so reorder by expression
+        # too -- keyed on col_to_expr (base columns are absent from it), which
+        # interleaves the candidate at its sorted-expr position. A no-op for
+        # the baseline (no candidate): the block already sorted the zoo.
+        _base_cols = [c for c in features.columns if c not in col_to_expr]
+        _sig_cols = sorted(
+            ((col_to_expr[c], c) for c in features.columns if c in col_to_expr),
+            key=lambda e: e[0])
+        features = features[_base_cols + [c for _, c in _sig_cols]]
     else:
-        # ---- preprocessing, in the baseline handler's exact order ----
-        features = features.fillna(0.0)                      # Fillna(feature)
-        keep = label.notna()                                 # DropnaLabel
-        features, label = features[keep], label[keep]
-        features = _cs_rank_norm(features)                   # CSRankNorm(feature)
-        label = _cs_rank_norm(label.to_frame()).iloc[:, 0]   # CSRankNorm(label)
-        features = features.fillna(0.0)
+        # ---- LightGBM: legacy combined build (column order affects splits) ----
+        # The block cache is ICIR-only because LightGBM's column sampling makes
+        # the prediction order-sensitive; this path reproduces the pre-change
+        # combined-dict build byte-for-byte.
+        all_signals = dict(zoo_signals)
+        if candidate_signals:
+            all_signals.update(candidate_signals)
+        columns: dict[str, pd.Series] = {}
+        base = _base_features(panel, theta)
+        for col in base.columns:
+            columns[col] = base[col]
+        col_to_expr: dict[str, str] = {}
+        for i, (expr, sig) in enumerate(sorted(all_signals.items())):
+            columns[f"ZOO{i}"] = _wide_to_long(
+                sig.reindex(index=panel.dates, columns=panel.instruments), f"ZOO{i}")
+            col_to_expr[f"ZOO{i}"] = expr
+        if candidate_signal is not None:
+            columns["CAND"] = _wide_to_long(
+                candidate_signal.reindex(index=panel.dates, columns=panel.instruments), "CAND"
+            )
+            col_to_expr["CAND"] = candidate_expr
+        features = pd.DataFrame(columns)
+        label = _label(panel, theta).reindex(features.index)
+        if getattr(theta.combiner, "engine", "native") == "backtest_v2":
+            features, label = _preprocess_v2(features, label)
+        else:
+            features = features.fillna(0.0)
+            keep = label.notna()
+            features, label = features[keep], label[keep]
+            features = _cs_rank_norm(features)
+            label = _cs_rank_norm(label.to_frame()).iloc[:, 0]
+            features = features.fillna(0.0)
 
     # ---- fit on train only ----
     train_start, train_end = theta.splits.window(theta.combiner.fit_split)
@@ -542,14 +694,6 @@ def fit_predict(
         )
 
     # ---- model dispatch: ICIR+shrinkage linear combiner (Ding-Martin Redux) ----
-    # The frozen LightGBM procedure (model="lightgbm") is the default and is
-    # what the frozen / soft protocols select. model="icir" routes here
-    # instead: same design matrix and preprocessing, but μ is an ICIR-weighted
-    # (IC/σ_IC) linear sum of the factor signals, shrunk toward equal weight,
-    # rather than a 500-round boosted fit. No threads, no over-fitting,
-    # milliseconds not minutes. See _fit_predict_icir for why each combiner
-    # seed bootstraps the train dates.
-    model = getattr(theta.combiner, "model", "lightgbm")
     if model == "icir":
         prediction, attribution = _fit_predict_icir(features, x_train, y_train, theta, panel, col_to_expr)
         _PREDICTION_CACHE[key] = prediction
@@ -622,8 +766,21 @@ def fit_predict(
 
 
 def clear_cache() -> None:
+    # NOTE: _BLOCK_CACHE is intentionally NOT cleared here. clear_cache runs every
+    # batch (the runner calls it to bound _PREDICTION_CACHE, which grows one entry
+    # per candidate expression ever seen). The block is a function of the held
+    # zoo, which is stable across a batch and changes one factor at a time, so it
+    # is bounded by _BLOCK_CACHE_MAX and must persist across batches for the
+    # cross-batch win. Use clear_block_cache() to drop it deliberately.
     _PREDICTION_CACHE.clear()
     _ATTRIBUTION_CACHE.clear()
 
 
-__all__ = ["clear_cache", "fit_predict", "signal_hash", "zoo_hash"]
+def clear_block_cache() -> None:
+    """Drop the preprocessed base+zoo block cache (tests / forced rebuild)."""
+    _BLOCK_CACHE.clear()
+
+
+__all__ = [
+    "clear_cache", "clear_block_cache", "fit_predict", "signal_hash", "zoo_hash",
+]

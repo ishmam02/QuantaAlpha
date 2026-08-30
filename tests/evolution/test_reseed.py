@@ -296,6 +296,196 @@ def test_v6_reseed_fires_through_real_get_next_task():
           " carries a grown direction")
 
 
+def _cx(did: int, rnd: int, metrics: dict, factors=None) -> StrategyTrajectory:
+    """A crossover-phase trajectory (the breeding stock mutation normally uses)."""
+    return StrategyTrajectory(
+        trajectory_id=StrategyTrajectory.generate_id(did, rnd, RoundPhase.CROSSOVER),
+        direction_id=did, round_idx=rnd, phase=RoundPhase.CROSSOVER,
+        factors=factors or [], backtest_metrics=dict(metrics),
+    )
+
+
+def _mut(did: int, rnd: int, metrics: dict, factors=None) -> StrategyTrajectory:
+    """A mutation-phase trajectory (post-reseed mutation carries reseed genes)."""
+    return StrategyTrajectory(
+        trajectory_id=StrategyTrajectory.generate_id(did, rnd, RoundPhase.MUTATION),
+        direction_id=did, round_idx=rnd, phase=RoundPhase.MUTATION,
+        factors=factors or [], backtest_metrics=dict(metrics),
+    )
+
+
+def test_v7_post_reseed_mutation_breeds_fresh_originals():
+    """The fix for the reseed dead-end.
+
+    A mutation whose IMMEDIATELY PRECEDING round is a fresh ORIGINAL round (a
+    reseed -- the reseed returns the phase to ORIGINAL) breeds from THOSE new
+    directions, not from the stale latest crossover. Measured on the production
+    pool before this fix: 0/53 reseeded originals were ever bred; every
+    post-reseed mutation bred from a crossover 2-4 rounds stale (round 5 bred
+    round 2's crossover, round 9 bred round 6's, ... round 21 bred round 18's).
+
+    This runs the REAL ``_prepare_mutation_targets`` -- the only mock is
+    ``_cached_diagnosis`` (returned None -> every parent routes to ORTHOGONAL,
+    so ``_mutation_targets`` = every admissible parent of the selected round),
+    which isolates parent SELECTION from the diagnosis/bucketing logic.
+    """
+    import os
+    ctl = EvolutionController(_cfg())
+    # round 0: initial originals -- must NOT be selected at round 5.
+    r0 = [_traj(i, 0, {"U": 0.4, "delta_mean": 0.05, "admitted": i == 0,
+                       "verdict": "admitted" if i == 0 else "marginal"},
+                factors=[{"expression": "TS_MEAN($close,20)"}]) for i in range(2)]
+    # round 2: crossover children -- the STALE crossover the old code bred.
+    cx2 = [_cx(i, 2, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                      "verdict": "marginal"},
+                 factors=[{"expression": f"RANK($close,{20+i})"}]) for i in range(2)]
+    # round 4: ORIGINAL -- the reseed's FRESH directions (the fix must breed THESE).
+    r4 = [_traj(10 + i, 4, {"U": 0.5, "delta_mean": 0.08, "admitted": False,
+                            "verdict": "marginal"},
+                factors=[{"expression": f"RSI($close,{14+i})"}]) for i in range(2)]
+    for t in r0 + cx2 + r4:
+        ctl.pool.add(t)
+
+    ctl._current_round = 5  # mutation; prev_round=4 is the reseed ORIGINAL round
+    saved = os.environ.pop("QA_REQUIRE_FEASIBLE", None)
+    try:
+        with mock.patch.object(ctl, "_cached_diagnosis", return_value=None):
+            ctl._prepare_mutation_targets()
+    finally:
+        if saved is not None:
+            os.environ["QA_REQUIRE_FEASIBLE"] = saved
+
+    selected = {t.trajectory_id for t in ctl._mutation_targets}
+    assert selected == {t.trajectory_id for t in r4}, (
+        f"V7: post-reseed mutation must breed the round-4 fresh originals, "
+        f"got rounds {sorted({t.round_idx for t in ctl._mutation_targets})}")
+    assert not (selected & {t.trajectory_id for t in cx2}), "V7: stale crossover leaked in"
+    assert not (selected & {t.trajectory_id for t in r0}), "V7: round-0 originals leaked in"
+    print("OK  V7: post-reseed mutation breeds the fresh ORIGINAL round, not the stale crossover")
+
+
+def test_v8_normal_mutation_breeds_latest_crossover_unchanged():
+    """The fix changes ONLY the reseed case.
+
+    In the normal cycle the round before a mutation is a CROSSOVER round, so
+    ``prev_is_original`` is False and mutation still breeds the latest
+    crossover outputs -- byte-identical to the pre-fix behavior. This is the
+    guardrail: the surgical fix must not perturb the normal breeding chain.
+    """
+    import os
+    ctl = EvolutionController(_cfg())
+    r0 = [_traj(i, 0, {"U": 0.4, "delta_mean": 0.05, "admitted": i == 0,
+                       "verdict": "admitted" if i == 0 else "marginal"},
+                factors=[{"expression": "TS_MEAN($close,20)"}]) for i in range(2)]
+    cx2 = [_cx(i, 2, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                      "verdict": "marginal"},
+                 factors=[{"expression": f"RANK($close,{20+i})"}]) for i in range(2)]
+    # round 4 is a CROSSOVER round here (normal cycle) -- the latest crossover.
+    cx4 = [_cx(i, 4, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                      "verdict": "marginal"},
+                 factors=[{"expression": f"DELTA($close,{i+1})"}]) for i in range(2)]
+    for t in r0 + cx2 + cx4:
+        ctl.pool.add(t)
+
+    ctl._current_round = 5  # mutation; prev_round=4 is a CROSSOVER round (normal)
+    saved = os.environ.pop("QA_REQUIRE_FEASIBLE", None)
+    try:
+        with mock.patch.object(ctl, "_cached_diagnosis", return_value=None):
+            ctl._prepare_mutation_targets()
+    finally:
+        if saved is not None:
+            os.environ["QA_REQUIRE_FEASIBLE"] = saved
+
+    selected = {t.trajectory_id for t in ctl._mutation_targets}
+    assert selected == {t.trajectory_id for t in cx4}, (
+        f"V8: normal mutation must breed the LATEST crossover (round 4), "
+        f"got rounds {sorted({t.round_idx for t in ctl._mutation_targets})}")
+    assert not (selected & {t.trajectory_id for t in cx2}), "V8: older crossover leaked in"
+    assert not (selected & {t.trajectory_id for t in r0}), "V8: round-0 originals leaked in"
+    print("OK  V8: normal mutation breeds the latest crossover (unchanged by the fix)")
+
+
+def test_v9_post_reseed_crossover_breeds_fresh_originals():
+    """The crossover half of the reseed fix (Option A).
+
+    A crossover whose most recent ORIGINAL round is NEWER than any crossover
+    (only a reseed creates an original round once crossovers exist) breeds the
+    FRESH reseed originals + the post-reseed mutation, not the stale pre-reseed
+    crossover. Measured pre-fix on production pool ``meanvar_20260827_224322``:
+    post-reseed crossovers bred the reseed round 0/8 (r6), 0/8 (r10), 0/7 (r14)
+    -- ~half their children picked two stale-crossover parents and inherited
+    zero reseed genes, so the reseed's new directions only entered the lineage
+    via the mutation half.
+
+    Runs the REAL ``_get_crossover_candidates`` (the round-selection logic); it
+    reads only ``round_idx``/``phase``, so metric values are placeholders and
+    admissibility filtering (applied later in ``_prepare_crossover_groups``) is
+    out of scope here.
+    """
+    ctl = EvolutionController(_cfg())
+    r0 = [_traj(i, 0, {"U": 0.4, "delta_mean": 0.05, "admitted": i == 0,
+                       "verdict": "admitted" if i == 0 else "marginal"},
+                factors=[{"expression": "TS_MEAN($close,20)"}]) for i in range(2)]
+    cx2 = [_cx(i, 2, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                      "verdict": "marginal"},
+               factors=[{"expression": f"RANK($close,{20+i})"}]) for i in range(2)]
+    # round 4: ORIGINAL -- the reseed's FRESH directions (the fix must breed THESE).
+    r4 = [_traj(10 + i, 4, {"U": 0.5, "delta_mean": 0.08, "admitted": False,
+                            "verdict": "marginal"},
+                factors=[{"expression": f"RSI($close,{14+i})"}]) for i in range(2)]
+    # round 5: mutation -- post-reseed, already carries reseed-4 genes via V7.
+    m5 = [_mut(20 + i, 5, {"U": 0.45, "delta_mean": 0.06, "admitted": False,
+                           "verdict": "marginal"},
+               factors=[{"expression": f"RSI($close,{14+i})_m"}]) for i in range(2)]
+    for t in r0 + cx2 + r4 + m5:
+        ctl.pool.add(t)
+
+    candidates = ctl._get_crossover_candidates()
+    selected_rounds = sorted({t.round_idx for t in candidates})
+    assert 4 in selected_rounds, "V9: reseed originals (round 4) must be candidates"
+    assert 5 in selected_rounds, "V9: post-reseed mutation (round 5) must be candidates"
+    assert 2 not in selected_rounds, "V9: stale pre-reseed crossover (round 2) leaked in"
+    assert 0 not in selected_rounds, "V9: initial originals (round 0) leaked in"
+    print("OK  V9: post-reseed crossover breeds fresh originals + mutation, not stale crossover")
+
+
+def test_v10_normal_crossover_breeds_latest_mutation_and_crossover_unchanged():
+    """The fix changes ONLY the reseed case.
+
+    In the normal cycle no original round is newer than the latest crossover,
+    so the post-reseed branch does not trigger and crossover still breeds the
+    latest mutation + latest crossover -- byte-identical to the pre-fix
+    behavior. This is the guardrail: the surgical fix must not perturb the
+    normal breeding chain.
+    """
+    ctl = EvolutionController(_cfg())
+    r0 = [_traj(i, 0, {"U": 0.4, "delta_mean": 0.05, "admitted": i == 0,
+                       "verdict": "admitted" if i == 0 else "marginal"},
+                factors=[{"expression": "TS_MEAN($close,20)"}]) for i in range(2)]
+    cx2 = [_cx(i, 2, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                      "verdict": "marginal"},
+               factors=[{"expression": f"RANK($close,{20+i})"}]) for i in range(2)]
+    m3 = [_mut(20 + i, 3, {"U": 0.35, "delta_mean": 0.03, "admitted": False,
+                           "verdict": "marginal"},
+               factors=[{"expression": f"DELTA($close,{i+1})_m"}]) for i in range(2)]
+    # round 4: CROSSOVER (normal cycle) -- the latest crossover.
+    cx4 = [_cx(10 + i, 4, {"U": 0.3, "delta_mean": 0.02, "admitted": False,
+                           "verdict": "marginal"},
+                factors=[{"expression": f"DELTA($close,{i+1})"}]) for i in range(2)]
+    for t in r0 + cx2 + m3 + cx4:
+        ctl.pool.add(t)
+
+    candidates = ctl._get_crossover_candidates()
+    selected_rounds = sorted({t.round_idx for t in candidates})
+    # Normal Case 2: latest mutation (round 3) + latest crossover (round 4).
+    assert 3 in selected_rounds and 4 in selected_rounds, (
+        f"V10: normal crossover must breed latest mutation (3) + latest crossover (4), "
+        f"got rounds {selected_rounds}")
+    assert 0 not in selected_rounds, "V10: originals (round 0) must not leak into normal crossover"
+    assert 2 not in selected_rounds, "V10: older crossover (round 2) must not leak in"
+    print("OK  V10: normal crossover breeds latest mutation + latest crossover (unchanged by the fix)")
+
+
 if __name__ == "__main__":
     test_v1_no_repository_data_is_noop()
     test_v2_grow_and_mark_saturated()
@@ -303,4 +493,8 @@ if __name__ == "__main__":
     test_v4_extraction_surfaces_admitted_verdict()
     test_v5_informed_directions_parse_and_no_fallback()
     test_v6_reseed_fires_through_real_get_next_task()
+    test_v7_post_reseed_mutation_breeds_fresh_originals()
+    test_v8_normal_mutation_breeds_latest_crossover_unchanged()
+    test_v9_post_reseed_crossover_breeds_fresh_originals()
+    test_v10_normal_crossover_breeds_latest_mutation_and_crossover_unchanged()
     print("\nAll reseed tests passed.")

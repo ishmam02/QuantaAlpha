@@ -92,6 +92,25 @@ def extract_operators(expr: str) -> set[str]:
     return operators
 
 
+def top_exercised_operators(expressions: Iterable[str], k: int = 3) -> list[str]:
+    """The ``k`` most-exercised operator names, by call-share then name.
+
+    A structured counterpart to ``coverage_block``'s printed "Top 3" line, so the
+    direction-level novelty gate can name the monoculture set without re-parsing
+    the rendered block. Ranks by call count (matches ``coverage_block``'s
+    ``ranked``), falling back to alphabetical for determinism. Degrades to ``[]``
+    when nothing parses.
+    """
+    counts: Counter[str] = Counter()
+    for expr in expressions:
+        for op in extract_operators(expr):
+            counts[op] += 1
+    ranked = sorted(counts, key=lambda op: (-counts[op], op))
+    if k <= 0:
+        return []
+    return ranked[:k]
+
+
 # Words that turn a measurement into a prescription. The block is scanned for
 # these so a future edit cannot accidentally start telling the generator what to
 # do -- the standing hard rule is "prompts DIAGNOSE, never PRESCRIBE."
@@ -191,4 +210,5 @@ def coverage_block(expressions: Iterable[str]) -> str:
     return block
 
 
-__all__ = ["DECLARED_OPERATORS", "extract_operators", "coverage_block"]
+__all__ = ["DECLARED_OPERATORS", "extract_operators", "coverage_block",
+           "top_exercised_operators"]

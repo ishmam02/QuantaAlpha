@@ -299,6 +299,46 @@ def spearman_abs_matrix(signals: dict) -> "np.ndarray":
     return R
 
 
+# Shared zoo x zoo |Spearman| block. ``operator.evaluate`` (the effective_rank
+# METRIC) and ``runner._decide_standalone`` (the marginal-er GATE) compute the
+# SAME block over the held zoo on the SAME panel -- both derive their signals
+# from the repository in the SAME insertion order and align to ``op._panel`` of
+# ``op._windows(False)`` -- so one shared build replaces two O(zoo**2) passes
+# per batch (evaluate builds it first; _decide reuses it). ``effective_rank`` /
+# ``effective_rank_cached`` are eigenvalue-based (permutation-invariant), and
+# the block is built in the caller's dict-iteration order -- which both callers
+# already used -- so a cached hit is bit-identical to a fresh build for both.
+# Bounded to a couple of zoo states (the zoo changes one factor at a time).
+_SPEARMAN_BLOCK_CACHE: dict[tuple, "np.ndarray"] = {}
+_SPEARMAN_BLOCK_CACHE_MAX = 2
+
+
+def spearman_block_cached(signals: dict, panel_key) -> "np.ndarray":
+    """Shared cached zoo x zoo |Spearman| block, keyed by signal set + panel.
+
+    ``signals`` is the held-zoo dict; the block is built in its iteration order
+    and keyed by ``(tuple(exprs in that order), panel_key)``. Both callers pass
+    the repository's insertion order on the same panel grid, so a block built
+    by one is reused by the other. ``panel_key`` is whatever the caller uses to
+    identify the alignment grid (a ``(start, end)`` panel span), so a re-split
+    misses rather than returning a stale block.
+    """
+    key = (tuple(signals), panel_key)
+    cached = _SPEARMAN_BLOCK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    R = spearman_abs_matrix(signals)
+    if len(_SPEARMAN_BLOCK_CACHE) >= _SPEARMAN_BLOCK_CACHE_MAX:
+        _SPEARMAN_BLOCK_CACHE.pop(next(iter(_SPEARMAN_BLOCK_CACHE)))
+    _SPEARMAN_BLOCK_CACHE[key] = R
+    return R
+
+
+def clear_spearman_block_cache() -> None:
+    """Drop the shared zoo x zoo block cache (tests / forced re-split)."""
+    _SPEARMAN_BLOCK_CACHE.clear()
+
+
 def effective_rank_cached(R_repo: "np.ndarray", repo_signals: dict,
                           extra_signals: dict) -> float:
     """``effective_rank`` of ``repo_signals + extra_signals`` reusing the
@@ -682,5 +722,7 @@ __all__ = [
     "rho_max_arg",
     "solo_turnover",
     "spearman_abs_matrix",
+    "spearman_block_cached",
+    "clear_spearman_block_cache",
     "strategy_metrics",
 ]

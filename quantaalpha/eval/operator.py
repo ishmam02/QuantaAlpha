@@ -40,12 +40,12 @@ from quantaalpha.eval import costs as costs_mod
 from quantaalpha.eval.data import PanelBundle, align_signal, load_benchmark, load_panel
 from quantaalpha.eval.execution import fill_prices, grinold_alpha, prediction_scale, realized_return
 from quantaalpha.eval.metrics import (
+    _abs_spearman,
     _cross_sectional_corr,
     cx,
-    effective_rank_cached,
+    effective_rank,
     prediction_metrics,
-    rho_max,
-    spearman_abs_matrix,
+    spearman_block_cached,
     strategy_metrics,
 )
 from quantaalpha.eval.portfolio import build_book
@@ -90,16 +90,11 @@ class EvaluationOperator:
         # Baseline books keyed by (zoo_hash, window) -- one fit per repository
         # state, not per candidate.
         self._baselines: dict[tuple, dict] = {}
-        # Cached zoo x zoo |Spearman| block for the effective_rank metric (the
-        # O(zoo**2) term). Single entry: (key, R_zoo) or None. Keyed by the
-        # ORDERED zoo tuple + eval_window + report -- the block is a pure
-        # function of the held signals on the panel, so a matching key reuses
-        # it (O(zoo**2) -> O(1)) and only the candidate-vs-zoo tail is rebuilt
-        # (O(zoo)); an admit/replace/evict changes the tuple -> miss -> rebuild.
-        # The ordered key (not the order-independent zoo_hash) guarantees the
-        # same axis order on a hit, so the cached block is bit-identical to a
-        # fresh build (no permutation float noise).
-        self._er_zoo_cache = None
+        # The zoo x zoo |Spearman| block for the effective_rank metric lives in
+        # the SHARED ``spearman_block_cached`` cache (metrics.py), keyed by the
+        # held-zoo signal set + panel grid -- so the operator's effective_rank
+        # metric and the runner's marginal-er gate (same held zoo, same panel)
+        # share one O(zoo**2) build per batch instead of two.
         self._masks: dict[tuple, object] = {}
 
     # ------------------------------------------------------------------
@@ -186,32 +181,64 @@ class EvaluationOperator:
         metrics.update(prediction_metrics(book["prediction"], panel, self.theta, eval_window))
 
         # --- properties of the new batch itself ---
-        metrics["rho_max"] = max(
-            (rho_max(sig, aligned_zoo) for sig in aligned_cands.values()), default=0.0
-        )
+        # rho_max, rho_within AND the effective_rank tail all need the SAME
+        # candidate-involving |Spearman| entries -- candidate-vs-zoo (K x zoo)
+        # and candidate-vs-candidate (K x K). Pre-Fix #3 each rebuilt its own
+        # copy (rho_max's 250 + rho_within's 10 + the effective_rank tail's
+        # 260, at zoo=50); building them once and reading all three metrics off
+        # the one matrix cuts the per-batch spearman cost ~71s with no change to
+        # any metric -- the entries are the same ``_abs_spearman`` primitive the
+        # three paths already shared, assembled in the same dict-iteration
+        # order. The zoo x zoo block is NOT rebuilt here: it is the shared
+        # ``spearman_block_cached`` cache, slotted in only for effective_rank.
+        _n_zoo = len(aligned_zoo)
+        _n_cand = len(aligned_cands)
+        _cand_keys = list(aligned_cands)
+        _cand_sigs = list(aligned_cands.values())
+        _zoo_sigs = list(aligned_zoo.values())
+        _cz = np.zeros((_n_cand, _n_zoo))   # candidate i vs zoo j
+        _cc = np.eye(_n_cand)               # candidate i vs candidate j, diag 1.0
+        for _i in range(_n_cand):
+            _si = _cand_sigs[_i]
+            for _j in range(_n_zoo):
+                _cz[_i, _j] = _abs_spearman(_si, _zoo_sigs[_j])
+            for _j in range(_i):
+                _v = _abs_spearman(_si, _cand_sigs[_j])
+                _cc[_i, _j] = _cc[_j, _i] = _v
+
+        # rho_max (Eq. 9): max |Spearman| of any candidate against any zoo
+        # incumbent. ``rho_max_arg`` starts at 0.0 and skips empty corrs, so the
+        # max over the candidate-vs-zoo block (whose ``_abs_spearman`` entries
+        # are 0.0 for empty pairs) reproduces it bit-for-bit; an empty zoo or
+        # empty batch -> 0.0 (trivially novel / nothing to compare).
+        metrics["rho_max"] = float(_cz.max()) if (_n_zoo and _n_cand) else 0.0
+
         # WITHIN-batch redundancy. ``rho_max`` above compares each candidate to
         # the ZOO only, so a batch whose members are copies of EACH OTHER passes
         # the redundancy gate untouched. Measured 2026-08-15 on the live 9-factor
         # zoo: every one of the three admitted batches contained a near-duplicate
         # pair (rho 0.85, 1.00, 0.89), leaving 9 factors with an effective rank of
         # 5.0. ``factors_per_hypothesis: 3`` means a batch nominally adds three
-        # directions; in practice it was adding about one.
-        _cand_list = list(aligned_cands.items())
+        # directions; in practice it was adding about one. Read off the
+        # candidate-vs-candidate block built above (spearman, for the same reason
+        # as rho_max: the combiner rank-normalises features, so X and RANK(X) are
+        # one column).
         _within = 0.0
         _worst_pair = None
-        for _i in range(len(_cand_list)):
-            for _j in range(_i + 1, len(_cand_list)):
-                # spearman, for the same reason as ``rho_max``: the combiner
-                # rank-normalises features, so X and RANK(X) are one column.
-                _corr = _cross_sectional_corr(
-                    _cand_list[_i][1], _cand_list[_j][1], "spearman"
-                )
-                if _corr.empty:
-                    continue
-                _r = abs(float(_corr.mean()))
-                if _r > _within:
-                    _within = _r
-                    _worst_pair = (_cand_list[_i][0], _cand_list[_j][0])
+        if _n_cand >= 2:
+            _iu = np.triu_indices(_n_cand, k=1)
+            if _iu[0].size:
+                _flat = _cc[_iu]
+                _idx = int(np.argmax(_flat))
+                _within = float(_flat[_idx])
+                # argmax returns the first maximal pair in (i<j) order, matching
+                # the strict-``>`` running-max loop it replaces (ties keep the
+                # first); name the pair only when the max is non-trivial.
+                if _within > 0.0:
+                    _worst_pair = (
+                        _cand_keys[int(_iu[0][_idx])],
+                        _cand_keys[int(_iu[1][_idx])],
+                    )
         metrics["rho_within"] = float(_within)
         if _worst_pair is not None and _within > 0.8:
             logger.warning(
@@ -230,39 +257,35 @@ class EvaluationOperator:
         #
         # exp(entropy of the normalised eigenvalue spectrum) -- the standard
         # participation-ratio form. Computed over candidates AND zoo, since the
-        # book is what gets traded. Costs one eigendecomposition of a matrix
-        # already being filled in above.
+        # book is what gets traded. The candidate-involving tail is already
+        # built above (shared with rho_max / rho_within); the zoo x zoo block is
+        # the shared ``spearman_block_cached`` cache, so the only per-batch work
+        # left here is one eigendecomposition of the assembled matrix.
         try:
             _all = {**aligned_zoo, **aligned_cands}
             _keys = list(_all)
             if len(_keys) >= 2:
                 _n = len(_keys)
-                # Effective rank of the book = zoo + new factors (unchanged
-                # semantics). The zoo x zoo |Spearman| block is invariant across
-                # reject batches (the runner holds the zoo fixed), so cache it
-                # keyed by the ordered zoo tuple + window + report: a hit reuses
-                # the block (O(zoo**2) -> O(1)) and only the candidate-vs-zoo tail
-                # is rebuilt (O(zoo)); an admit/replace/evict changes the tuple
-                # -> miss -> rebuild. Bit-identical to the inline double loop:
-                # spearman_abs_matrix uses the same _abs_spearman primitive, and
-                # effective_rank_cached slots the block in and computes only the
-                # tail; eigenvalues are permutation-invariant and the ordered
-                # key guarantees the same axis order on a hit. Guard: only when
-                # no candidate expression duplicates a zoo one -- the inline path
-                # dedupes via the dict merge ({**zoo, **cands} keeps one) while
-                # effective_rank_cached would carry both, so a collision falls
-                # back to the full inline build, which is always bit-identical.
                 if not (aligned_zoo.keys() & aligned_cands.keys()):
-                    _er_key = (tuple(aligned_zoo), eval_window, report)
-                    if (self._er_zoo_cache is None
-                            or self._er_zoo_cache[0] != _er_key):
-                        _R_zoo = spearman_abs_matrix(aligned_zoo)
-                        self._er_zoo_cache = (_er_key, _R_zoo)
-                    else:
-                        _R_zoo = self._er_zoo_cache[1]
-                    _er = effective_rank_cached(
-                        _R_zoo, aligned_zoo, aligned_cands)
+                    # No candidate duplicates a zoo expression: assemble the
+                    # book's |Spearman| matrix from the cached zoo x zoo block
+                    # and the pre-built candidate tail. Bit-identical to the
+                    # ``effective_rank_cached`` path it replaces -- same
+                    # ``_abs_spearman`` entries, same dict-iteration order, and
+                    # eigenvalues are invariant to the block slotting.
+                    _R_zoo = spearman_block_cached(
+                        aligned_zoo, (panel_start, panel_end))
+                    _R = np.eye(_n_zoo + _n_cand)
+                    _R[:_n_zoo, :_n_zoo] = _R_zoo
+                    _R[:_n_zoo, _n_zoo:] = _cz.T
+                    _R[_n_zoo:, :_n_zoo] = _cz
+                    _R[_n_zoo:, _n_zoo:] = _cc
+                    _er = effective_rank(_R)
                 else:
+                    # A candidate expression duplicates a zoo one: the book
+                    # dedupes the duplicate via the dict merge ({**zoo, **cands}
+                    # keeps one), so the pre-built full tail does not apply --
+                    # rebuild the deduped matrix inline (always bit-identical).
                     _R = np.eye(_n)
                     for _i in range(_n):
                         for _j in range(_i + 1, _n):
@@ -345,7 +368,7 @@ class EvaluationOperator:
             out.append((replace(self.theta, splits=splits), valid))
         return out
 
-    def _signal_only(self, factors, panel, eval_window):
+    def _signal_only(self, zoo_signals, candidate_signals, panel, eval_window):
         """Fit the combiner per fold, but never build a book.
 
         The expensive half of an evaluation is the portfolio: a capped-simplex
@@ -366,12 +389,14 @@ class EvaluationOperator:
         prediction, attribution = None, None
         for theta_fold, _fold_window in self._folds(False):
             prediction, attribution = combiner_mod.fit_predict(
-                factors, None, panel, theta_fold)
+                zoo_signals, None, panel, theta_fold,
+                candidate_signals=candidate_signals)
         return {"book_priced": False}, prediction, attribution
 
     def _fit_and_price(
         self,
-        factors: dict[str, pd.DataFrame],
+        zoo_signals: dict[str, pd.DataFrame],
+        candidate_signals: dict[str, pd.DataFrame],
         panel: PanelBundle,
         eval_window: tuple[str, str],
         report: bool,
@@ -393,7 +418,9 @@ class EvaluationOperator:
         folds = self._folds(report)
         per_fold, predictions, attributions, windows = [], [], [], []
         for theta_fold, fold_window in folds:
-            pred, attribution = combiner_mod.fit_predict(factors, None, panel, theta_fold)
+            pred, attribution = combiner_mod.fit_predict(
+                zoo_signals, None, panel, theta_fold,
+                candidate_signals=candidate_signals)
             win = fold_window or eval_window
             per_fold.append(self._book(pred, panel, win, theta_fold))
             predictions.append(pred)
@@ -465,7 +492,6 @@ class EvaluationOperator:
         skip_book: bool = False,
     ) -> dict:
         """The book from ``zoo ∪ candidates``, plus its gain over the zoo alone."""
-        combined = {**aligned_zoo, **aligned_cands}
         if skip_book:
             # Price the SIGNAL, not the book. Everything structural (hashes,
             # zoo size, window, prediction metrics) is still produced; only the
@@ -473,9 +499,11 @@ class EvaluationOperator:
             # metrics are left ABSENT rather than filled with zeros, so a
             # consumer that needs them fails loudly instead of averaging in a
             # number nobody measured.
-            metrics, prediction, attribution = self._signal_only(combined, panel, eval_window)
+            metrics, prediction, attribution = self._signal_only(
+                aligned_zoo, aligned_cands, panel, eval_window)
         else:
-            metrics, prediction, attribution = self._fit_and_price(combined, panel, eval_window, report)
+            metrics, prediction, attribution = self._fit_and_price(
+                aligned_zoo, aligned_cands, panel, eval_window, report)
 
         # Marginal contribution of the whole batch over the repository alone.
         baseline = ({} if skip_book
@@ -571,7 +599,7 @@ class EvaluationOperator:
         key = (combiner_mod.zoo_hash(aligned_zoo), eval_window, report)
         if key not in self._baselines:
             self._baselines[key] = self._fit_and_price(
-                aligned_zoo, panel, eval_window, report)[0]
+                aligned_zoo, {}, panel, eval_window, report)[0]
             logger.info(
                 "baseline book for zoo=%s (|zoo|=%d): net_ir=%.4f net_arr=%.4f",
                 key[0], len(aligned_zoo),

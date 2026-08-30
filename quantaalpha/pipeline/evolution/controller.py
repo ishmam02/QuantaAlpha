@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1104,13 +1105,30 @@ class EvolutionController:
         if self._current_round == 1:
             prev_phase_trajs = self.pool.get_by_phase(RoundPhase.ORIGINAL)
         else:
-            # After crossover round, we mutate the crossover outputs
-            # Find crossover trajectories from the most recent crossover round
-            all_crossover = self.pool.get_by_phase(RoundPhase.CROSSOVER)
-            # Get the most recent crossover round index
-            if all_crossover:
-                max_crossover_round = max(t.round_idx for t in all_crossover)
-                prev_phase_trajs = [t for t in all_crossover if t.round_idx == max_crossover_round]
+            # Breed from the IMMEDIATELY PRECEDING round. Normally that round is
+            # the latest crossover, so we mutate its crossover outputs (unchanged
+            # behavior). But a RESEED returns the phase to ORIGINAL, so the round
+            # before the next mutation is a fresh ORIGINAL round -- and breeding
+            # from those new directions (not the stale crossover chain) is what
+            # makes a reseed's new families not dead-ends. Measured before this
+            # fix: 0/53 reseeded originals were ever bred; every post-reseed
+            # mutation bred from a crossover 2-4 rounds stale (round 5 bred round
+            # 2's crossover, round 9 bred round 6's, ... round 21 bred round 18's).
+            prev_round_trajs = [t for t in self.pool.get_all()
+                                if t.round_idx == prev_round]
+            prev_is_original = bool(prev_round_trajs) and all(
+                t.phase == RoundPhase.ORIGINAL for t in prev_round_trajs)
+            if prev_is_original:
+                # Post-reseed: the preceding round IS the fresh directions the
+                # reseed injected. Refine them, not the stale crossover.
+                prev_phase_trajs = prev_round_trajs
+            else:
+                # Normal cycle: mutate the most recent crossover outputs.
+                all_crossover = self.pool.get_by_phase(RoundPhase.CROSSOVER)
+                if all_crossover:
+                    max_crossover_round = max(t.round_idx for t in all_crossover)
+                    prev_phase_trajs = [t for t in all_crossover
+                                        if t.round_idx == max_crossover_round]
 
         if not prev_phase_trajs:
             # Fallback: get all trajectories from previous round
@@ -1474,7 +1492,17 @@ class EvolutionController:
         latest_crossover_round = -1
         if crossover_trajs:
             latest_crossover_round = max(t.round_idx for t in crossover_trajs)
-        
+
+        # Find the most recent original round (round 0 initially, or a reseed's
+        # fresh injected directions). Used to detect the first crossover AFTER a
+        # reseed: only a reseed creates an ORIGINAL round once crossovers exist, so
+        # ``latest_crossover_round < latest_original_round`` means a reseed fired
+        # and no crossover has run since (mirrors the V7 mutation fix in
+        # ``_prepare_mutation_targets``).
+        latest_original_round = -1
+        if original_trajs:
+            latest_original_round = max(t.round_idx for t in original_trajs)
+
         candidates = []
         
         # ========================================================
@@ -1521,7 +1549,31 @@ class EvolutionController:
                 candidates.extend([t for t in mutation_trajs if t.round_idx == latest_mutation_round])
             logger.info(f"First crossover: using {len(original_trajs)} original + "
                        f"{len(candidates) - len(original_trajs)} mutation (round {latest_mutation_round})")
-        
+
+        # Case 1b: First crossover AFTER A RESEED -- an ORIGINAL round is more
+        # recent than any crossover (only a reseed creates an original round once
+        # crossovers exist). Breed the FRESH reseed originals + the post-reseed
+        # mutation (which already carries them via the V7 fix in
+        # ``_prepare_mutation_targets``), NOT the stale pre-reseed crossover.
+        # Symmetric with the V7 mutation fix. Measured pre-fix on production pool
+        # ``meanvar_20260827_224322``: post-reseed crossovers bred the reseed round
+        # 0/8 (r6), 0/8 (r10), 0/7 (r14) -- ~half their children picked two
+        # stale-crossover parents and inherited ZERO reseed genes, so the reseed's
+        # new directions only entered the lineage via the mutation half.
+        elif latest_original_round >= 0 and latest_crossover_round < latest_original_round:
+            reseed_originals = [t for t in original_trajs
+                                if t.round_idx == latest_original_round]
+            candidates.extend(reseed_originals)
+            n_mut = 0
+            if latest_mutation_round >= 0:
+                post_reseed_mut = [t for t in mutation_trajs
+                                   if t.round_idx == latest_mutation_round]
+                candidates.extend(post_reseed_mut)
+                n_mut = len(post_reseed_mut)
+            logger.info(f"Post-reseed crossover: using {len(reseed_originals)} fresh original "
+                       f"(round {latest_original_round}) + {n_mut} mutation (round {latest_mutation_round}) "
+                       f"instead of stale crossover (round {latest_crossover_round})")
+
         # Case 2: Subsequent crossover
         # Use: latest mutation + latest crossover
         else:
@@ -1530,12 +1582,12 @@ class EvolutionController:
                 latest_mutations = [t for t in mutation_trajs if t.round_idx == latest_mutation_round]
                 candidates.extend(latest_mutations)
                 logger.info(f"Adding {len(latest_mutations)} mutation trajectories from round {latest_mutation_round}")
-            
+
             # Add latest crossover trajectories
             latest_crossovers = [t for t in crossover_trajs if t.round_idx == latest_crossover_round]
             candidates.extend(latest_crossovers)
             logger.info(f"Adding {len(latest_crossovers)} crossover trajectories from round {latest_crossover_round}")
-        
+
         return candidates
     
     def _get_crossover_task(self) -> Optional[dict[str, Any]]:
@@ -2136,6 +2188,11 @@ class EvolutionController:
             )
             return False
         new_dirs = self._generate_informed_directions(digest)
+        # Direction-level operator-novelty gate (env-gated inside the helper,
+        # default off => a no-op that returns new_dirs unchanged): keep only
+        # directions that introduce an operator outside the top-K exercised in
+        # the admitted zoo, so the reseed cannot refill the monoculture.
+        new_dirs = self._filter_novel_directions(new_dirs, digest)
         if not new_dirs:
             logger.warning(
                 f"Repository {reason} at {size} factor(s): informed-direction "
@@ -2266,6 +2323,64 @@ class EvolutionController:
                 lines.append(cov)
         except Exception:
             logger.exception("operator-coverage block failed; omitting from reseed digest")
+        # --- what worked well: strongest admitted factors (always on) ---------
+        # The complement to the failure-mode counts below: the planner already
+        # sees WHAT FAILED and the measured sign; it saw what WORKED only as
+        # thin per-direction admit snippets. A ranked, cross-direction view of
+        # the strongest factors that cleared the gate is a concrete quality bar
+        # (the |t| at which factors admit), not a family hint -- the coverage
+        # block + the operator-novelty gate handle family novelty. Always on:
+        # "what worked" is baseline reseed context, not an opt-in. Measurement
+        # only (same diagnose-never-prescribe rule as the blocks below); scans
+        # all phases so bred winners surface. Controller code, not the protocol,
+        # so the frozen hash is untouched.
+        _www = self._what_worked_well_block()
+        if _www:
+            if lines:
+                lines.append("")
+            lines.extend(_www)
+        # --- regime-conditional IC: crash-fragility of admitted factors -----
+        # Sibling of _what_worked_well_block: the same admitted factors, read
+        # this time for their per-factor ic_crash/ic_rally. The per-batch
+        # generator already sees each factor's own crash/rally IC through the
+        # feedback channel; the reseed planner sees only this digest, so
+        # without this block a new direction is proposed blind to which
+        # construction patterns invert on the worst 20% of days (by the day's
+        # cross-sectional return) and which hold. Measurement only (counts +
+        # the extreme factors), names no market and no remedy, closes "yours
+        # to determine" -- the same rule the other digest blocks follow.
+        # Always on: crash-robustness is baseline reseed context, not an opt-in.
+        _reg = self._regime_conditional_block()
+        if _reg:
+            if lines:
+                lines.append("")
+            lines.extend(_reg)
+        # --- failure memory routed to the DIRECTION PLANNER (env-gated) -----
+        # The reseed digest is the direction planner's input -- the layer that
+        # picks the operator family and the sign frame. The failure-mode counts
+        # (``_failure_patterns``) and the measured realized-IC sign
+        # (``_sign_direction_block``) previously reached only the per-batch
+        # generator (``_build_zoo_context``), AFTER the direction had already
+        # locked in the family and the sign, so the planner kept choosing the
+        # monoculture operator and the opposite-framed hypotheses. Routing them
+        # here lets the planner avoid the failing construction at the layer
+        # that chooses it. Measurement only (counts + a signed share), no remedy,
+        # no market prior -- the same diagnose-never-prescribe rule the
+        # per-batch block already follows. Default off => the digest is
+        # byte-identical to before, so the frozen protocol path is unchanged.
+        if os.environ.get("QA_RESEED_FAILURE_MEMORY", "").lower() in (
+                "1", "true", "yes", "on"):
+            _fm_all = self.pool.get_all()
+            _fpat = self._failure_patterns(_fm_all)
+            if _fpat:
+                if lines:
+                    lines.append("")
+                lines.extend(_fpat)
+            _sblk = self._sign_direction_block(_fm_all)
+            if _sblk:
+                if lines:
+                    lines.append("")
+                lines.extend(_sblk)
         return "\n".join(lines)
 
     def _generate_informed_directions(self, digest: str) -> list[str]:
@@ -2680,6 +2795,302 @@ class EvolutionController:
             if count and key in label:
                 out.append(f"- {count} of {n} {label[key]}")
         return out if len(out) > 1 else []
+
+    def _sign_direction_block(self, trajectories: list) -> list[str]:
+        """The measured sign of the realized IC across all factors so far.
+
+        Sibling of the aggregate buried in ``_build_zoo_context``'s rejected
+        branch, extracted so the RESEED DIGEST (the direction planner's input)
+        can state the same measured direction. The reseed planner picks the
+        operator family and the sign frame; without this block it never sees
+        that -- measured on this run -- the realized IC has been predominantly
+        one sign, so it keeps emitting the opposite-framed hypotheses.
+
+        Measurement only: states the negative share with a minimum sample (8),
+        closes "yours to determine", names no market and no remedy. Reads the
+        per-factor tearsheet (``rank_ic_neutral`` then ``rank_ic``) so it works
+        on the PERSISTED pool (where the top-level ``rank_ic_own`` is absent)
+        as well as the live in-memory one. Returns ``[]`` under the minimum
+        sample so the lesson is never asserted from a handful of points.
+        """
+        signed = []
+        for t in trajectories:
+            sheets = (t.backtest_metrics or {}).get("factor_tearsheets")
+            if isinstance(sheets, dict):
+                rows = sheets.values()
+            elif isinstance(sheets, list):
+                rows = sheets
+            else:
+                rows = []
+            for s in rows:
+                if not isinstance(s, dict):
+                    continue
+                v = s.get("rank_ic_neutral")
+                if v is None:
+                    v = s.get("rank_ic")
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv == fv:
+                    signed.append(fv)
+        if len(signed) < 8:
+            return []
+        neg = sum(1 for v in signed if v < 0)
+        return [
+            "## Direction, measured across this run",
+            f"- {neg} of {len(signed)} factors scored so far realized a "
+            f"NEGATIVE information coefficient "
+            f"({100.0 * neg / len(signed):.0f}%).",
+            "- This is the measured outcome on this market over this period, "
+            "not an assumption. What it implies for the next hypothesis is "
+            "yours to determine.",
+        ]
+
+    def _admitted_expressions(self) -> list[str]:
+        """Factor expressions the gate counts as the exercised population.
+
+        Mirrors ``_build_zoo_context``'s ``_is_admitted`` split on VERDICT
+        (admitted/replaced/bootstrap), never the stale ``admitted`` flag, so
+        the novelty gate's "top-K exercised" set matches the coverage block the
+        reseed digest already shows.
+        """
+        out = []
+        for t in self.pool.get_all():
+            m = t.backtest_metrics or {}
+            v = str(m.get("verdict") or "").strip().lower()
+            if v:
+                is_adm = v in ("admitted", "replaced", "bootstrap")
+            else:
+                is_adm = bool(m.get("admitted", m.get("feasible", True)))
+            if not is_adm:
+                continue
+            for f in (t.factors or []):
+                e = (f.get("expression") or "") if isinstance(f, dict) else ""
+                if e:
+                    out.append(e)
+        return out
+
+    def _what_worked_well_block(self) -> list[str]:
+        """The strongest ADMITTED factors by |t|, across every round and phase.
+
+        The reseed digest already states what FAILED (``_failure_patterns``)
+        and the measured sign (``_sign_direction_block``), and it showed what
+        WORKED only as thin per-direction admit snippets (capped at 3, truncated
+        to 80 chars). This is the ranked, cross-direction view: the top factors
+        that actually cleared the gate, by their solo neutralized |t| -- a
+        concrete quality bar the planner can read, not a family hint (the
+        coverage block + the operator-novelty gate handle family novelty).
+
+        Scans ALL phases (original + mutation + crossover) via ``get_all`` so a
+        bred winner -- a mutation child that beat its parent -- surfaces, not
+        only the original directions. Measurement only: states each factor's
+        |t| / IC / horizon / operator family, names no remedy and no market,
+        closes "yours to determine" -- the same diagnose-never-prescribe rule
+        the other digest blocks follow. Always on: "what worked" is baseline
+        context for a reseed, not an opt-in. Returns [] when no admitted factor
+        has a tearsheet, so the empty-history digest stays empty.
+        """
+        from quantaalpha.factors.operator_coverage import extract_operators
+
+        rows = []  # (abs_t, expr, rank_ic_neutral, best_horizon)
+        for t in self.pool.get_all():
+            m = t.backtest_metrics or {}
+            v = str(m.get("verdict") or "").strip().lower()
+            if v:
+                is_adm = v in ("admitted", "replaced", "bootstrap")
+            else:
+                is_adm = bool(m.get("admitted", m.get("feasible", True)))
+            if not is_adm:
+                continue
+            sheets = m.get("factor_tearsheets")
+            if not isinstance(sheets, dict):
+                continue
+            for expr, sheet in sheets.items():
+                if not isinstance(sheet, dict):
+                    continue
+                try:
+                    at = abs(float(sheet.get("t_nw")))
+                except (TypeError, ValueError):
+                    continue
+                if at != at:  # NaN
+                    continue
+                rows.append((at, str(expr),
+                             sheet.get("rank_ic_neutral"),
+                             sheet.get("best_horizon")))
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r[0], reverse=True)
+        top = rows[:8]
+        out = [
+            "## What worked well (strongest admitted factors by |t|, all rounds)",
+            f"- {len(rows)} admitted factors scored so far; the {len(top)} strongest:",
+        ]
+        for at, expr, ric, h in top:
+            fam = sorted(set(extract_operators(expr))) or ["(bare)"]
+            ric_s = f" ric={format_metric(ric)}" if ric is not None else ""
+            out.append(
+                f"- |t|={at:.2f}{ric_s} h={h} ops={','.join(fam)} :: {expr[:90]}"
+            )
+        out.append(
+            "- Stated as measurement only, not an assumption. What it implies "
+            "for the next hypothesis is yours to determine."
+        )
+        return out
+
+    def _regime_conditional_block(self) -> list[str]:
+        """The crash-fragility of ADMITTED factors, for the reseed direction planner.
+
+        Sibling of ``_what_worked_well_block``: the same admitted factors, this
+        time read for their regime-conditional IC (``ic_crash``/``ic_rally`` in
+        the per-factor tearsheet). The per-batch generator already sees each
+        factor's own crash/rally IC through the feedback channel; the reseed
+        planner sees only this digest, so without this block a new direction is
+        proposed blind to which admitted construction patterns invert on the
+        worst 20% of days (by the day's cross-sectional return) and which hold.
+
+        Measurement only: states the count that invert vs hold on the worst
+        20% of days, and the extreme factors either way, names no market and no
+        remedy, closes "yours to determine". Returns [] when fewer than 6
+        admitted factors carry an ic_crash, so the lesson is never asserted from
+        a handful and pre-restart tearsheets (which predate the metric and lack
+        it) keep the empty digest empty rather than erroring.
+        """
+        rows = []  # (ic_crash, ic_rally, expr)
+        for t in self.pool.get_all():
+            m = t.backtest_metrics or {}
+            v = str(m.get("verdict") or "").strip().lower()
+            if v:
+                is_adm = v in ("admitted", "replaced", "bootstrap")
+            else:
+                is_adm = bool(m.get("admitted", m.get("feasible", True)))
+            if not is_adm:
+                continue
+            sheets = m.get("factor_tearsheets")
+            if not isinstance(sheets, dict):
+                continue
+            for expr, sheet in sheets.items():
+                if not isinstance(sheet, dict):
+                    continue
+                try:
+                    cc = float(sheet.get("ic_crash"))
+                    rr = float(sheet.get("ic_rally"))
+                except (TypeError, ValueError):
+                    continue
+                if cc != cc or rr != rr:  # NaN -- pre-restart tearsheet or a miss
+                    continue
+                rows.append((cc, rr, str(expr)))
+        if len(rows) < 6:
+            return []
+        rows.sort(key=lambda r: r[0])
+        n = len(rows)
+        k = min(4, n // 3)
+        fragile_n = sum(1 for r in rows if r[0] <= 0)
+        out = [
+            "## Regime-conditional IC of admitted factors",
+            f"- {n} admitted factors carry a regime-conditional IC. On the worst "
+            f"20% of days (by the day's cross-sectional return), {fragile_n} of "
+            f"them have ic_crash <= 0 (the edge inverts or vanishes when the "
+            f"cross-section falls) and {n - fragile_n} have ic_crash > 0 (it holds).",
+            "- Most inversion on the worst 20% of days (lowest ic_crash):",
+        ]
+        for cc, rr, expr in rows[:k]:
+            out.append(f"  - ic_crash={cc:+.4f} ic_rally={rr:+.4f} :: {expr[:90]}")
+        out.append("- Most holding on the worst 20% of days (highest ic_crash):")
+        for cc, rr, expr in rows[-k:]:
+            out.append(f"  - ic_crash={cc:+.4f} ic_rally={rr:+.4f} :: {expr[:90]}")
+        out.append(
+            "- Stated as measurement only, not an assumption. What it implies "
+            "for the next direction is yours to determine."
+        )
+        return out
+
+    def _hypothesis_operators(self, text: str) -> set[str]:
+        """Declared operator names a direction's hypothesis text names.
+
+        The direction is a hypothesis string (``A high 14-day RSI predicts
+        LOWER``), not yet a factor expression, so ``extract_operators`` (which
+        parses an AST) cannot run on it. A word-boundary scan against the
+        declared operator set is the reliable subset: it catches an explicitly
+        named operator (``RSI``, ``TS_SKEW``, ``MACD``) and misses a vaguely
+        worded one (``20-day average`` for ``TS_MEAN``) -- which errs toward
+        REJECTING the vague case (forcing a named operator on retry), the side
+        the monoculture-break wants.
+        """
+        from quantaalpha.factors.operator_coverage import DECLARED_OPERATORS
+        text = text or ""
+        return {
+            op for op in DECLARED_OPERATORS
+            if re.search(rf"\b{re.escape(op)}\b", text)
+        }
+
+    def _filter_novel_directions(
+        self, new_dirs: list[str], digest: str
+    ) -> list[str]:
+        """Direction-level operator-novelty gate (env-gated, default off).
+
+        Keeps only directions whose hypothesis names an operator OUTSIDE the
+        top-K most-exercised in the admitted zoo, so a reseed cannot refill the
+        population with more of the same monoculture (measured: TS_MEAN 59% of
+        the zoo, 23 of 56 operators never exercised). A gate is allowed to be
+        prescriptive (``rho_max``, ``marginal_er`` are); the PROMPT stays
+        diagnose-never-prescribe, so a rejection feeds back a MEASUREMENT (the
+        unused operators from coverage), not a remedy.
+
+        If every direction is rejected, one retry is attempted with that
+        measurement appended to the digest -- the LLM sees "your directions
+        exercised only {top-K}; the population has not yet exercised {unused}"
+        (data) and produces a second batch. Still empty after retry => the
+        reseed produces nothing this round (the existing no-reseed path).
+        """
+        if not new_dirs:
+            return new_dirs
+        if os.environ.get("QA_RESEED_OP_NOVELTY_GATE", "").lower() not in (
+                "1", "true", "yes", "on"):
+            return new_dirs
+        k = int(os.environ.get("QA_RESEED_OP_TOPK", "3"))
+        admitted_exprs = self._admitted_expressions()
+        if not admitted_exprs:
+            # No exercised population to measure against (early run): cannot
+            # call anything a monoculture, so do not gate.
+            return new_dirs
+        from quantaalpha.factors.operator_coverage import (
+            coverage_block, top_exercised_operators,
+        )
+        top_k = set(top_exercised_operators(admitted_exprs, k))
+
+        def _novel(d):
+            return self._hypothesis_operators(d) - top_k
+
+        kept = [d for d in new_dirs if _novel(d)]
+        rejected = [d for d in new_dirs if not _novel(d)]
+        logger.info(
+            f"operator-novelty gate: kept {len(kept)}/{len(new_dirs)} "
+            f"(top-{k} exercised = {sorted(top_k)}); rejected {len(rejected)}")
+        if not rejected:
+            return kept
+        if kept:
+            return kept
+        # All rejected: retry once with the rejection restated as a measurement
+        # (the unused operators), never as a directive.
+        unused = coverage_block(admitted_exprs)
+        retry_measurement = (
+            "\n\n## Operator-novelty outcome\n"
+            f"The previous directions exercised only the top-{k} most-used "
+            f"operators ({', '.join(sorted(top_k))}) and named no operator "
+            "outside that set.\n" + (unused or "")
+        )
+        retry = self._generate_informed_directions(digest + retry_measurement)
+        retry_kept = [d for d in retry if _novel(d)] if retry else []
+        if retry_kept:
+            logger.info(
+                f"operator-novelty gate: retry produced {len(retry_kept)} novel "
+                f"direction(s)")
+            return retry_kept
+        logger.warning(
+            f"operator-novelty gate: all {len(rejected)} rejected and retry "
+            f"yielded nothing novel; reseed produces no directions this round")
+        return []
 
     def _rounds_exhausted(self) -> bool:
         """Should evolution stop?

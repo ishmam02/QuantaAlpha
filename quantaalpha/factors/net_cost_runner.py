@@ -347,17 +347,12 @@ class NetCostFactorRunner(QlibFactorRunner):
         self._contributions: dict[str, float] = {}
         # Cadence counter for contribution-based eviction.
         self._rounds_since_evict = 0
-        # Across-batch cache for the marginal-er gate's repo-repo |Spearman|
-        # block (the O(zoo**2) term). The block is a pure function of the held
-        # signals on the eval panel, so it is keyed by the repo COMPOSITION
-        # plus the (start, end) window the panel was built on. A reject batch
-        # leaves the zoo unchanged -> the key matches -> the block is reused
-        # instead of rebuilt (O(zoo**2) -> O(1) on ~60% of batches). An
-        # admit/replace/evict changes the composition -> key mismatch ->
-        # rebuild once, then cached. n_factors is 1 (one candidate per batch),
-        # which is what made the old per-call local cache a build-and-discard
-        # no-op and the instance cache the actual win. One entry only.
-        self._mer_cache = None
+        # The marginal-er gate's repo-repo |Spearman| block lives in the SHARED
+        # ``spearman_block_cached`` cache (metrics.py), keyed by the held-zoo
+        # signal set + panel grid -- the SAME block operator.evaluate builds
+        # earlier in the batch (same held zoo, same panel), so the two share one
+        # O(zoo**2) build. No instance field: a replace pop changes the repo ->
+        # the next candidate's key misses -> rebuild.
         # One EvaluationOperator per admission test seed, reused for the
         # whole run so the panel and baseline caches survive across batches.
         self._seed_ops: dict[int, EvaluationOperator] = {}
@@ -736,7 +731,7 @@ class NetCostFactorRunner(QlibFactorRunner):
         from quantaalpha.eval.metrics import (
             _cross_sectional_corr, _slice, label_frame_at, rho_max, rho_max_arg,
             newey_west_t, quantile_metrics, effective_rank,
-            effective_rank_cached, spearman_abs_matrix,
+            effective_rank_cached, spearman_abs_matrix, spearman_block_cached,
         )
 
         adm = self.theta.admission
@@ -827,10 +822,11 @@ class NetCostFactorRunner(QlibFactorRunner):
 
         kept, notes, replaced = [], [], []
         self._last_tearsheets = {}
-        # Marginal-er gate cache is instance-level now (self._mer_cache, set up
-        # in __init__): the repo-repo |Spearman| block survives across batches,
-        # keyed by repo composition + eval window, so a reject batch reuses the
-        # prior block instead of rebuilding it every batch.
+        # Marginal-er gate's repo-repo |Spearman| block is the SHARED
+        # spearman_block_cached (metrics.py), keyed by held-zoo signal set +
+        # panel grid -- the same block operator.evaluate built earlier this
+        # batch. Survives across reject batches; a replace/admit/evict changes
+        # the signal set and misses.
 
         for expr, signal in candidates.items():
             sig_raw = align_signal(signal, panel)
@@ -896,9 +892,33 @@ class NetCostFactorRunner(QlibFactorRunner):
                                 if len(_raw_ic) >= 100 else float("nan"))
             except Exception:
                 _raw_rank_ic = float("nan")
+            # REGIME-CONDITIONAL IC (per-factor). The mean IC (ric) collapses
+            # every day into one number; the edge is not always uniform across
+            # market regimes. Bin the winning-horizon per-day IC by the day's
+            # own cross-sectional return -- the equal-weight mean of the forward
+            # return across the universe, the same label the IC is measured
+            # against -- so the regime boundary is contemporaneous and defined
+            # relative to THIS universe's own return distribution, not by any
+            # external calendar or named index. Measurement only; what to do
+            # about a regime-concentrated edge is the model's call.
+            try:
+                _ic = _cross_sectional_corr(sliced, labels[h], "spearman").dropna()
+                _mkt = labels[h].where(panel.universe).mean(axis=1).reindex(_ic.index)
+                _good = _mkt.notna() & _ic.notna()
+                _ic, _mkt = _ic[_good], _mkt[_good]
+                if len(_ic) >= 100:
+                    _lo = float(_mkt.quantile(0.20))
+                    _hi = float(_mkt.quantile(0.80))
+                    _ic_crash = float(_ic[_mkt <= _lo].mean())
+                    _ic_rally = float(_ic[_mkt >= _hi].mean())
+                else:
+                    _ic_crash = _ic_rally = float("nan")
+            except Exception:
+                _ic_crash = _ic_rally = float("nan")
             sheet.update({"rank_ic_neutral": ric, "t_nw": t, "best_horizon": h,
                           "ic_pos_frac": pos, "n_obs": n,
-                          "rank_icir": _icir, "rank_ic": _raw_rank_ic})
+                          "rank_icir": _icir, "rank_ic": _raw_rank_ic,
+                          "ic_crash": _ic_crash, "ic_rally": _ic_rally})
 
 
             # MULTIPLE TESTING across the whole search, not just this factor.
@@ -1156,11 +1176,11 @@ class NetCostFactorRunner(QlibFactorRunner):
                     # actually stand, otherwise two near-clones can both "beat"
                     # an incumbent that only one of them replaces.
                     self._repository.pop(near, None)
-                    # a row/column left the repo -> the block is stale. The
-                    # key check at the next candidate would catch this too (the
-                    # composition changed); drop it now defensively so the
-                    # rebuild happens on the post-pop zoo, not the cached one.
-                    self._mer_cache = None
+                    # a row/column left the repo -> the held-zoo signal set
+                    # changed, so the next candidate's spearman_block_cached key
+                    # misses and rebuilds on the post-pop zoo. Nothing to drop
+                    # here: the shared cache is keyed by the signal set, not held
+                    # in an instance field.
                     replaced.append((near, expr, cand_score, inc_score, rho))
                     logger.info("repository: REPLACE %s (|t| %.2f) with %s "
                                 "(|t| %.2f), rho %.3f",
@@ -1194,26 +1214,21 @@ class NetCostFactorRunner(QlibFactorRunner):
             # frozen admission path is byte-identical.
             if _min_mer and _held:
                 try:
-                    # Reuse the cached repo-repo |Spearman| block; only the
-                    # kept batch-mates and this candidate are fresh. The block
-                    # is keyed by the repo COMPOSITION + the eval window the
-                    # panel was built on -- a pure function of those -- so a
-                    # matching key means the cached R_repo is valid. A reject
-                    # batch (zoo unchanged) hits and skips the O(zoo**2) build;
-                    # an admit/replace/evict changes the composition and misses.
-                    # Within a batch the repo changes only on a replace (the
-                    # pop below); across batches only on admit/replace/evict,
-                    # so the key is the exact invalidation signal. Eigenvalues
-                    # are permutation-invariant, so the cached path is
-                    # bit-identical to the uncached one (verdict unchanged).
-                    _mer_key = (tuple(sorted(self._repository)), start, end)
-                    if self._mer_cache is None or self._mer_cache[0] != _mer_key:
-                        _repo_sigs = {
-                            e: s for e, (s, _) in self._repository.items()}
-                        self._mer_cache = (
-                            _mer_key, spearman_abs_matrix(_repo_sigs),
-                            _repo_sigs)
-                    _R_repo, _repo_sigs = self._mer_cache[1], self._mer_cache[2]
+                    # Reuse the SHARED repo-repo |Spearman| block; only the kept
+                    # batch-mates and this candidate are fresh. The block is
+                    # keyed by the repo signal set + the panel grid, so it is
+                    # the SAME block operator.evaluate built earlier this batch
+                    # (same held zoo, same panel) -- one O(zoo**2) build per
+                    # batch, not two. A reject batch (zoo unchanged) hits; an
+                    # admit/replace/evict (or the replace pop below) changes the
+                    # signal set and misses -> rebuild. _repo_sigs is rebuilt
+                    # every candidate (cheap dict comprehension), so a mid-batch
+                    # replace is reflected in the key on the next candidate.
+                    # Eigenvalues are permutation-invariant and the block is
+                    # built in the repository's insertion order (as before), so
+                    # the shared block is bit-identical to a fresh build.
+                    _repo_sigs = {e: s for e, (s, _) in self._repository.items()}
+                    _R_repo = spearman_block_cached(_repo_sigs, (start, end))
                     _kept_sigs = {e: s for e, s, _t, _r, _h in kept}
                     _er_held = effective_rank_cached(
                         _R_repo, _repo_sigs, _kept_sigs)
@@ -2021,6 +2036,25 @@ class NetCostFactorRunner(QlibFactorRunner):
                  if isinstance(v, dict) and v.get("t_nw") is not None
                  and float(v["t_nw"]) == float(v["t_nw"])),
                 default=None),
+            # The factor's own regime-conditional IC, promoted from the
+            # per-factor tear sheet so the mutation/refine and crossover-strength
+            # diagnoses (which read top-level backtest_metrics through the shared
+            # _METRIC_GLOSS in llm_diagnosis) can see crash-fragility -- the one
+            # measurement that varies per factor but not at the book level. First
+            # non-NaN factor, matching rank_ic_own; for a single-factor bred
+            # parent that is the factor being refined.
+            "ic_crash": next(
+                (float(v["ic_crash"]) for v in
+                 (res.get("factor_tearsheets") or {}).values()
+                 if isinstance(v, dict) and v.get("ic_crash") is not None
+                 and float(v["ic_crash"]) == float(v["ic_crash"])),
+                None),
+            "ic_rally": next(
+                (float(v["ic_rally"]) for v in
+                 (res.get("factor_tearsheets") or {}).values()
+                 if isinstance(v, dict) and v.get("ic_rally") is not None
+                 and float(v["ic_rally"]) == float(v["ic_rally"])),
+                None),
             "factor_tearsheets": res.get("factor_tearsheets") or {},
             "admitted_exprs": res.get("admitted_exprs") or [],
             # Book-level deflation, present only on batches that priced a book.

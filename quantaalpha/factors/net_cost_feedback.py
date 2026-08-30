@@ -53,6 +53,8 @@ _RAW_METRICS: tuple[tuple[str, str, str], ...] = (
      "{:+.3f}"),
     ("best_horizon", "Horizon where the edge is strongest (days)", "{:.0f}"),
     ("ic_pos_frac", "Days the IC keeps its sign", "{:.1%}"),
+    ("ic_crash", "Rank IC on the worst 20% of days (by cross-sectional return)", "{:+.4f}"),
+    ("ic_rally", "Rank IC on the best 20% of days (by cross-sectional return)", "{:+.4f}"),
     ("monotonicity", "Decile monotonicity (1 = clean gradient, 0 = tails only)", "{:+.2f}"),
     ("q_spread", "Top-decile minus bottom-decile return", "{:+.4f}"),
     ("ls_sharpe", "Long/short Sharpe (dollar-neutral, before cost)", "{:+.2f}"),
@@ -133,6 +135,17 @@ _METRIC_HELP: dict[str, str] = {
                     "chosen by measurement across 1/5/20 days rather than assumed.",
     "ic_pos_frac": "share of days the correlation kept its sign. Near 50% means "
                    "the edge came from a few days rather than persistently.",
+    "ic_crash": "the factor's rank IC averaged over the 20% of days with the worst "
+                "cross-sectional return (the equal-weight mean of the forward return "
+                "across the universe). An overall IC that turns negative on these days "
+                "is an edge that did not hold when the cross-section fell in the window "
+                "measured; a gap between this and ic_rally means the edge is "
+                "regime-concentrated, not uniform. What to do about it is yours to "
+                "determine.",
+    "ic_rally": "the factor's rank IC averaged over the 20% of days with the best "
+                "cross-sectional return. Read alongside ic_crash: an edge present only "
+                "on these days is regime-conditional. What to do about it is yours to "
+                "determine.",
     "monotonicity": "does return rise steadily from the bottom decile to the top, "
                     "or only at the extremes. A tails-only signal cannot be held "
                     "by a book that owns a few dozen of a few hundred names.",
