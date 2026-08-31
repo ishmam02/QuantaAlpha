@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import json
+import os
 import threading
 
 from quantaalpha.log import logger
@@ -145,9 +147,8 @@ class EvolutionController:
             
             Returns None if evolution is complete.
         """
-        # Check if we've reached max rounds
-        if self._current_round >= self.config.max_rounds:
-            logger.info(f"Evolution complete: reached max rounds ({self.config.max_rounds})")
+        # Round budget: max_rounds, or QA_TARGET_MINED-driven (_rounds_exhausted)
+        if self._rounds_exhausted():
             return None
         
         # Phase: ORIGINAL
@@ -174,8 +175,10 @@ class EvolutionController:
         Returns:
             List of task dictionaries, or empty list if phase is complete
         """
-        # Check if we've reached max rounds
-        if self._current_round >= self.config.max_rounds:
+        # Round budget: max_rounds, or QA_TARGET_MINED-driven (_rounds_exhausted).
+        # Also the RECURSION BOUND -- every phase transition below re-enters this
+        # method, and only this guard ends that chain.
+        if self._rounds_exhausted():
             return []
         
         tasks = []
@@ -858,9 +861,85 @@ class EvolutionController:
         
         return metrics
     
+    def _library_size(self) -> int:
+        """How many factors this run has actually mined.
+
+        Reads the same file ``loop.py`` writes, chosen the same way
+        (``FACTOR_LIBRARY_SUFFIX``), so the count is the run's real output
+        rather than an estimate. Returns -1 when the size cannot be read; the
+        caller then falls back to ``max_rounds`` instead of extending blindly.
+        """
+        suffix = os.environ.get("FACTOR_LIBRARY_SUFFIX", "")
+        name = f"all_factors_library_{suffix}.json" if suffix else "all_factors_library.json"
+        path = Path("data") / "factorlib" / name
+        if not path.exists():
+            return 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return len(json.load(f).get("factors", {}))
+        except Exception as exc:
+            logger.warning(f"cannot size the factor library ({exc}); stopping at max_rounds")
+            return -1
+
+    def _rounds_exhausted(self) -> bool:
+        """Should evolution stop?
+
+        ``max_rounds`` alone cannot deliver a fixed factor count. The round
+        budget is sized from ``batches = D + D + C*(R-2)`` times
+        ``factors_per_hypothesis``, which is an UPPER estimate: a factor whose
+        implementation fails to produce a usable signal is dropped and nothing
+        replaces it, so a run configured for exactly 150 reliably finishes
+        short. When the run's purpose is a 150-factor comparison, finishing at
+        143 is not a smaller result -- it is a different experiment.
+
+        ``QA_TARGET_MINED`` makes the budget follow the outcome instead of the
+        estimate: keep mining until the library actually holds that many
+        factors. ``QA_MAX_ROUNDS_CAP`` bounds the cost, and bounds the
+        recursion in the phase getters, which re-enter themselves on every
+        phase transition and terminate only because this returns True.
+        """
+        if self._current_round < self.config.max_rounds:
+            return False
+
+        target = os.environ.get("QA_TARGET_MINED")
+        if not target:
+            logger.info(f"Evolution complete: reached max rounds ({self.config.max_rounds})")
+            return True
+        try:
+            target_n = int(target)
+        except ValueError:
+            logger.warning(f"QA_TARGET_MINED={target!r} is not an integer; ignoring")
+            return True
+        if target_n <= 0:
+            return True
+
+        mined = self._library_size()
+        if mined < 0:
+            return True
+        if mined >= target_n:
+            logger.info(
+                f"Evolution complete: library holds {mined} mined factor(s) "
+                f">= QA_TARGET_MINED={target_n} after round {self._current_round}"
+            )
+            return True
+
+        cap = int(os.environ.get("QA_MAX_ROUNDS_CAP", self.config.max_rounds * 3))
+        if self._current_round >= cap:
+            logger.warning(
+                f"Evolution stopping at the cap ({cap} rounds) with "
+                f"{mined}/{target_n} mined factors."
+            )
+            return True
+
+        logger.info(
+            f"Extending evolution: {mined}/{target_n} mined factor(s) "
+            f"after round {self._current_round} (cap {cap})"
+        )
+        return False
+
     def is_complete(self) -> bool:
         """Check if evolution is complete."""
-        return self._current_round >= self.config.max_rounds
+        return self._rounds_exhausted()
     
     def get_best_trajectories(self, top_n: int = 5) -> list[StrategyTrajectory]:
         """Get the best performing trajectories."""

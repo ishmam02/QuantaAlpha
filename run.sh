@@ -30,6 +30,46 @@ else
 fi
 
 # =============================================================================
+# Parity with main -- the comparison arm must differ in the ALGORITHM, not the
+# environment. Every override below exists because sourcing .env assigns the
+# variable unconditionally, so a pre-exported value is silently clobbered.
+# =============================================================================
+# Per-run LLM swaps without editing .env (a model change is a confound, so both
+# arms must be pointable at one model from outside).
+if [ -n "${QA_CHAT_SEED:-}" ]; then
+    export CHAT_SEED="${QA_CHAT_SEED}"
+fi
+if [ -n "${QA_CHAT_MODEL:-}" ]; then
+    export CHAT_MODEL="${QA_CHAT_MODEL}"
+fi
+if [ -n "${QA_REASONING_MODEL:-}" ]; then
+    export REASONING_MODEL="${QA_REASONING_MODEL}"
+fi
+
+# Thread budget. The tracked configs ask for 20 LightGBM threads, which
+# oversubscribes an 8-core box 2.5x on its own and thrashes once several
+# instances share it.
+if [ -n "${QA_THREADS:-}" ]; then
+    export OMP_NUM_THREADS="${QA_THREADS}"
+    export MKL_NUM_THREADS="${QA_THREADS}"
+    export OPENBLAS_NUM_THREADS="${QA_THREADS}"
+    export NUMEXPR_NUM_THREADS="${QA_THREADS}"
+    export LGBM_NUM_THREADS="${QA_THREADS}"
+fi
+
+# Determinism. PYTHONHASHSEED must be set BEFORE the interpreter starts; setting
+# it inside Python is too late.
+export PYTHONHASHSEED="${QA_SEED:-42}"
+
+# Refuse the treatment arm's wiring. This branch is the BASELINE: it has no
+# quantaalpha/eval protocol and no net-cost runner, so if a shell that last ran
+# main still exports these, the baseline would either crash on an import that
+# does not exist here or, worse, half-adopt the treatment's evaluation and stop
+# being a baseline. Unset rather than trust the caller's shell to be clean.
+unset QLIB_FACTOR_RUNNER QLIB_FACTOR_SUMMARIZER QA_PROTOCOL QA_LEDGER \
+      QA_PRIMARY_METRIC QA_REQUIRE_FEASIBLE QA_TARGET_ZOO
+
+# =============================================================================
 # Activate conda environment
 # =============================================================================
 eval "$(conda shell.bash hook)" 2>/dev/null
@@ -121,9 +161,29 @@ fi
 DIRECTION="$1"
 LIBRARY_SUFFIX="$2"
 
+# Per-run library. Without a suffix the library is the SHARED
+# data/factorlib/all_factors_library.json, and FactorLibraryManager._load()
+# reads it before appending -- so a second baseline run starts holding the
+# first run's factors, reaches the target without mining them, and reports a
+# 150-factor result it did not produce. Defaulting the suffix to EXPERIMENT_ID
+# makes every run write its own file and start genuinely empty.
+#
+# Precedence: positional $2 > a pre-set FACTOR_LIBRARY_SUFFIX > EXPERIMENT_ID.
+# Exporting FACTOR_LIBRARY_SUFFIX="" deliberately selects the shared file.
 if [ -n "${LIBRARY_SUFFIX}" ]; then
     export FACTOR_LIBRARY_SUFFIX="${LIBRARY_SUFFIX}"
+elif [ -z "${FACTOR_LIBRARY_SUFFIX+x}" ]; then
+    export FACTOR_LIBRARY_SUFFIX="${EXPERIMENT_ID}"
 fi
+
+# Factor-count target. max_rounds alone gives an UPPER estimate
+# (D + D + C*(R-2) batches x factors_per_hypothesis); every factor whose
+# implementation fails to yield a usable signal is dropped with nothing to
+# replace it, so a run configured for exactly 150 finishes short. The
+# controller extends past max_rounds until the library actually holds this
+# many, bounded by QA_MAX_ROUNDS_CAP.
+export QA_TARGET_MINED="${QA_TARGET_MINED:-150}"
+export QA_MAX_ROUNDS_CAP="${QA_MAX_ROUNDS_CAP:-60}"
 
 echo ""
 echo "Starting experiment..."
