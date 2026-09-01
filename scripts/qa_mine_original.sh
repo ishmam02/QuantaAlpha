@@ -43,6 +43,15 @@ export QA_REASONING_MODEL="${QA_REASONING_MODEL:-glm-5.2:cloud}"
 export QA_TARGET_MINED="${QA_TARGET_MINED:-150}"
 export QA_MAX_ROUNDS_CAP="${QA_MAX_ROUNDS_CAP:-60}"
 
+# Force the console-script `quantaalpha mine` (run.sh) to import THIS worktree's
+# original-branch code, not the pip editable install (which points at the main
+# repo and would silently run the treatment arm's code). The editable install is
+# a plain .pth path entry in site-packages, so prepending the worktree to
+# PYTHONPATH shadows it. Verified: from a neutral CWD, PYTHONPATH=<worktree> ->
+# qa_orig_mine/quantaalpha; without it -> QuantaAlpha/quantaalpha (main).
+# We are in the worktree root already (cd at top of this script), so $PWD is it.
+export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
+
 echo "arm       : BASELINE (original)"
 echo "config    : ${CONFIG_PATH}"
 echo "model     : ${QA_CHAT_MODEL}"

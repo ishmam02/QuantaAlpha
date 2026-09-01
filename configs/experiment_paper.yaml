@@ -60,7 +60,7 @@ evolution:
   # Flow: both enabled → round 0=original, 1=mutation, 2=crossover, ...
   #       mutation only → round 0=original, 1+=mutation, ...
   #       crossover only → round 0=original, 1+=crossover, ...
-  max_rounds: 5
+  max_rounds: 15
 
   # Crossover: number of parents selected per crossover operation
   crossover_size: 2
@@ -90,7 +90,7 @@ evolution:
   top_percent_threshold: 0.3
 
   # Fresh start: true=each experiment starts with empty trajectory pool; false=load existing if available
-  fresh_start: true
+  fresh_start: false
 
   # Cleanup on finish: true=delete trajectory pool file after experiment; false=keep for analysis
   cleanup_on_finish: false
@@ -101,7 +101,7 @@ evolution:
 # ============================================================
 quality_gate:
   # Consistency check (hypothesis–description–expression). Uses LLM to verify and correct expression if needed
-  consistency_enabled: false
+  consistency_enabled: true
 
   # Complexity check: symbol length, base features count, free args ratio
   complexity_enabled: true
@@ -121,18 +121,18 @@ quality_gate:
 # ============================================================
 factor:
   # Number of factors to generate per hypothesis
-  factors_per_hypothesis: 3
+  factors_per_hypothesis: 1
 
   # Complexity constraints (important for preventing overfitting; keep symbol length under ~250)
   complexity:
-    symbol_length_threshold: 200
+    symbol_length_threshold: 250
     base_features_threshold: 5
     free_args_ratio_threshold: 0.5
 
   # Uniqueness/duplication checking against factor zoo
   duplication:
     enabled: true
-    threshold: 5
+    threshold: 8
     factor_zoo_path: null # Use default when null
 
 # ============================================================
