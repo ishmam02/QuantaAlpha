@@ -1,0 +1,294 @@
+{
+  "question": "do mutation / crossover / reseed make the factors better?",
+  "note": "within-library comparison only -- each mine is judged against itself, so differing cost models, splits and stored metrics across the two libraries do not enter",
+  "mines": {
+    "main": {
+      "n_nodes": 161,
+      "resolvable_parent_links": 155,
+      "lineage_available": true,
+      "operators": {
+        "mutation": {
+          "n": 66,
+          "vs_best_parent": {
+            "n": 56,
+            "wins": 30,
+            "win_rate": 0.5357142857142857,
+            "p_binom_gt_half": 0.3444398803616697,
+            "p_wilcoxon": 0.10600931803643099,
+            "mean_delta": 0.003731966939448478,
+            "median_delta": 0.0009269707750363086
+          },
+          "beat_all_parents_rate": 0.45454545454545453,
+          "beat_any_parent_rate": 0.45454545454545453,
+          "chance_beat_all": 0.5,
+          "chance_beat_any": 0.5,
+          "admitted_rate": 0.3181818181818182,
+          "fix_from_failure_rate": 0.1836734693877551,
+          "fix_from_failure_n": 49
+        },
+        "crossover": {
+          "n": 43,
+          "vs_best_parent": {
+            "n": 43,
+            "wins": 7,
+            "win_rate": 0.16279069767441862,
+            "p_binom_gt_half": 0.9999991819379375,
+            "p_wilcoxon": 0.9999996172806505,
+            "mean_delta": -0.013508893264629123,
+            "median_delta": -0.012042170398592745
+          },
+          "beat_all_parents_rate": 0.16279069767441862,
+          "beat_any_parent_rate": 0.4883720930232558,
+          "chance_beat_all": 0.3333333333333333,
+          "chance_beat_any": 0.6666666666666666,
+          "admitted_rate": 0.37209302325581395,
+          "fix_from_failure_rate": 0.2807017543859649,
+          "fix_from_failure_n": 57
+        }
+      },
+      "phase_output_trend": {
+        "original": {
+          "n": 50,
+          "slope": 0.0007862688387425221,
+          "p": 0.024406330168024598,
+          "rho": 0.3579403744795602,
+          "null_95": 0.0006621292459146493,
+          "beats_null": true,
+          "early_mean": 0.021044865540352564,
+          "late_mean": 0.03467999642489408,
+          "mw_p_late_gt_early": 0.0022435197893846876
+        },
+        "mutation": {
+          "n": 67,
+          "slope": 0.00033804772038782216,
+          "p": 0.288440468302347,
+          "rho": 0.14769843236375235,
+          "null_95": 0.0006816414044106058,
+          "beats_null": false,
+          "early_mean": 0.02398582394976718,
+          "late_mean": 0.028705114602423712,
+          "mw_p_late_gt_early": 0.09166545810614668
+        },
+        "crossover": {
+          "n": 43,
+          "slope": 0.00012214919870906144,
+          "p": 0.703981351438826,
+          "rho": 0.025716378425024118,
+          "null_95": 0.0006252134353002368,
+          "beats_null": false,
+          "early_mean": 0.016561825716456507,
+          "late_mean": 0.020946927344212846,
+          "mw_p_late_gt_early": 0.2714007082009904
+        }
+      },
+      "rounds": [
+        0,
+        1,
+        2,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "median_per_round": [
+        0.016692705600701487,
+        0.02005997,
+        0.014225828151858681,
+        0.021093746132963116,
+        0.018617070699838003,
+        0.006437835909184732,
+        0.034721794470970846,
+        0.019714415470091784,
+        0.01963075639631634,
+        0.01564300526141503,
+        0.017970795084896858,
+        0.0398911382156489,
+        0.030355637565745306,
+        0.021076594171196783,
+        0.028322881054234264,
+        0.03093769813895413,
+        0.02675336400843223,
+        0.014763152353708354
+      ],
+      "mean_per_round": [
+        0.017948221483724932,
+        0.02381155721770808,
+        0.015168595498734337,
+        0.021634877462341,
+        0.015794851065035743,
+        0.012146039882661717,
+        0.0345287653752087,
+        0.022593187568666386,
+        0.024006500379792066,
+        0.022950400937610894,
+        0.02510748199096551,
+        0.04084426627882028,
+        0.03463439794812152,
+        0.0257671726408431,
+        0.030844322814300794,
+        0.028515726570967882,
+        0.02602725378021257,
+        0.014971765898613713
+      ],
+      "cum_best": [
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402,
+        0.05854930839609402
+      ],
+      "cum_zoo_mean": [
+        0.03346042775451121,
+        0.029742461290758,
+        0.027116120614988297,
+        0.027388927172128333,
+        0.02690175264254199,
+        0.02625134585693068,
+        0.027248785205050672,
+        0.029019880782143535,
+        0.029214998835026058,
+        0.02904864625709591,
+        0.02940134137451873,
+        0.030836677104510102,
+        0.03116300541801257,
+        0.030504370405528898,
+        0.030334594266273496,
+        0.030912422894129914,
+        0.0312248471469882,
+        0.0308014519373189
+      ],
+      "L1_no_anti_learning": {
+        "trend": {
+          "slope": 0.0004678048392376126,
+          "p": 0.11840862025889194,
+          "rho": 0.3519091847265222
+        },
+        "verdict": "PASS (flat or rising)"
+      },
+      "L2_zoo_improves": {
+        "trend": {
+          "slope": 8.135155252682659e-05,
+          "p": 0.24686669021782903,
+          "rho": 0.5108359133126935
+        },
+        "verdict": "flat"
+      },
+      "L3_bar_rises": {
+        "trend": {
+          "slope": 0.0,
+          "p": 1.0,
+          "rho": NaN
+        },
+        "first": 0.05854930839609402,
+        "last": 0.05854930839609402,
+        "verdict": "flat"
+      }
+    },
+    "original": {
+      "n_nodes": 51,
+      "resolvable_parent_links": 0,
+      "lineage_available": false,
+      "lineage_note": "parent_trajectory_ids are RECORDED but resolve to nothing: the original branch mints a trajectory id from a microsecond timestamp in two independent places (factor_mining.py:159 writes the library's trajectory_id; controller.py:737 mints the id that becomes a child's parent_trajectory_ids), so the same logical trajectory carries two different ids and the two id spaces are disjoint (38 parent refs vs 62 trajectory ids, 0 overlap, in the untrimmed 184-factor library). Per-operator child-vs-parent cannot be computed; the round-over-round learning definition (L1/L2/L3) still can, and is reported below.",
+      "operators": null,
+      "phase_output_trend": {
+        "mutation": {
+          "n": 21,
+          "slope": 0.0021969743,
+          "p": 0.01462369287719617,
+          "rho": 0.5560178451775125,
+          "null_95": 0.0017976249599999943,
+          "beats_null": true,
+          "early_mean": 0.029632792,
+          "late_mean": 0.03448715181818182,
+          "mw_p_late_gt_early": 0.011051852457781198
+        }
+      },
+      "rounds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "median_per_round": [
+        0.033182315,
+        0.02976627,
+        0.03568082,
+        0.035220045000000005,
+        0.038661650000000006,
+        0.0381333
+      ],
+      "mean_per_round": [
+        0.03310109,
+        0.029632792,
+        0.03498534888888889,
+        0.034122537,
+        0.037119484999999994,
+        0.0381333
+      ],
+      "cum_best": [
+        0.03677979,
+        0.03677979,
+        0.03761706,
+        0.04145494,
+        0.04180028,
+        0.04180028
+      ],
+      "cum_zoo_mean": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "L1_no_anti_learning": {
+        "trend": {
+          "slope": 0.0014565797142857154,
+          "p": 0.04258255674956039,
+          "rho": 0.8285714285714287
+        },
+        "verdict": "PASS (flat or rising)"
+      },
+      "L2_zoo_improves": {
+        "trend": null,
+        "verdict": "no zoo (no gate)"
+      },
+      "L3_bar_rises": {
+        "trend": {
+          "slope": 0.0012571942857142863,
+          "p": 0.009252584994228496,
+          "rho": 0.9710083124552245
+        },
+        "first": 0.03677979,
+        "last": 0.04180028,
+        "verdict": "PASS (rising)"
+      }
+    }
+  }
+}

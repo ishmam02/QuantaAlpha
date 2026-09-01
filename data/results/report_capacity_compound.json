@@ -1,0 +1,254 @@
+{
+  "window": [
+    "2017-01-01",
+    "2025-12-31"
+  ],
+  "navs": [
+    100000000.0,
+    500000000.0,
+    1000000000.0
+  ],
+  "note": "fixed = fund size constant (the production convention); compounding = fund grows with its own net return, so impact is charged against the fund's actual size that day",
+  "libraries": {
+    "main_full": {
+      "library": "data/factorlib/all_factors_library_meanvar_20260828_194432.json",
+      "by_nav": {
+        "100000000": {
+          "fixed": {
+            "n_factors": 147,
+            "excess_cagr": 0.10180589106319937,
+            "net_cagr": 0.17183354471783296,
+            "excess_ir": 0.6632039700552607,
+            "excess_mdd": -0.33964889494976236,
+            "cost_bps": 4.92580145016635,
+            "turnover": 0.10643456485509668,
+            "secs": 243.6
+          },
+          "compounding": {
+            "n_factors": 147,
+            "excess_cagr": 0.07835873229001633,
+            "net_cagr": 0.14691668196099328,
+            "excess_ir": 0.5102947086866361,
+            "excess_mdd": -0.41346261808688034,
+            "cost_bps": 5.810951652277144,
+            "turnover": 0.10643456485509668,
+            "secs": 34.2,
+            "nav_end": 360155142.3419357,
+            "nav_growth_x": 3.601551423419357,
+            "n_pricing_passes": 2
+          }
+        },
+        "500000000": {
+          "fixed": {
+            "n_factors": 147,
+            "excess_cagr": 0.055739260459249484,
+            "net_cagr": 0.12286936651125013,
+            "excess_ir": 0.3631240734166179,
+            "excess_mdd": -0.4465106576635376,
+            "cost_bps": 6.683891201825069,
+            "turnover": 0.10643456485509668,
+            "secs": 237.0
+          },
+          "compounding": {
+            "n_factors": 147,
+            "excess_cagr": 0.021555106649864486,
+            "net_cagr": 0.08654232043795629,
+            "excess_ir": 0.14036402925738636,
+            "excess_mdd": -0.5313247887278579,
+            "cost_bps": 8.038140440739774,
+            "turnover": 0.10643456485509668,
+            "secs": 33.5,
+            "nav_end": 1106901999.6191735,
+            "nav_growth_x": 2.213803999238347,
+            "n_pricing_passes": 2
+          }
+        },
+        "1000000000": {
+          "fixed": {
+            "n_factors": 147,
+            "excess_cagr": 0.02248191804901034,
+            "net_cagr": 0.08751934103488068,
+            "excess_ir": 0.14646471418421825,
+            "excess_mdd": -0.5150979947553773,
+            "cost_bps": 8.001261913329486,
+            "turnover": 0.10643456485509668,
+            "secs": 237.6
+          },
+          "compounding": {
+            "n_factors": 147,
+            "excess_cagr": -0.0119686377051883,
+            "net_cagr": 0.0509095881987891,
+            "excess_ir": -0.07794182525434293,
+            "excess_mdd": -0.5862057267035767,
+            "cost_bps": 9.411270599450946,
+            "turnover": 0.10643456485509668,
+            "secs": 33.7,
+            "nav_end": 1639903433.7025073,
+            "nav_growth_x": 1.6399034337025074,
+            "n_pricing_passes": 2
+          }
+        }
+      }
+    },
+    "main_kept": {
+      "library": "data/factorlib/all_factors_library_meanvar_20260828_194432_zoo.json",
+      "by_nav": {
+        "100000000": {
+          "fixed": {
+            "n_factors": 56,
+            "excess_cagr": 0.041429845102218144,
+            "net_cagr": 0.1071355301158996,
+            "excess_ir": 0.2780884064168884,
+            "excess_mdd": -0.4072433476103259,
+            "cost_bps": 4.96984928262477,
+            "turnover": 0.10658660247377388,
+            "secs": 105.0
+          },
+          "compounding": {
+            "n_factors": 56,
+            "excess_cagr": 0.02755567985957441,
+            "net_cagr": 0.09239689720047028,
+            "excess_ir": 0.18492373461334594,
+            "excess_mdd": -0.44810039936811963,
+            "cost_bps": 5.521638057699807,
+            "turnover": 0.10658660247377388,
+            "secs": 32.5,
+            "nav_end": 231029565.43837073,
+            "nav_growth_x": 2.310295654383707,
+            "n_pricing_passes": 2
+          }
+        },
+        "500000000": {
+          "fixed": {
+            "n_factors": 56,
+            "excess_cagr": -0.003037953367487134,
+            "net_cagr": 0.05988452910010911,
+            "excess_ir": -0.020391752976618403,
+            "excess_mdd": -0.5040977155552584,
+            "cost_bps": 6.765687916209076,
+            "turnover": 0.10658660247377388,
+            "secs": 106.5
+          },
+          "compounding": {
+            "n_factors": 56,
+            "excess_cagr": -0.021005452506090316,
+            "net_cagr": 0.04079863126357752,
+            "excess_ir": -0.14095696933419913,
+            "excess_mdd": -0.5446520265485121,
+            "cost_bps": 7.513785210677018,
+            "turnover": 0.10658660247377388,
+            "secs": 32.3,
+            "nav_end": 747417446.1891963,
+            "nav_growth_x": 1.4948348923783927,
+            "n_pricing_passes": 2
+          }
+        },
+        "1000000000": {
+          "fixed": {
+            "n_factors": 56,
+            "excess_cagr": -0.03511509945669933,
+            "net_cagr": 0.025799076996849024,
+            "excess_ir": -0.23569999422825272,
+            "excess_mdd": -0.5661594440241495,
+            "cost_bps": 8.111344596273339,
+            "turnover": 0.10658660247377388,
+            "secs": 103.8
+          },
+          "compounding": {
+            "n_factors": 56,
+            "excess_cagr": -0.05034415799441272,
+            "net_cagr": 0.009623917707774154,
+            "excess_ir": -0.33783577014541344,
+            "excess_mdd": -0.595755743653148,
+            "cost_bps": 8.765665743986503,
+            "turnover": 0.10658660247377388,
+            "secs": 32.3,
+            "nav_end": 1137001406.6394422,
+            "nav_growth_x": 1.1370014066394423,
+            "n_pricing_passes": 2
+          }
+        }
+      }
+    },
+    "original": {
+      "library": "data/factorlib/all_factors_library_original_20260831_012324.json",
+      "by_nav": {
+        "100000000": {
+          "fixed": {
+            "n_factors": 149,
+            "excess_cagr": 0.036019781210560486,
+            "net_cagr": 0.10140761851298907,
+            "excess_ir": 0.24111662318674398,
+            "excess_mdd": -0.34362813087194555,
+            "cost_bps": 5.016326863083987,
+            "turnover": 0.10638676527322927,
+            "secs": 216.4
+          },
+          "compounding": {
+            "n_factors": 149,
+            "excess_cagr": 0.024037533138884237,
+            "net_cagr": 0.0886809544009668,
+            "excess_ir": 0.16088333594675283,
+            "excess_mdd": -0.3870777006568894,
+            "cost_bps": 5.494950320173455,
+            "turnover": 0.10638676527322927,
+            "secs": 33.9,
+            "nav_end": 228434244.92065117,
+            "nav_growth_x": 2.2843424492065116,
+            "n_pricing_passes": 2
+          }
+        },
+        "500000000": {
+          "fixed": {
+            "n_factors": 149,
+            "excess_cagr": -0.010976202721454276,
+            "net_cagr": 0.05148097499415982,
+            "excess_ir": -0.07346777211240535,
+            "excess_mdd": -0.4562588968860273,
+            "cost_bps": 6.926666015073685,
+            "turnover": 0.10638676527322927,
+            "secs": 215.3
+          },
+          "compounding": {
+            "n_factors": 149,
+            "excess_cagr": -0.0247257160183203,
+            "net_cagr": 0.036878244218416345,
+            "excess_ir": -0.16546716324804525,
+            "excess_mdd": -0.49642336896583694,
+            "cost_bps": 7.502539809850631,
+            "turnover": 0.10638676527322927,
+            "secs": 33.9,
+            "nav_end": 736506216.1332071,
+            "nav_growth_x": 1.4730124322664142,
+            "n_pricing_passes": 2
+          }
+        },
+        "1000000000": {
+          "fixed": {
+            "n_factors": 149,
+            "excess_cagr": -0.044794742926825504,
+            "net_cagr": 0.015552467385039348,
+            "excess_ir": -0.2997984885081782,
+            "excess_mdd": -0.5278063700176396,
+            "cost_bps": 8.358120151870189,
+            "turnover": 0.10638676527322927,
+            "secs": 219.6
+          },
+          "compounding": {
+            "n_factors": 149,
+            "excess_cagr": -0.05414021082502585,
+            "net_cagr": 0.005629087777616837,
+            "excess_ir": -0.36228794038628226,
+            "excess_mdd": -0.5497335980230742,
+            "cost_bps": 8.762478973133037,
+            "turnover": 0.10638676527322927,
+            "secs": 33.9,
+            "nav_end": 1118399480.1535184,
+            "nav_growth_x": 1.1183994801535184,
+            "n_pricing_passes": 2
+          }
+        }
+      }
+    }
+  }
+}

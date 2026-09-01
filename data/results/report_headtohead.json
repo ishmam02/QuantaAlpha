@@ -1,0 +1,650 @@
+{
+  "main": {
+    "n_nodes": 161,
+    "resolvable_parent_links": 155,
+    "lineage_available": true,
+    "lineage": {
+      "mutation": {
+        "RankIC": {
+          "n": 62,
+          "wins": 38,
+          "win_rate": 0.6129032258064516,
+          "p_gt_chance": 0.04897722025975368,
+          "mean_delta": 0.002978252402729705,
+          "beat_all_rate": 0.5757575757575758,
+          "chance_beat_all": 0.5
+        },
+        "IC": {
+          "n": 62,
+          "wins": 31,
+          "win_rate": 0.5,
+          "p_gt_chance": 0.5504618431735706,
+          "mean_delta": 0.0006595944497449234,
+          "beat_all_rate": 0.4696969696969697,
+          "chance_beat_all": 0.5
+        },
+        "RankICIR": {
+          "n": 62,
+          "wins": 35,
+          "win_rate": 0.5645161290322581,
+          "p_gt_chance": 0.18707585620239742,
+          "mean_delta": 0.01410039249353342,
+          "beat_all_rate": 0.5303030303030303,
+          "chance_beat_all": 0.5
+        },
+        "ICIR": {
+          "n": 62,
+          "wins": 29,
+          "win_rate": 0.46774193548387094,
+          "p_gt_chance": 0.737113319912175,
+          "mean_delta": 0.0028221057621313156,
+          "beat_all_rate": 0.4393939393939394,
+          "chance_beat_all": 0.5
+        }
+      },
+      "crossover": {
+        "RankIC": {
+          "n": 43,
+          "wins": 24,
+          "win_rate": 0.5581395348837209,
+          "p_gt_chance": 0.271192005928242,
+          "mean_delta": 0.003901462913242377,
+          "beat_all_rate": 0.5581395348837209,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "IC": {
+          "n": 43,
+          "wins": 25,
+          "win_rate": 0.5813953488372093,
+          "p_gt_chance": 0.1801888264678837,
+          "mean_delta": 0.0016635143699785637,
+          "beat_all_rate": 0.5813953488372093,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "RankICIR": {
+          "n": 43,
+          "wins": 23,
+          "win_rate": 0.5348837209302325,
+          "p_gt_chance": 0.38039582128067195,
+          "mean_delta": 0.01644565943057573,
+          "beat_all_rate": 0.5348837209302325,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "ICIR": {
+          "n": 43,
+          "wins": 24,
+          "win_rate": 0.5581395348837209,
+          "p_gt_chance": 0.271192005928242,
+          "mean_delta": 0.007580717437189611,
+          "beat_all_rate": 0.5581395348837209,
+          "chance_beat_all": 0.3333333333333333
+        }
+      }
+    },
+    "rounds": [
+      0,
+      1,
+      2,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22
+    ],
+    "definition": {
+      "RankIC": {
+        "L1_median": {
+          "slope": 0.0020557562657524788,
+          "p": 1.0959815387965865e-06,
+          "rho": 0.7997936016511867,
+          "beats_null": true,
+          "first": 0.015773467489806306,
+          "last": 0.05378372538584889,
+          "n": 18
+        },
+        "L2_cum_mean": {
+          "slope": 0.001872461399438207,
+          "p": 1.184884618944183e-10,
+          "rho": 1.0,
+          "beats_null": true,
+          "first": 0.013600614876591591,
+          "last": 0.045844142708597914,
+          "n": 18
+        },
+        "L3_cum_best": {
+          "slope": 0.0019299319034227784,
+          "p": 3.939273820248291e-08,
+          "rho": 0.9854462091693035,
+          "beats_null": true,
+          "first": 0.022884210736969984,
+          "last": 0.05769514964265658,
+          "n": 18
+        }
+      },
+      "IC": {
+        "L1_median": {
+          "slope": 0.0011353273633383128,
+          "p": 1.3116814081505042e-06,
+          "rho": 0.78328173374613,
+          "beats_null": true,
+          "first": 0.0022712070389189097,
+          "last": 0.020148243186385667,
+          "n": 18
+        },
+        "L2_cum_mean": {
+          "slope": 0.0009192601026908235,
+          "p": 2.0784334434742345e-11,
+          "rho": 1.0,
+          "beats_null": true,
+          "first": 0.002773401109503087,
+          "last": 0.016299476289808202,
+          "n": 18
+        },
+        "L3_cum_best": {
+          "slope": 0.0012120907088822306,
+          "p": 3.050033350942759e-08,
+          "rho": 0.9849224535069168,
+          "beats_null": true,
+          "first": 0.004897082175654614,
+          "last": 0.023726727252732387,
+          "n": 18
+        }
+      },
+      "RankICIR": {
+        "L1_median": {
+          "slope": 0.00975939710955878,
+          "p": 8.575629105022838e-07,
+          "rho": 0.7977296181630547,
+          "beats_null": true,
+          "first": 0.09033693777196428,
+          "last": 0.26507690410372636,
+          "n": 18
+        },
+        "L2_cum_mean": {
+          "slope": 0.008776126878901115,
+          "p": 9.303086142006581e-11,
+          "rho": 1.0,
+          "beats_null": true,
+          "first": 0.07664405848270685,
+          "last": 0.22804411921438494,
+          "n": 18
+        },
+        "L3_cum_best": {
+          "slope": 0.009248966956627693,
+          "p": 5.3434530264761056e-08,
+          "rho": 0.9854462091693035,
+          "beats_null": true,
+          "first": 0.12420405805327366,
+          "last": 0.28469399096288583,
+          "n": 18
+        }
+      },
+      "ICIR": {
+        "L1_median": {
+          "slope": 0.005671874871776343,
+          "p": 1.0769652697212006e-06,
+          "rho": 0.7853457172342622,
+          "beats_null": true,
+          "first": 0.013161854447671442,
+          "last": 0.10141231190520374,
+          "n": 18
+        },
+        "L2_cum_mean": {
+          "slope": 0.004485481549994403,
+          "p": 1.8997173322476865e-11,
+          "rho": 0.9979360165118679,
+          "beats_null": true,
+          "first": 0.017125517874173823,
+          "last": 0.08239048403583023,
+          "n": 18
+        },
+        "L3_cum_best": {
+          "slope": 0.005934659312331192,
+          "p": 5.781499200766774e-08,
+          "rho": 0.9849224535069168,
+          "beats_null": true,
+          "first": 0.030937375664366377,
+          "last": 0.1188788360661143,
+          "n": 18
+        }
+      },
+      "annualized_return": {
+        "L1_median": null,
+        "L2_cum_mean": null,
+        "L3_cum_best": null
+      },
+      "information_ratio": {
+        "L1_median": null,
+        "L2_cum_mean": null,
+        "L3_cum_best": null
+      },
+      "max_drawdown": {
+        "L1_median": null,
+        "L2_cum_mean": null,
+        "L3_cum_best": null
+      }
+    },
+    "verdict": {
+      "L1_no_anti_learning": {
+        "rises": 4,
+        "flat": 0,
+        "declines": 0,
+        "rising": [
+          "RankIC",
+          "IC",
+          "RankICIR",
+          "ICIR"
+        ],
+        "falling": []
+      },
+      "L2_zoo_mean": {
+        "rises": 4,
+        "flat": 0,
+        "declines": 0,
+        "rising": [
+          "RankIC",
+          "IC",
+          "RankICIR",
+          "ICIR"
+        ],
+        "falling": []
+      },
+      "L3_best_bar": {
+        "rises": 4,
+        "flat": 0,
+        "declines": 0,
+        "rising": [
+          "RankIC",
+          "IC",
+          "RankICIR",
+          "ICIR"
+        ],
+        "falling": []
+      }
+    },
+    "pool": "/Users/ishmamkabir/Documents/Frequent/QuantaAlpha/data/results/trajectory_pool_meanvar_20260828_194432.json",
+    "metrics_used": [
+      "RankIC",
+      "IC",
+      "RankICIR",
+      "ICIR",
+      "annualized_return",
+      "information_ratio",
+      "max_drawdown"
+    ]
+  },
+  "original": {
+    "n_nodes": 60,
+    "resolvable_parent_links": 70,
+    "lineage_available": true,
+    "lineage": {
+      "mutation": {
+        "RankIC": {
+          "n": 29,
+          "wins": 8,
+          "win_rate": 0.27586206896551724,
+          "p_gt_chance": 0.995934970676899,
+          "mean_delta": -0.002742898907155041,
+          "beat_all_rate": 0.27586206896551724,
+          "chance_beat_all": 0.5
+        },
+        "IC": {
+          "n": 29,
+          "wins": 9,
+          "win_rate": 0.3103448275862069,
+          "p_gt_chance": 0.987940227612853,
+          "mean_delta": -0.0030759375971173967,
+          "beat_all_rate": 0.3103448275862069,
+          "chance_beat_all": 0.5
+        },
+        "RankICIR": {
+          "n": 29,
+          "wins": 8,
+          "win_rate": 0.27586206896551724,
+          "p_gt_chance": 0.995934970676899,
+          "mean_delta": -0.03134833034091689,
+          "beat_all_rate": 0.27586206896551724,
+          "chance_beat_all": 0.5
+        },
+        "ICIR": {
+          "n": 29,
+          "wins": 8,
+          "win_rate": 0.27586206896551724,
+          "p_gt_chance": 0.995934970676899,
+          "mean_delta": -0.02733022080995801,
+          "beat_all_rate": 0.27586206896551724,
+          "chance_beat_all": 0.5
+        },
+        "annualized_return": {
+          "n": 29,
+          "wins": 14,
+          "win_rate": 0.4827586206896552,
+          "p_gt_chance": 0.644464448094368,
+          "mean_delta": -0.01079700137812397,
+          "beat_all_rate": 0.4827586206896552,
+          "chance_beat_all": 0.5
+        },
+        "information_ratio": {
+          "n": 29,
+          "wins": 13,
+          "win_rate": 0.4482758620689655,
+          "p_gt_chance": 0.77087084017694,
+          "mean_delta": -0.10390209388307056,
+          "beat_all_rate": 0.4482758620689655,
+          "chance_beat_all": 0.5
+        },
+        "max_drawdown": {
+          "n": 29,
+          "wins": 16,
+          "win_rate": 0.5517241379310345,
+          "p_gt_chance": 0.355535551905632,
+          "mean_delta": 0.004570863666635053,
+          "beat_all_rate": 0.5517241379310345,
+          "chance_beat_all": 0.5
+        }
+      },
+      "crossover": {
+        "RankIC": {
+          "n": 19,
+          "wins": 5,
+          "win_rate": 0.2631578947368421,
+          "p_gt_chance": 0.9903945922851562,
+          "mean_delta": -0.0022220856627775576,
+          "beat_all_rate": 0.2631578947368421,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "IC": {
+          "n": 19,
+          "wins": 4,
+          "win_rate": 0.21052631578947367,
+          "p_gt_chance": 0.9977874755859375,
+          "mean_delta": -0.0017388634056873264,
+          "beat_all_rate": 0.21052631578947367,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "RankICIR": {
+          "n": 19,
+          "wins": 8,
+          "win_rate": 0.42105263157894735,
+          "p_gt_chance": 0.8203582763671875,
+          "mean_delta": -0.010724302007915416,
+          "beat_all_rate": 0.42105263157894735,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "ICIR": {
+          "n": 19,
+          "wins": 4,
+          "win_rate": 0.21052631578947367,
+          "p_gt_chance": 0.9977874755859375,
+          "mean_delta": -0.012128432059565361,
+          "beat_all_rate": 0.21052631578947367,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "annualized_return": {
+          "n": 19,
+          "wins": 4,
+          "win_rate": 0.21052631578947367,
+          "p_gt_chance": 0.9977874755859375,
+          "mean_delta": -0.03200345551997425,
+          "beat_all_rate": 0.21052631578947367,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "information_ratio": {
+          "n": 19,
+          "wins": 6,
+          "win_rate": 0.3157894736842105,
+          "p_gt_chance": 0.9682159423828125,
+          "mean_delta": -0.24302618090254266,
+          "beat_all_rate": 0.3157894736842105,
+          "chance_beat_all": 0.3333333333333333
+        },
+        "max_drawdown": {
+          "n": 19,
+          "wins": 6,
+          "win_rate": 0.3157894736842105,
+          "p_gt_chance": 0.9682159423828125,
+          "mean_delta": -0.01361289951059782,
+          "beat_all_rate": 0.3157894736842105,
+          "chance_beat_all": 0.3333333333333333
+        }
+      }
+    },
+    "rounds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "definition": {
+      "RankIC": {
+        "L1_median": {
+          "slope": 0.0008269460397218903,
+          "p": 0.2878586880127546,
+          "rho": 0.5428571428571429,
+          "beats_null": false,
+          "first": 0.0331823151854954,
+          "last": 0.0337258652940932,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": 0.0002955037607027654,
+          "p": 0.18113936824794163,
+          "rho": 0.6,
+          "beats_null": false,
+          "first": 0.03310108993747475,
+          "last": 0.03364531482175299,
+          "n": 6
+        },
+        "L3_cum_best": {
+          "slope": 0.0012571944922327835,
+          "p": 0.009252581118418425,
+          "rho": 0.9710083124552245,
+          "beats_null": true,
+          "first": 0.0367797931303119,
+          "last": 0.0418002840123423,
+          "n": 6
+        }
+      },
+      "IC": {
+        "L1_median": {
+          "slope": 0.0005825027062180283,
+          "p": 0.381460120969913,
+          "rho": 0.2,
+          "beats_null": false,
+          "first": 0.015192573214099201,
+          "last": 0.0150708400266327,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": 0.00015723389382057181,
+          "p": 0.47657166642115084,
+          "rho": 0.08571428571428573,
+          "beats_null": false,
+          "first": 0.01526929352758439,
+          "last": 0.015102071013753991,
+          "n": 6
+        },
+        "L3_cum_best": {
+          "slope": 0.00155772798710602,
+          "p": 0.007127558445691564,
+          "rho": 0.9710083124552245,
+          "beats_null": true,
+          "first": 0.0177411498600497,
+          "last": 0.02402922466489,
+          "n": 6
+        }
+      },
+      "RankICIR": {
+        "L1_median": {
+          "slope": 0.007002338868592901,
+          "p": 0.37450870923881413,
+          "rho": 0.6571428571428573,
+          "beats_null": false,
+          "first": 0.2498819966241126,
+          "last": 0.2608317448409405,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": 0.0031152841455945016,
+          "p": 0.13002155340213556,
+          "rho": 0.7714285714285715,
+          "beats_null": false,
+          "first": 0.2529939609405761,
+          "last": 0.2604293787127097,
+          "n": 6
+        },
+        "L3_cum_best": {
+          "slope": 0.005687842341693004,
+          "p": 0.010892895803475218,
+          "rho": 0.956182887467515,
+          "beats_null": true,
+          "first": 0.3073428531339221,
+          "last": 0.332227163378829,
+          "n": 6
+        }
+      },
+      "ICIR": {
+        "L1_median": {
+          "slope": 0.005753067207268181,
+          "p": 0.3364676575560547,
+          "rho": 0.6571428571428573,
+          "beats_null": false,
+          "first": 0.117585790860568,
+          "last": 0.12098986215543206,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": 0.0015505832794115166,
+          "p": 0.38102330839239945,
+          "rho": 0.6,
+          "beats_null": false,
+          "first": 0.11719825072879983,
+          "last": 0.1174743503894911,
+          "n": 6
+        },
+        "L3_cum_best": {
+          "slope": 0.010254369191100347,
+          "p": 0.00553246581748633,
+          "rho": 0.9710083124552245,
+          "beats_null": true,
+          "first": 0.1478411097247018,
+          "last": 0.1908393983731215,
+          "n": 6
+        }
+      },
+      "annualized_return": {
+        "L1_median": {
+          "slope": -0.003591267003254893,
+          "p": 0.3785548345616021,
+          "rho": -0.2,
+          "beats_null": false,
+          "first": 0.09498331211135165,
+          "last": 0.06540653333112875,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": -0.003126839201728513,
+          "p": 0.1281041583887703,
+          "rho": -0.7714285714285715,
+          "beats_null": false,
+          "first": 0.0979100908890996,
+          "last": 0.07613691839407702,
+          "n": 6
+        },
+        "L3_cum_best": null
+      },
+      "information_ratio": {
+        "L1_median": {
+          "slope": -0.005171411265410074,
+          "p": 0.8908144878807073,
+          "rho": -0.14285714285714288,
+          "beats_null": false,
+          "first": 0.8052242759177509,
+          "last": 0.6961815073619342,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": -0.02599485644261421,
+          "p": 0.1890902529957607,
+          "rho": -0.3142857142857143,
+          "beats_null": false,
+          "first": 0.8738005793759124,
+          "last": 0.6821063289702867,
+          "n": 6
+        },
+        "L3_cum_best": null
+      },
+      "max_drawdown": {
+        "L1_median": {
+          "slope": 7.217522420460976e-05,
+          "p": 0.97915664062179,
+          "rho": 0.14285714285714288,
+          "beats_null": false,
+          "first": 0.0841692844801096,
+          "last": 0.08435847865895546,
+          "n": 6
+        },
+        "L2_cum_mean": {
+          "slope": 0.000617822445421056,
+          "p": 0.3770771192858061,
+          "rho": 0.2571428571428572,
+          "beats_null": false,
+          "first": 0.08027691675431643,
+          "last": 0.08545556389619953,
+          "n": 6
+        },
+        "L3_cum_best": null
+      }
+    },
+    "verdict": {
+      "L1_no_anti_learning": {
+        "rises": 0,
+        "flat": 7,
+        "declines": 0,
+        "rising": [],
+        "falling": []
+      },
+      "L2_zoo_mean": {
+        "rises": 0,
+        "flat": 7,
+        "declines": 0,
+        "rising": [],
+        "falling": []
+      },
+      "L3_best_bar": {
+        "rises": 4,
+        "flat": 0,
+        "declines": 0,
+        "rising": [
+          "RankIC",
+          "IC",
+          "RankICIR",
+          "ICIR"
+        ],
+        "falling": []
+      }
+    },
+    "pool": "/Users/ishmamkabir/Documents/Frequent/qa_orig_mine/log/2026-08-31_05-23-28-565698/trajectory_pool.json",
+    "metrics_used": [
+      "RankIC",
+      "IC",
+      "RankICIR",
+      "ICIR",
+      "annualized_return",
+      "information_ratio",
+      "max_drawdown"
+    ]
+  }
+}
