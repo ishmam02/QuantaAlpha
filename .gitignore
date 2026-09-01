@@ -130,6 +130,9 @@ docs/_build/
 .claude
 hf_data
 logs
-scripts 
-tests
 tools
+
+# scripts/ and tests/ ARE tracked: RUNNING.md tells users to run the launcher
+# (scripts/qa_mine.sh), the resume helper, the data checker, and the analysis
+# scripts behind the report's tables, so a clone without them cannot follow the
+# guide or reproduce the results.

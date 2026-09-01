@@ -42,6 +42,11 @@
 
 ---
 
+> **📖 Setting up to run it? See [`RUNNING.md`](RUNNING.md)** — a step-by-step English
+> guide to installing, configuring, mining a factor library, and backtesting it, with a
+> verification step after each stage. Written to be followed by a person or executed by
+> an AI agent.
+
 <a id="coming-soon"></a>
 
 ## 🔭 Coming Soon：[QuantaAlpha-claw](https://github.com/QuantaAlpha/QuantaAlpha-claw) (Agent-Native Alpha Research)
