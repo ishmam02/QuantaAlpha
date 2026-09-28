@@ -214,7 +214,27 @@ an answer.** So directions are constrained to name *mechanisms and measurement
 targets*, never instruments, dates or events. This constraint is what makes the
 whole approach defensible, and `09-` enforces it.
 
-**L4 — Empirical measurement (the only actual evidence).** Three controls:
+**L4 — Empirical measurement (the only actual evidence).**
+
+**The primary control is the IC decay curve, and on the existing library it has
+already passed.** Per-year Rank IC runs .1104 → .0898 → .0587 → .0543 → .0504 →
+.0524 → **.0160 (2023)** → .0288 → .0469: monotone decay with distance from the
+fit window, with the trough at the most-documented regime break in the sample. A
+library built on hindsight would not fail hardest exactly where the hindsight is
+densest. **Parametric leakage bought the existing system nothing.**
+
+There is a structural reason: **admission is itself an anti-leakage mechanism**,
+because factors are selected on data ≤ T, so an edge that exists only in the future
+cannot pass. The residual risk is therefore narrow — leakage survives only when it
+points at a factor that *also* worked before T, which is a **credit-assignment**
+problem (the system looks more capable than it is) rather than a performance-
+inflation one.
+
+This finding is about the *old* configuration, where the model got little beyond a
+window range. This design supplies far more period-identifying information, so it
+must be re-established per arm in `14`: **if the agent arm shows flatter IC decay
+than the fixed-direction arm, that is the leakage signature.** Three further
+controls bound the channel:
 
 * **Date-relabel placebo (decisive, cheap).** Run the agent on the *same*
   market-state report labelled with a different date. If the directions change

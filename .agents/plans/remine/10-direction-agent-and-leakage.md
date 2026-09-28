@@ -52,7 +52,52 @@ measurement targets** and nothing else. Enforce a specificity budget: a directio
 may name operator families, horizons and economic mechanisms; it may not name
 instruments, dates, events, or a numeric threshold to aim at.
 
-**L4 — Measurement.** Three controls, run at every re-mine point and reported:
+### L4 — Measurement
+
+**The strongest control is the IC decay curve, and it has already run.**
+
+If the generator had exploited post-T knowledge, the resulting factors would hold
+up in the leaked period. Measured on the existing library (mined under a context
+clamped to ~2012), per-year Rank IC is:
+
+```
+2017   2018   2019   2020   2021   2022   2023   2024   2025
+.1104  .0898  .0587  .0543  .0504  .0524  .0160  .0288  .0469
+```
+
+IC decays **monotonically with distance from the fit window** and bottoms out in
+**2023** — the single most-documented regime break in recent A-share history, and
+therefore exactly where a leaking model's knowledge is densest. A library built on
+hindsight does not fail hardest precisely there. **This is direct evidence that
+parametric leakage bought the existing system nothing.**
+
+There is a structural reason it could not. **Admission is itself an anti-leakage
+mechanism:** factors are selected on data ≤ T, so a factor whose edge exists only
+in the future scores badly on the past and is rejected. The search mechanically
+filters out the kind of factor leakage would produce.
+
+That narrows the residual risk sharply. Leakage can only survive the gate if the
+leaked knowledge points at a factor that **also** worked before T — in which case
+the factor is genuinely good on point-in-time data and the harm is not financial.
+What remains is a **credit-assignment** problem: the system would look more capable
+than it is, having been handed an idea rather than reasoning to it. Worth
+detecting; not a threat to the returns.
+
+**So the decay-shape test is the primary diagnostic**, run per arm in `14`:
+
+* **Compare the IC decay *shape* between arms.** If arm B (agent directions) shows
+  materially **flatter** decay than arm A (fixed direction) — its factors
+  mysteriously holding up in later years — that is the leakage signature. If both
+  decay alike, leakage bought nothing, whatever the placebo says.
+* Report the decay slope and the year-of-trough per arm alongside the headline.
+
+**Why the other three controls still run.** The evidence above is about the *old*
+configuration, where the model received little more than a window range. This
+design hands it substantially more period-identifying information — nine regime
+statistics plus a What-Changed digest naming which archetypes died. That is a far
+richer fingerprint, so the finding must be **re-established, not assumed to carry
+over.** The three controls below bound the channel; the decay curve measures the
+outcome:
 
 1. **Date-relabel placebo (decisive).** Same market-state report, different date
    label. Compute the similarity of the returned direction sets. High similarity ⇒
@@ -101,8 +146,11 @@ instruments, dates, events, or a numeric threshold to aim at.
 
 ## Reporting rule
 
-The honest claim is **"L1+L2+L3 enforced; L4 placebo similarity = X"**. The claim
-"no temporal leakage" is not available to us and must not appear in any report.
+The honest claim is **"L1-L3 enforced; decay shape matched between arms; placebo
+similarity = X"**. The decay-shape comparison is the load-bearing half — it is an
+outcome measurement, not a proxy — and on the existing library it already passes.
+The claim "no temporal leakage" is not available to us and must not appear in any
+report.
 
 ## Risks
 

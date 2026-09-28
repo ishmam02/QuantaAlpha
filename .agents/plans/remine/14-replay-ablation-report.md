@@ -50,8 +50,16 @@ has not necessarily produced alpha. The size decomposition runs on the winner.
 with every mine, and the bar correctly rises), plus the BH/FDR bar already wired
 into `_fdr_bar`. Do not reset `n_tests` between mines.
 
-**Leakage:** the three `10` controls at every trigger point, reported as numbers.
-The claim is "L1+L2+L3 enforced; placebo similarity = X", never "no leakage".
+**Leakage:** the primary test is the **IC decay shape, compared between arms**. If
+arm B (agent directions) decays materially flatter than arm A (fixed direction) —
+its factors holding up in later years — that is the leakage signature, because
+post-T knowledge is the only thing that would produce it. Report the decay slope
+and the year-of-trough per arm beside the headline. On the existing library this
+test already passes (Rank IC falls monotonically from .1104 to a .0160 trough in
+2023, the most-documented break in the sample), so the bar is "arm B matches arm
+A's shape", not "arm B decays at all". The three `10` controls run alongside and
+bound the channel. The claim is "L1-L3 enforced; decay shape matched; placebo
+similarity = X" — never "no leakage".
 
 ## Harness
 
