@@ -23,23 +23,9 @@
 We mine factors once, from a direction someone types in, and then trade them
 forever. That doesn't hold up.
 
-Numbers below are from the first CSI300 window we trust: fit 2005--2016 (purged to
-2016-12-09), scored 2017--2025, LightGBM combiner, top-50 book, full cost model,
-benchmarked against the cap-weighted CSI300 total-return index. Everything is
-excess return, so CRR means cumulative excess return.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{lrrrr}
-\toprule
-& $\rid$ & ARR & CRR & TC \\
-\midrule
-\main{} (147 factors)   & 0.0565 & $-5.96\%$  & $-41.3\%$ & 0.37 \\
-\textsc{original} (147) & 0.0488 & $-9.78\%$  & $-59.1\%$ & 0.33 \\
-no factors at all       & ---    & $-14.33\%$ & $-73.9\%$ & ---  \\
-\bottomrule
-\end{tabular}
-\end{table}
+Everything here is from the window we trust --- fit 2005--2016, scored 2017--2025,
+LightGBM combiner, top-50 book, full costs --- and every return is excess over the
+cap-weighted CSI300 total-return index, so CRR means cumulative excess return.
 
 Rank IC by year runs 0.1104, 0.0898, 0.0587, 0.0543, 0.0504, 0.0524, 0.0160,
 0.0288, 0.0469. It falls with distance from the fit and then flattens out around
