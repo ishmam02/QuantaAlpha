@@ -1,11 +1,15 @@
 \documentclass[11pt]{article}
-\usepackage[margin=1in]{geometry}
+\usepackage[margin=0.95in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{bm}
 \usepackage{enumitem}
 \usepackage[hidelinks]{hyperref}
 \usepackage{booktabs}
 \usepackage{xcolor}
+\usepackage{titlesec}
+% Tighter section spacing only: the content and the margins are unchanged.
+% Needed to hold the document at four pages after the cost/trigger detail went in.
+\titlespacing*{\section}{0pt}{1.6ex plus .3ex minus .2ex}{0.9ex plus .2ex}
 
 \newcommand{\main}{\textsc{main-full}}
 \newcommand{\rid}{\mathrm{IC}_{\mathrm{rank}}}
@@ -107,17 +111,22 @@ news. The 2023 rotation \emph{is} rising dispersion and an inverted size spread,
 and the agent sees those as numbers with no label on them. We never tell it the
 story.
 
-\textbf{Parents.} Today selection is pure exploitation over a pool that gets thrown
-away at the end of each run, and it has produced operator monoculture twice. The
-library becomes an archive binned by operator, horizon, regime behaviour and decay
-tier, with parents drawn 50\% from the best performers, 30\% from thinly populated
-bins, and 20\% from dead factors whose regime looks like the current one.
+\textbf{Parents.} Today selection is pure exploitation, from a pool thrown away at
+the end of each run; it has produced operator monoculture twice, and crossover
+measures worse than mutation (median absolute rank IC 0.0067 against 0.0114). The
+library becomes an archive binned by operator class, lookback horizon, regime
+profile and decay tier, with parents drawn on a fixed, logged budget: 50\% the best
+performers by shrunk marginal contribution, 30\% occupants of thinly populated bins
+whatever their fitness --- that is what breaks the monoculture --- and 20\% dead
+factors whose regime matches the current state. Within a pool we pick cells by UCB,
+not factors: verdicts are noisy enough that three of four flip across combiner
+seeds, and a cell pools many trials.
 
 \section{How we test it}
 
-Replay history. At each trigger point everything uses data up to that date only,
-the next year gets scored, and we never look at it again. Returns stitch into one
-series per arm.
+Replay history. At each trigger point everything uses data up to that date only, the
+next year is scored and never looked at again; returns stitch into one series per
+arm.
 
 \begin{table}[h]
 \centering
@@ -139,14 +148,22 @@ F & random DSL & calendar & same, without survivorship \\
 \end{tabular}
 \end{table}
 
-A, B, G and H are a 2$\times$2 over directions and scheduling. So $A-D$ is
-re-mining, $B-A$ is the direction agent, $G-A$ is the decay agent, and
-$(H-G)-(B-A)$ tells us whether the two agents help each other or get in each
-other's way. C and D are already measured. E and F need no mining.
+A, B, G and H are a 2$\times$2 over directions and scheduling: $A-D$ is re-mining,
+$B-A$ the direction agent, $G-A$ the decay agent, and $(H-G)-(B-A)$ whether the two
+agents help each other or get in each other's way. C and D are already measured;
+E and F need no mining.
 
-Cost is 22--26 mines. G reuses A's mine whenever their trigger dates line up, so
-only the divergences cost anything extra. We measure what one mine costs before
-launching any of this, and the fallback is three trigger points instead of nine.
+Cost is 22--26 mines on the nine-point schedule and six on the reduced one. One mine
+is measured, not guessed: \texttt{meanvar\_20260828\_194432}, the 150-factor library
+this document is built on, took \textbf{15.1 hours of compute}, 160 batches at 5.7
+minutes. Its run spanned 51 hours of wall clock, 34 of them an interruption, so the
+replay is budgeted on machine time: 22--26 mines is 14--16 days, six is under four.
+
+The nine trigger points are the first trading day of 2017 through 2025; A and B mine
+at each, G and H at those plus any the decay agent pulls forward, reusing a mine
+wherever a date coincides. The reduced set starts 2016, 2019 and 2022 --- blocks of
+three, three and four years --- and beginning in 2016 rather than 2017, arm C would
+need re-cutting over 2016--2025 to match.
 
 Headline metric is stitched CRR. Alongside it, per year and per arm: ARR, IR, MDD,
 rank IC, IC, ICIR, TC, turnover, cost, book size, admissions, tier counts. The
