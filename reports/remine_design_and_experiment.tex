@@ -1,26 +1,16 @@
 \documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,amsthm}
+\usepackage{amsmath,amssymb}
 \usepackage{bm}
 \usepackage{enumitem}
 \usepackage[hidelinks]{hyperref}
 \usepackage{booktabs}
-\usepackage{graphicx}
-\usepackage{caption}
 \usepackage{xcolor}
-\usepackage{longtable}
-\usepackage{multirow}
 
-\newcommand{\R}{\mathbb{R}}
-\newcommand{\E}{\mathbb{E}}
-\newcommand{\proto}{\Theta}
 \newcommand{\main}{\textsc{main-full}}
-\newcommand{\orig}{\textsc{original}}
 \newcommand{\rid}{\mathrm{IC}_{\mathrm{rank}}}
 
-\title{\vspace{-2.5em}\textbf{Closing the Research Loop}\\[0.3em]
-\large Decay-Driven Dynamic Re-Mining:\\
-Design, Evidence, and the Experiment That Tests It}
+\title{\vspace{-2.5em}\textbf{Dynamic Re-Mining: Design and Test Plan}}
 \date{28 September 2026}
 
 \sloppy
@@ -28,395 +18,267 @@ Design, Evidence, and the Experiment That Tests It}
 \maketitle
 \vspace{-2em}
 
-\begin{abstract}
-\noindent
-The system mines alpha factors once, from a human-written direction, and trades
-the result indefinitely. On the first genuinely leak-free CSI300 window this does
-not survive: rank IC decays from $0.1104$ to $\sim\!0.045$ within three years and
-cumulative excess return over the cap-weighted, dividend-reinvested CSI300 is
-$-41.3\%$ across 2017--2025. We present (i) the one intervention already measured
-to work --- an annual combiner refit, which turns a $-18.8\%$ cumulative excess
-into $+2.7\%$ on \emph{unchanged} factors; (ii) a design that closes the research
-loop by monitoring decay and re-mining against it, with deterministic rules as a
-hard floor and an LLM agent permitted only to accelerate them; and (iii) a
-nine-arm historical replay that isolates every mechanism, including two non-LLM
-control arms that test for temporal leakage at a layer the main ablation cannot
-reach. We then argue, from metrics rather than assertion, that this work closes
-the \emph{research} half of the quant loop and cannot close the \emph{trading}
-half: predictive power is present and industry-normal, and the shortfall is
-located entirely in portfolio construction.
-\end{abstract}
+\section{The problem}
 
-\section{Where we are}
+We mine factors once, from a direction someone types in, and then trade them
+forever. That doesn't hold up.
 
-All figures below use protocol
-\texttt{protocol\_csi300\_lightgbm\_topk\_decay.yaml}: fit 2005-01-01 to
-2016-12-31 (purged to 2016-12-09), scored 2017-01-01 to 2025-12-31, LightGBM
-combiner, \texttt{topk\_dropout} construction ($k=50$, \texttt{n\_drop}$=5$,
-\texttt{max\_weight}$=0.03$), the full $\kappa$ cost model, and benchmark
-\texttt{SH000300TR} --- the official cap-weighted CSI300 \emph{total-return}
-index. Because \texttt{costs.net\_return} computes
-$\text{gross}-\text{benchmark}-\text{charges}$, every return reported here is
-\textbf{excess}, and CRR denotes \textbf{cumulative excess return}.
+Numbers below are from the first CSI300 window we trust: fit 2005--2016 (purged to
+2016-12-09), scored 2017--2025, LightGBM combiner, top-50 book, full cost model,
+benchmarked against the cap-weighted CSI300 total-return index. Everything is
+excess return, so CRR means cumulative excess return.
 
 \begin{table}[h]
 \centering
-\caption{Leak-free out-of-sample baseline, 2017--2025.}
+\begin{tabular}{lrrrr}
+\toprule
+& $\rid$ & ARR & CRR & TC \\
+\midrule
+\main{} (147 factors)   & 0.0565 & $-5.96\%$  & $-41.3\%$ & 0.37 \\
+\textsc{original} (147) & 0.0488 & $-9.78\%$  & $-59.1\%$ & 0.33 \\
+no factors at all       & ---    & $-14.33\%$ & $-73.9\%$ & ---  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Rank IC by year runs 0.1104, 0.0898, 0.0587, 0.0543, 0.0504, 0.0524, 0.0160,
+0.0288, 0.0469. It falls with distance from the fit and then flattens out around
+0.045. The 2023 hole is real --- IC goes negative for the smaller zoo that year.
+
+The returns are beta, not alpha. Annual excess return correlates $-0.73$ with the
+benchmark's own return and $+0.11$ with our rank IC. Every year we made money was
+a year the index fell. In 2017 we had the best signal this system has ever produced
+out of sample, rank IC 0.1104, and lost 5.45\% because the index rose 24.25\%.
+
+\section{What already works: refitting the combiner}
+
+Refit the combiner every year on data before the year being traded. Same factors
+throughout, nothing re-mined, so any gain comes from the refit alone.
+
+\begin{table}[h]
+\centering
+\caption{\main{}, 147 factors. Excess over the total-return index, net of costs.}
 \begin{tabular}{lrrrrr}
 \toprule
-configuration & $\rid$ & ARR & \textbf{CRR} & IR & TC \\
+& \multicolumn{2}{c}{frozen 2016 fit} & \multicolumn{2}{c}{annual refit} & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+year & $\rid$ & ARR & $\rid$ & ARR & $\Delta$ARR \\
 \midrule
-\main{} (147 factors)  & 0.0565 & $-5.96\%$ & $\bm{-41.32\%}$ & $-0.32$ & 0.37 \\
-\orig{} (147 factors)  & 0.0488 & $-9.78\%$ & $-59.07\%$ & $-0.59$ & 0.33 \\
-null model (no factors) & --- & $-14.33\%$ & $-73.87\%$ & $-1.05$ & --- \\
+2021 & 0.0504 & $+5.82\%$  & 0.0586 & $+11.40\%$ & $+5.58$ pp \\
+2022 & 0.0524 & $+1.81\%$  & 0.0598 & $+8.98\%$  & $+7.17$ pp \\
+2023 & 0.0160 & $-7.42\%$  & 0.0298 & $-1.99\%$  & $+5.43$ pp \\
+2024 & 0.0288 & $-4.31\%$  & 0.0533 & $-3.75\%$  & $+0.56$ pp \\
+2025 & 0.0469 & $-14.94\%$ & 0.0616 & $-10.25\%$ & $+4.69$ pp \\
+\midrule
+mean & 0.0389 & & 0.0526 & & $+4.69$ pp \\
+\textbf{CRR} & & $\bm{-18.8\%}$ & & $\bm{+2.68\%}$ & $+21.5$ pp \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Two properties of this baseline drive everything that follows.
+All five years improve, on both rank IC and return. Mean rank IC rises 35\%. This
+is the only configuration out of the nine we have tested with a positive CRR, and
+we don't currently do it --- production fits once and never refits again.
 
-\paragraph{Signal decays on a roughly three-year clock.}
-Rank IC by year for \main{}: $0.1104$, $0.0898$, $0.0587$, $0.0543$, $0.0504$,
-$0.0524$, $0.0160$, $0.0288$, $0.0469$. The decline is monotone in distance from
-the fit window and then plateaus near $0.045$. The 2023 trough is genuine: IC goes
-negative for the reduced zoo that year.
+2023 is worth a look. A refit more than halves the loss and lifts rank IC by 86\%.
+About half of what reads as a regime break is just a stale combiner.
 
-\paragraph{The returns are beta, not alpha.}
-Correlation of annual excess return with the \emph{benchmark's} return is
-$\bm{-0.73}$; with the book's own rank IC it is $+0.11$. Signal quality explains
-about $1\%$ of the variance in excess return. Every profitable year is a year the
-index fell. The decisive case is 2017: rank IC $0.1104$, the highest this system
-has ever produced out of sample and above every break-even estimate, returned
-$-5.45\%$ because the index rose $24.25\%$.
-
-\section{What already works: the annual combiner refit}
-
-The cheapest available intervention changes no factors at all. It refits the
-LightGBM combiner each year on data strictly before the year being traded
-(fit $\le Y-1$, report $Y$, expanding window). The factor library is frozen
-throughout, so any gain is attributable to the refit alone.
-
-\begin{table}[h]
-\centering
-\caption{\main{}, 147 factors: frozen 2016 fit versus annual rolling refit.
-Both columns are excess over \texttt{SH000300TR}, net of $\kappa$ costs.}
-\begin{tabular}{lrrrrrr}
-\toprule
-& \multicolumn{2}{c}{frozen (fit $\le$ 2016)} & \multicolumn{2}{c}{annual refit} & \multicolumn{2}{c}{improvement} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
-year & $\rid$ & ARR & $\rid$ & ARR & $\Delta\rid$ & $\Delta$ARR \\
-\midrule
-2021 & 0.0504 & $+5.82\%$  & 0.0586 & $+11.40\%$ & $+0.0082$ & $+5.58$ pp \\
-2022 & 0.0524 & $+1.81\%$  & 0.0598 & $+8.98\%$  & $+0.0074$ & $+7.17$ pp \\
-2023 & 0.0160 & $-7.42\%$  & 0.0298 & $-1.99\%$  & $+0.0138$ & $+5.43$ pp \\
-2024 & 0.0288 & $-4.31\%$  & 0.0533 & $-3.75\%$  & $+0.0245$ & $+0.56$ pp \\
-2025 & 0.0469 & $-14.94\%$ & 0.0616 & $-10.25\%$ & $+0.0147$ & $+4.69$ pp \\
-\midrule
-mean & 0.0389 & --- & 0.0526 & --- & $+35\%$ & $\bm{+4.69}$ \textbf{pp} \\
-\textbf{stitched} & & $\bm{-4.24\%}$ & & $\bm{+0.55\%}$ & & \\
-\textbf{CRR} & & $\bm{-18.8\%}$ & & $\bm{+2.68\%}$ & & $\bm{+21.5}$ \textbf{pp} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\noindent
-Every one of the five years improves, on both rank IC and ARR. Mean rank IC rises
-$35\%$; the transfer coefficient rises from $0.366$ to $0.386$. \textbf{This is the
-only configuration of the nine we have tested with a positive CRR}, and it is
-currently \textbf{not done at all} --- the production system fits once and never
-refits. The frozen stitched figure is compounded from the per-year values; the
-refit figure is computed on the concatenated daily series.
-
-Note also that 2023 --- the year attributed in the literature to an A-share regime
-rotation --- more than halves its loss under a refit, and its rank IC rises $86\%$.
-Roughly half of what reads as a regime break is combiner staleness.
-
-\paragraph{Factor freshness is worth about twice as much again.}
-Fresh factors score $0.1001$ (2017--18) and $0.1136$ (2016) against $0.0526$ for
-stale factors with a fresh combiner and $0.0439$ for both stale. Combining the two
-through $\mathrm{IR}=\mathrm{TC}\cdot \mathrm{IC}\cdot\sqrt{N}$: both stale
-$0.30$, refit-only $0.36$, re-mined and refit $\bm{0.68}$ --- the first
-configuration above the conventional $0.5$ viability bar. \emph{This figure carries
-a caveat that the experiment is designed to test; see \S\ref{sec:leak}.}
+Refreshing the \emph{factors} is worth roughly twice as much again: fresh factors
+score 0.1001 and 0.1136 against 0.0526 for stale factors with a fresh combiner.
+Putting both together, $\mathrm{IR}=\mathrm{TC}\cdot\mathrm{IC}\cdot\sqrt{N}$ goes
+0.30 (both stale) $\to$ 0.36 (refit only) $\to$ 0.68 (re-mined and refit), which is
+the first number above the usual 0.5 bar. There is a caveat on that figure in
+\S\ref{sec:leak}.
 
 \section{The design}
 
-Mining cadence is the primary lever and combiner refit the secondary one, and both
-belong inside one loop. The design has a deterministic layer that always runs and
-an advisory layer that may only make it act sooner.
+Two layers. A deterministic one that always runs, and an agent that can only make
+it act sooner.
 
-\paragraph{Deterministic layer (the hard floor).}
-Per-factor rolling 63-day IC is compared against the factor's validation IC at
-admission. Tiers, on \emph{sustained} breaches rather than touches:
-\emph{healthy} ($\ge 70\%$ of baseline); \emph{soft decay} ($<70\%$ for 30+ days)
-$\to$ half weight; \emph{hard decay} ($<50\%$ for 60+ days) $\to$ removed from
-scoring, UUID retained and re-tested quarterly. Cadences: monitor \textbf{daily};
-refit \textbf{monthly} floor; re-mine \textbf{annual} floor, fired earlier when
-$\ge 33\%$ of the active set is hard-decayed or the book's own rolling IC breaches
-$50\%$ of baseline for 60 days.
+\textbf{Deterministic.} Each factor's rolling 63-day IC is compared to its
+validation IC at admission. Healthy at 70\% of baseline or better. Soft decay below
+70\% for 30 days straight, which halves its weight. Hard decay below 50\% for 60
+days, which drops it from scoring but keeps the UUID and re-tests it quarterly.
+Monitor daily, refit monthly, re-mine at least annually and sooner if a third of
+the book hard-decays. Annual is the floor, not a safe choice: the published
+half-life for this kind of factor is now around 18 months.
 
-Annual is the \emph{minimum} defensible re-mine cadence, not a cautious one: the
-published estimate for a medium-frequency factor's half-life is now around 18
-months, against 5--7 years pre-AI.
+\textbf{The agent.} The deterministic rule can't fire until a breach has held for
+30 days, so there's a month or two of lag to claw back. The agent runs weekly and
+on every tier change. It can pull a refit, a re-mine, or a demotion forward. The
+only thing it can delay is a soft demotion, and only with a computed market
+condition attached, expiring after a quarter, capped at a quarter of the book, and
+never against hard decay. If it breaks or returns nonsense, nothing happens --- the
+deterministic layer carries on.
 
-\paragraph{Advisory layer (the decay agent).}
-Because the deterministic rule cannot fire before a 30-day sustained breach, there
-is a structural 30--60 day latency to buy back. An LLM agent runs weekly and on
-every tier transition, and may: trigger a refit or re-mine early, or demote a
-factor early. It may delay exactly one thing --- a \emph{soft} demotion, via a
-regime exemption that must cite a computed market condition, expires after one
-quarter, may never cover more than $25\%$ of the active set, and may never apply
-to hard decay. It may never postpone a scheduled refit or re-mine. A malformed,
-timed-out, or absent agent is a non-event: the deterministic layer proceeds
-unchanged.
+\textbf{Soft decay under a tree model.} Halving a feature's weight does nothing to
+a gradient-boosted tree, and LightGBM gives us no per-factor weights anyway. The
+combiner already fits one model per seed and averages them, so a soft-decayed
+factor goes into half the seed models instead of all of them. Same effect, no new
+machinery.
 
-\paragraph{Soft decay under a tree model.}
-``Half weight'' is not literally implementable: gradient-boosted trees are
-invariant to monotone feature scaling and the LightGBM path produces no per-factor
-weights. The combiner already fits one model per seed and averages the
-predictions, so soft decay is expressed as \textbf{feature-subset bagging}: the
-factor's column enters only $\lceil p\cdot K\rceil$ of the $K$ seed models, with
-$p\in\{1,0.5,0\}$ reproducing the tier multipliers exactly.
+\textbf{The library.} Keep everything, forever, admitted or rejected, under its
+UUID. What actually trades is a capped subset chosen at each refit: drop the
+hard-decayed, drop the broken, then enforce an orthogonality gate so no two bets
+are the same, then cap and replace. The orthogonality gate exists in the code and
+is switched off by default.
 
-\paragraph{The library, and what actually trades.}
-The library is append-only and unbounded: every factor ever mined, admitted or
-rejected, retained under its UUID with its full trajectory. What trades is a
-\emph{capped, gated} active set, selected per refit by tier, then pathology, then
-an orthogonality gate ($\rho_{\max}\le\bar\rho$, so no two bets are the same ---
-currently disabled by default), then capacity-with-replacement, then re-measured
-marginal contribution against the set as it now stands.
+\textbf{Directions.} Each re-mine writes its own, from statistics computed up to
+that date: dispersion, breadth, the size-decile spread, volatility, return
+autocorrelation, turnover, overnight gaps, industry dispersion, correlation. No
+news. The 2023 rotation \emph{is} rising dispersion and an inverted size spread,
+and the agent sees those as numbers with no label on them. We never tell it the
+story.
 
-\paragraph{Direction selection, without a news corpus.}
-Each re-mine derives its own directions from a \textbf{computed market-state
-report} over data $\le T$: cross-sectional dispersion, breadth, the size-decile
-spread, volatility term structure, return autocorrelation at 1/5/20 days,
-turnover, overnight-gap share, industry dispersion, and mean pairwise correlation.
-No news is read. This is deliberate: the 2023 rotation \emph{is} a rise in
-dispersion and an inversion of the size spread, and the agent sees those as
-numbers with no label. Nothing about the regime narrative is ever stated to the
-model.
+\textbf{Parents.} Today selection is pure exploitation over a pool that gets thrown
+away at the end of each run, and it has produced operator monoculture twice. The
+library becomes an archive binned by operator, horizon, regime behaviour and decay
+tier, with parents drawn 50\% from the best performers, 30\% from thinly populated
+bins, and 20\% from dead factors whose regime looks like the current one.
 
-\paragraph{Parent selection.}
-Selection today is pure exploitation over a pool destroyed at the end of each run,
-and it has produced operator monoculture twice. The library becomes a MAP-Elites
-style archive binned by operator class, horizon, regime profile and decay tier,
-with parents drawn on a logged budget: $50\%$ exploit (best by shrunk marginal
-contribution among healthy factors), $30\%$ explore (sparse archive cells), $20\%$
-resurrect (hard-decayed factors whose regime profile matches the current market
-state). Selection within a pool is UCB over \emph{cells}, not factors, because
-individual fitness is noisy enough that three of four verdicts flip across
-combiner seeds.
+\section{How we test it}
 
-\section{The experiment}
-
-Validation is a historical replay: at each trigger point $T$, everything ---
-market state, direction, mining, admission, active-set gate, combiner fit --- uses
-data $\le T$ only; the following year is scored and never revisited; per-arm daily
-returns are stitched into one continuous series.
+Replay history. At each trigger point everything uses data up to that date only,
+the next year gets scored, and we never look at it again. Returns stitch into one
+series per arm.
 
 \begin{table}[h]
 \centering
-\caption{The nine arms. ``Schedule'' distinguishes the deterministic floor alone
-from the floor plus the advisory decay agent.}
 \small
-\begin{tabular}{llllp{5.4cm}}
+\begin{tabular}{lllp{6.2cm}}
 \toprule
-arm & directions & schedule & re-mines & what it isolates \\
+arm & directions & schedule & what it tells us \\
 \midrule
-\textbf{C} & --- & none & no & static baseline; the number to beat (CRR $-41.32\%$) \\
-\textbf{D} & --- & calendar & no & refit only; already measured (CRR $+2.68\%$) \\
-\addlinespace
-\textbf{A} & fixed & deterministic & yes & the value of re-mining itself \\
-\textbf{B} & agent & deterministic & yes & the direction agent (vs A) \\
-\textbf{G} & fixed & $+$ decay agent & yes & the decay agent (vs A) \\
-\textbf{H} & agent & $+$ decay agent & yes & the full system; interaction of both agents \\
-\textbf{H$^-$} & agent & $+$ agent, accelerate-only & yes & the regime-exemption mechanism (vs H); run only if H beats G \\
-\addlinespace
-\textbf{E} & Alpha158 & calendar & no & leakage control: a fixed, published, pre-LLM factor set \\
-\textbf{F} & random DSL & calendar & no & leakage control: mechanically generated expressions, no survivorship \\
+C & --- & none & static baseline, CRR $-41.3\%$ \\
+D & --- & calendar & refit only, CRR $+2.68\%$ \\
+A & fixed & deterministic & whether re-mining is worth it \\
+B & agent & deterministic & the direction agent \\
+G & fixed & + decay agent & the decay agent \\
+H & agent & + decay agent & both together \\
+H$^-$ & agent & + agent, no exemptions & what the regime exemption buys \\
+E & Alpha158 & calendar & leakage control, no LLM \\
+F & random DSL & calendar & same, without survivorship \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\noindent
-Arms A, B, G, H form a $2\times2$ factorial over \{fixed, agent\} directions
-$\times$ \{deterministic, $+$agent\} scheduling. The contrasts of interest are
-$A-D$ (re-mining), $B-A$ (direction agent), $G-A$ (decay agent), $H-G$ and $H-B$
-(each agent in the presence of the other), and the interaction
-$(H-G)-(B-A)$.
+A, B, G and H are a 2$\times$2 over directions and scheduling. So $A-D$ is
+re-mining, $B-A$ is the direction agent, $G-A$ is the decay agent, and
+$(H-G)-(B-A)$ tells us whether the two agents help each other or get in each
+other's way. C and D are already measured. E and F need no mining.
 
-\paragraph{Metrics.}
-Primary: stitched \textbf{CRR}. Secondary, per year and per arm: ARR, IR, MDD,
-rank IC, IC, ICIR, TC, turnover, cost in bps, active-set size, admissions, and the
-decay tier census. The benchmark's own return is reported alongside every arm,
-because excess return here is beta-driven and an arm that ``wins'' in a falling
-market has not necessarily produced alpha. Deflated Sharpe is computed against the
-\emph{true cross-mine trial count}, which grows with every mine and correctly
-raises the bar.
+Cost is 22--26 mines. G reuses A's mine whenever their trigger dates line up, so
+only the divergences cost anything extra. We measure what one mine costs before
+launching any of this, and the fallback is three trigger points instead of nine.
 
-\paragraph{Cost.}
-Annual triggers across 2017--2025 give nine points per re-mining arm. Arms G and H
-share mines with A and B wherever their trigger dates coincide, so the incremental
-cost of the decay-agent arms is only the divergences; the estimate is 22--26 mines
-in total. Arms C, D, E and F require no mining at all. The per-mine wall-clock and
-LLM cost is measured before anything is launched, and a reduced three-point trigger
-set is the pre-committed fallback.
+Headline metric is stitched CRR. Alongside it, per year and per arm: ARR, IR, MDD,
+rank IC, IC, ICIR, TC, turnover, cost, book size, admissions, tier counts. The
+benchmark's own return sits next to every arm, because excess return here is driven
+by beta and an arm that wins in a falling market hasn't necessarily found anything.
 
-\subsection{Temporal leakage, and why two control arms}
+\subsection{Leakage}
 \label{sec:leak}
 
-The generating model's weights contain the future; no prompt retracts that. Three
-layers bound what leakage can do --- context hygiene (only the train window is
-disclosed, clamped to the day before the earliest fold's validation day, failing
-closed), an output validator rejecting dates, tickers and named events, and a
-specificity cap so a direction names mechanisms rather than answers. But bounds
-are not measurements, so the experiment measures two distinct exposures.
+The model's weights contain the future and no prompt takes that back. We bound what
+it can do --- only the training window is disclosed, a validator strips dates and
+tickers, and a direction names a mechanism rather than an answer --- and then we
+measure two things.
 
-\paragraph{Late-sample leakage: already refuted.}
-If hindsight had been exploited, the factors would hold up in the leaked period.
-They do not: rank IC falls monotonically with distance from the fit and troughs at
-$0.0160$ in \textbf{2023}, the most-documented regime break in the sample and
-precisely where a leaking model's knowledge is densest. There is also a structural
-reason --- admission selects on data $\le T$, so a factor whose edge exists only in
-the future is rejected before entering the library.
+Late-sample leakage is already ruled out. If hindsight were being used, the factors
+would hold up later in the sample. Instead rank IC falls steadily and bottoms out
+in 2023, the most heavily documented regime break we have and exactly where the
+model would know the most. Admission also selects on past data, so a factor that
+only works in the future never gets in.
 
-\paragraph{First-year leakage: \emph{not} refuted, and it matters.}
-Within the pool that works before $T$, hindsight can still select those the model
-knows persist longest. That inflates \textbf{year one} and converges to the honest
-baseline as even the leaked picks decay --- reproducing the observed curve exactly.
-The 2023 trough does not exclude it, since by 2023 a leaked pick is dead too. And
-the $A$ versus $B$ ablation is \textbf{blind} to it, because both arms author
-factors with the same model: this leakage is common mode and differences out.
+The first year after a fit is not ruled out, and it matters more. Among factors
+that work before the cutoff, hindsight can still pick the ones it knows last
+longest. That inflates year one and fades as those picks decay, which looks exactly
+like what we see. Arms A and B can't detect it either, since both write factors
+with the same model and the effect cancels. And the whole case for re-mining rests
+on a first-year number.
 
-This bears directly on the project's central justification. The $+90\%$
-factor-freshness figure, which carries re-mined-and-refit to gross IR $0.68$, is a
-\emph{first-year} measurement --- and an annually re-mining loop lives on exactly
-that number.
+Hence arms E and F, which have no LLM in them at all. Compare year-one IC against
+steady-state IC as a ratio. If ours is much higher than theirs, that's the leak.
+Until then we quote the steady-state figure, around 0.045--0.05, as what to expect,
+not the first-year 0.11.
 
-Hence arms \textbf{E} and \textbf{F}, which contain no LLM in generation and
-therefore cannot leak. Arm E is Alpha158, a fixed published pre-LLM set; arm F is
-mechanically generated DSL expressions, which arm E cannot replace because
-Alpha158 is a \emph{survivor} set and may show unusually flat decay for reasons
-unrelated to leakage. The test compares the \textbf{ratio} $\rid^{\text{year-1}} /
-\rid^{\text{steady-state}}$ (a ratio, because the controls are weaker in level). A
-materially larger ratio for the mined arms is the leakage signature, isolated at
-the layer the main ablation cannot reach. \textbf{Until these arms clear year one,
-the deployable expectation is the steady-state rank IC ($\sim\!0.045$--$0.05$), not
-the first-year value ($\sim\!0.11$), and $+90\%$ is quoted as an upper bound.}
-
-\section{What this closes, and what it cannot}
-
-\subsection{The research half is present and industry-normal}
+\section{What this settles, and what it doesn't}
 
 \begin{table}[h]
 \centering
-\caption{Predictive-power metrics. These are construction-, cost- and
-benchmark-independent: they are properties of the signal alone.}
 \begin{tabular}{lrrl}
 \toprule
-metric & full 2017--2025 & 2017 & typical usable range \\
+& 2017--2025 & 2017 & usable range \\
 \midrule
-IC            & 0.0425 & 0.0941 & 0.02--0.05 \\
-Rank IC       & 0.0565 & 0.1104 & 0.03--0.05 \\
-ICIR          & 0.315  & 0.743  & 0.3--0.5 \\
-Rank ICIR     & 0.409  & 0.845  & 0.3--0.5 \\
+IC        & 0.0425 & 0.0941 & 0.02--0.05 \\
+Rank IC   & 0.0565 & 0.1104 & 0.03--0.05 \\
+ICIR      & 0.315  & 0.743  & 0.3--0.5 \\
+Rank ICIR & 0.409  & 0.845  & 0.3--0.5 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\noindent
-On leak-free out-of-sample data the mined library sits inside the normal range for
-a usable equity signal on every predictive-power metric, and its first out-of-sample
-year is comfortably above it. \textbf{The system finds alpha.} That is the research
-question, and it is answered affirmatively.
+On clean out-of-sample data the library sits inside the normal range for a usable
+equity signal on every predictive-power metric, and its first year is above it. The
+system finds alpha. That was the research question and the answer is yes.
 
-\subsection{The trading half is where it is lost, and the metrics locate it exactly}
+Where it goes wrong is construction. Take
+$\mathrm{IR}=\mathrm{TC}\cdot\mathrm{IC}\cdot\sqrt{N}$: with IC 0.0425,
+$\sqrt{300}=17.3$ and TC 0.37, gross IR comes out around 0.3. Each term on its own
+is ordinary. A TC of 0.37 is normal for a long-only book, which usually runs
+0.3--0.6, so there is no hidden loss to go and recover. The product is too small
+because of the mandate --- 300 names, 50 holdings, long only, measured against a
+cap-weighted index we have no way to hedge.
 
-Write the standard decomposition
-$\mathrm{IR}=\mathrm{TC}\cdot\mathrm{IC}\cdot\sqrt{N}$. With
-$\mathrm{IC}=0.0425$, $N\approx 300$ so $\sqrt{N}=17.3$, and
-$\mathrm{TC}=0.37$:
-\[
-\mathrm{IR}_{\text{gross}} \;=\; 0.37 \times 0.0425 \times 17.3 \;\approx\; 0.27\text{--}0.36 .
-\]
-Every term is individually normal. \textbf{A transfer coefficient of $0.37$ is
-squarely inside the industry range of $0.3$--$0.6$ for a long-only book} --- there
-is no anomalous loss to recover. The product is sub-viable because of the
-\emph{mandate}: $N\approx 300$ names, $k=50$ holdings, long-only, benchmarked to a
-cap-weighted index with no hedging instrument. Five independent measurements
-confirm the constraint is construction, not signal:
+Five things say the same:
 
-\begin{enumerate}[leftmargin=*,itemsep=2pt]
-\item \textbf{The null model reproduces the pathology.} A book holding \emph{no}
-mined factors shows correlation $-0.64$ between excess return and the benchmark,
-against $-0.73$ for \main{}. The beta shortfall is a property of the construction,
-not of the factors.
-\item \textbf{The position cap is not binding.} Raising \texttt{max\_weight} from
-$0.03$ to $0.10$ left TC at $0.36$ and cost $10.5$ pp. The mean-variance optimiser
-\emph{diversified} from 100 to 134 names rather than concentrating --- a
-total-risk optimiser answering a benchmark-relative mandate.
-\item \textbf{Relaxing long-only raises TC and still loses.} Signed (dollar-neutral)
-top-$k$ lifted TC from $0.37$ to $\bm{0.51}$ at an unchanged cap --- confirming
-long-only, not the cap, is the binding constraint --- yet absolute long/short
-return was $-1.65\%$/yr with 2 of 9 positive years.
-\item \textbf{Three of nine tested configurations are worse than holding no factors
-at all}, including Kelly/mean-variance at CRR $-78.95\%$ against the null model's
-$-73.87\%$.
-\item \textbf{The best signal year is a losing year.} 2017, rank IC $0.1104$, ICIR
-$0.743$: $-5.45\%$, because the index rose $24.25\%$.
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+\item A book holding no mined factors shows the same beta problem, $-0.64$ against
+our $-0.73$. It's the construction, not the factors.
+\item Raising the position cap from 3\% to 10\% left TC at 0.36. The cap isn't what
+binds.
+\item Going dollar-neutral lifted TC to 0.51, which confirms long-only is what
+binds, and still lost money.
+\item Three of our nine configurations do worse than holding no factors.
+\item Our best signal year lost 5.45\%.
 \end{enumerate}
-
-\subsection{The asymmetry, stated plainly}
 
 \begin{table}[h]
 \centering
-\caption{What each half of the loop actually has.}
 \small
-\begin{tabular}{p{6.4cm}p{6.4cm}}
+\begin{tabular}{p{6.3cm}p{6.3cm}}
 \toprule
-\textbf{Factor side (research)} & \textbf{Portfolio side (trading)} \\
+\textbf{Factor side} & \textbf{Portfolio side} \\
 \midrule
-LLM search loop with mutation, crossover and refinement &
-\texttt{topk}$=50$ \\
-Admission gate on marginal contribution tested against its own noise &
-\texttt{max\_weight}$=0.03$ \\
-Benjamini--Hochberg FDR control; deflated Sharpe against trial count &
-\texttt{n\_drop}$=5$ \\
-Orthogonality gate, diversity scoring, lineage and verdict tracking & \\
-Per-factor tear sheets, diagnosis and routing & \\
+LLM search with mutation, crossover, refinement & \texttt{topk} = 50 \\
+Admission gate tested against its own noise & \texttt{max\_weight} = 0.03 \\
+FDR control and deflated Sharpe & \texttt{n\_drop} = 5 \\
+Orthogonality gate, diversity scoring, lineage & \\
+Per-factor tear sheets and diagnosis & \\
 \midrule
-\emph{A research system.} & \emph{Three constants, fixed once by a 54-config sweep on a single 2021 window.} \\
+A research system. & Three constants from one sweep on one 2021 window. \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\noindent
-The objective the search maximises is a function of IC. \textbf{Nothing in the
-system optimises IR or CRR.} The re-mining design in this document makes the
-research half close properly --- it monitors its own decay, re-mines against it,
-and refits continuously. It will raise IC, and on the measured decomposition that
-raises gross IR from $0.30$ to perhaps $0.68$.
+The objective we optimise is a function of IC. Nothing in the system optimises IR
+or CRR. The design in this document fixes the research half properly --- it watches
+its own decay, re-mines against it, refits continuously --- and on the numbers
+above that should take gross IR from 0.30 to somewhere near 0.68.
 
-It will not fix a transfer coefficient that is already normal, a benchmark that
-cannot be tracked long-only, or a construction stage with no search loop, no
-admission criterion and no multiple-testing control. \textbf{Converting demonstrated
-predictive power into realised profit requires a second system, built for
-construction the way this one was built for factors} --- searching over
-constraints, hedges, weighting schemes and rebalancing rules, with an objective
-that is the realised net IR rather than the signal's IC.
+It won't fix a transfer coefficient that is already normal, or a benchmark we can't
+track long-only, or a construction stage with no search, no admission rule and no
+multiple-testing control. Turning predictive power into profit needs a second
+system built for construction the way this one was built for factors, searching
+over constraints, hedges, weights and rebalancing, with realised net IR as the
+objective instead of IC.
 
-\paragraph{The falsifiable form of this claim.} If the conclusion is wrong, the
-replay will say so: an arm that materially improves IC should then also improve
-CRR. The measured relationship says it will not --- correlation between annual
-excess return and rank IC is $+0.11$, against $-0.73$ with the benchmark. We will
-report whichever answer the data gives.
+If we're wrong, the replay will say so: an arm that lifts IC should then lift CRR.
+Our measured correlation between annual excess return and rank IC is $+0.11$, so we
+don't expect it to.
 
-\section{What is not tested here}
-
-Shorting and borrow costs (deferred to the construction phase, and the signed
-result above says it is not a quick win); live news; real capital and a broker
-integration; and any change to the construction stage itself. NAV is simulated and
-compounds from \textyen100M, which at that scale leaves the market-impact term
-effectively inert --- it matters as the capital base changes, not now.
+Not covered here: shorting and borrow costs, live news, real capital, and any
+change to construction itself. NAV is simulated and compounds from 100M CNY, where
+the impact term is small enough not to matter yet.
 
 \end{document}
