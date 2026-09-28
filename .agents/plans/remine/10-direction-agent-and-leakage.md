@@ -166,3 +166,75 @@ report.
   the LLM, so that window is soft-selected on. Fix: the re-mine's validation window
   must sit strictly before the new `final_test`, and the window must never be
   reported as clean OOS.
+
+---
+
+## What the existing direction machinery already gives you
+
+Measured 2026-09-28, before writing anything. The agent is not a new pipeline —
+it is a new **supplier of one string**, and knowing which string matters is most of
+the design.
+
+**How directions are made today.**
+
+* `run.sh` takes one human-typed direction (default: *"cross-sectional equity
+  factors from daily price and volume"*). `planning.generate_parallel_directions`
+  expands it into `num_directions` = 10 parallel directions via the LLM, with the
+  clamped `_market_context()` leading the prompt.
+* Within a mine, `_reseed_if_stale` fires on staleness (`reseed_after_stale_rounds`
+  = 2, `growth_floor` = 1) or on schedule (`reseed_interval` = 4), builds a digest
+  (`_build_reseed_digest`), calls `generate_informed_directions`, **appends**
+  `num_directions` more (never replaces — working parents stay), marks saturated
+  directions, and resets the phase to ORIGINAL. `generate_informed_directions`
+  takes `initial_direction` too, so the seed string frames the reseed prompt as
+  well as the initial expansion.
+
+**What that produced in `meanvar_20260828_194432`** — 40 directions over 10 rounds:
+10 initial + 3 reseeds × 10. The budget split is lopsided:
+
+| | directions | trajectories | share |
+|---|---|---|---|
+| initial | 10 | 124 | **77%** |
+| reseeded | 30 | 37 | 23% |
+
+Twenty-three of the thirty reseeded directions got **exactly one** trajectory.
+
+**Three consequences that shape this task.**
+
+1. **The seed direction is the highest-leverage input in a mine.** It frames 77% of
+   the search. Replacing it with the agent's output is therefore not a marginal
+   change to a corner of the pipeline — it re-aims most of the budget, which is
+   exactly why the A/B contrast is worth the compute, and why the L3 specificity
+   budget (a direction names a mechanism, never an answer) is load-bearing rather
+   than decorative.
+2. **A direction seeded late is mostly wasted.** The cap is `max_rounds` = 15 (the
+   measured run finished 10). A direction appended at round 8 gets one pass and
+   dies with the run. In a loop that repeats every year, so the *output* of a
+   reseed has to persist across mines even though its *trigger* is within-run.
+3. **`direction_id` is a per-run list index, and the text is not persisted
+   anywhere.** Not in the trajectory pool (only `direction_id`), not in the ledger,
+   not in the library JSON. `grep` for the run.sh default finds it in smoke logs
+   only. Two mines' direction `3` are unrelated.
+
+**Required before the replay can run.**
+
+* **Record the direction.** `{direction_id, text, source: original|reseed_N,
+  round_added}` into the trajectory pool and the ledger. Without it arm A cannot be
+  told which direction to hold fixed — its one input is unrecoverable — and no
+  cross-mine direction memory is possible.
+* **Content-address it.** Key cross-mine direction memory on `md5(text)`, not the
+  index, so a direction re-proposed in a later mine is recognised as the same one.
+* **Pin the search dynamics across arms.** A and B must share `num_directions`,
+  `reseed_interval`, `reseed_after_stale_rounds`, `growth_floor`, `max_rounds` and
+  both prompt files. Otherwise `B − A` is not one argument, and the within-run
+  reseed — not the agent — is what differs.
+* **Filter novelty against the library, not the zoo.** `_filter_novel_directions`
+  currently compares against the operators exercised in the *current* zoo; in a
+  loop it must compare against the whole library's coverage, or each re-mine
+  re-enters the monoculture the gate exists to prevent.
+* **Persist direction outcomes.** `_direction_status` (attempts, admissions,
+  `last_admit_round`, saturated) is in-memory and dies with the run, so every
+  re-mine re-derives the same archetypes and re-exhausts them. Persisting it into
+  the `06` global store lets a saturated archetype stay retired across mines and a
+  productive one be re-seeded directly — which is the direction-level form of the
+  "what stopped working" memory in `07`.
