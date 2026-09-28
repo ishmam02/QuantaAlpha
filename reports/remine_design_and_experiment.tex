@@ -1,5 +1,5 @@
 \documentclass[11pt]{article}
-\usepackage[margin=0.95in]{geometry}
+\usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{bm}
 \usepackage{enumitem}
@@ -7,7 +7,7 @@
 \usepackage{booktabs}
 \usepackage{xcolor}
 \usepackage{titlesec}
-\linespread{0.96}
+\linespread{1.0}
 % Tighter section spacing only: the content and the margins are unchanged.
 % Needed to hold the document at four pages after the cost/trigger detail went in.
 \titlespacing*{\section}{0pt}{1.1ex plus .3ex minus .2ex}{0.5ex plus .2ex}
@@ -143,8 +143,8 @@ B & agent & deterministic & the direction agent \\
 G & fixed & + decay agent & the decay agent \\
 H & agent & + decay agent & both together \\
 H$^-$ & agent & + agent, no exemptions & what the regime exemption buys \\
-E & Alpha158 & calendar & leakage control, no LLM \\
-F & random DSL & calendar & same, without survivorship \\
+E & Alpha158 & calendar & leakage control --- public handcrafted set, no LLM \\
+F & random DSL & calendar & same, without Alpha158's survivorship \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -199,8 +199,11 @@ like what we see. Arms A and B can't detect it either, since both write factors
 with the same model and the effect cancels. And the whole case for re-mining rests
 on a first-year number.
 
-Hence arms E and F, which have no LLM in them at all. Compare year-one IC against
-steady-state IC as a ratio. If ours is much higher than theirs, that's the leak.
+Hence arms E and F, which have no LLM in them at all: E is Alpha158, a public set of
+handcrafted factors, F is randomly composed expressions, and neither stands in for what a
+firm running this loop would trade --- they show only what the pipeline produces with no
+model in it. Compare year-one IC
+against steady-state IC as a ratio. If ours is much higher than theirs, that's the leak.
 Until then the number to expect is the steady state --- 0.0526 mean Rank IC over
 2021--2025 with a refreshed combiner, above the 0.03--0.05 band a usable signal
 usually occupies. It is the first-year 0.11 we don't get to quote.
@@ -243,17 +246,22 @@ year, on the same annual-refit numbers as Table 1.
 \toprule
 & 2021 & 2022 & 2023 & 2024 & 2025 \\
 \midrule
-index    & $-3.5$ & $-19.8$ & $-9.1$ & $+18.2$ & $+21.0$ \\
-our ARR  & $\bm{+11.40}$ & $\bm{+8.98}$ & $-1.99$ & $-3.75$ & $-10.25$ \\
+index             & $-3.5$ & $-19.8$ & $-9.1$ & $+18.2$ & $+21.0$ \\
+our ARR, excess   & $\bm{+11.40}$ & $\bm{+8.98}$ & $-1.99$ & $-3.75$ & $-10.25$ \\
+our ARR, absolute & $+7.9$ & $-10.8$ & $-11.1$ & $+14.5$ & $+10.8$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-We made money in two years out of five, and the index fell in both. It never happens
-the other way round: there is no year where the index rose and we still came out
-ahead. A falling index isn't sufficient either --- 2023 fell and we still lost ---
-but it is necessary, which is not something you would say about a book that was
-earning its return from stock selection.
+The absolute row is approximate: the eval path stores only the excess, so it is excess
+plus the index's own return to first order. It makes the same point from the other side
+--- the book moves with the market and keeps part of it, $+14.5\%$ and $+10.8\%$ in the
+two up years against the index's $+18.2\%$ and $+21.0\%$.
+
+The excess is the row to read carefully: positive in 2021 and 2022, both years the index
+fell, and negative otherwise --- including 2023, which fell 9.1\% and still cost us 2.0
+points. A falling index is not sufficient, but it is necessary, which is not something
+you would say about a book earning its return from stock selection.
 
 Five things say the same:
 
@@ -261,10 +269,9 @@ Five things say the same:
 \item Annual excess return correlates $-0.73$ with the benchmark's own return and
 only $+0.11$ with our rank IC. A book holding no mined factors shows the same thing
 at $-0.64$, so it's the construction, not the factors.
-\item Raising the position cap from 3\% to 10\% left TC at 0.36. The cap isn't what
-binds.
-\item Going dollar-neutral lifted TC to 0.51, which confirms long-only is what
-binds, and still lost money.
+\item Raising the position cap from 3\% to 10\% left TC at 0.36, and going
+dollar-neutral lifted it only to 0.51. The cap isn't what binds --- long-only is ---
+and both still lost money.
 \item Three of our nine configurations do worse than holding no factors.
 \item Our best signal year lost money. 2017, rank IC 0.1104, the strongest this
 system has produced out of sample: $-5.45\%$, because the index rose 24.25\%.
