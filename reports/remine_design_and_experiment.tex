@@ -1,5 +1,5 @@
 \documentclass[11pt]{article}
-\usepackage[margin=0.95in]{geometry}
+\usepackage[margin=0.9in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{bm}
 \usepackage{enumitem}
@@ -9,7 +9,7 @@
 \usepackage{titlesec}
 % Tighter section spacing only: the content and the margins are unchanged.
 % Needed to hold the document at four pages after the cost/trigger detail went in.
-\titlespacing*{\section}{0pt}{1.6ex plus .3ex minus .2ex}{0.9ex plus .2ex}
+\titlespacing*{\section}{0pt}{1.3ex plus .3ex minus .2ex}{0.6ex plus .2ex}
 
 \newcommand{\main}{\textsc{main-full}}
 \newcommand{\rid}{\mathrm{IC}_{\mathrm{rank}}}
@@ -149,21 +149,24 @@ F & random DSL & calendar & same, without survivorship \\
 \end{table}
 
 A, B, G and H are a 2$\times$2 over directions and scheduling: $A-D$ is re-mining,
-$B-A$ the direction agent, $G-A$ the decay agent, and $(H-G)-(B-A)$ whether the two
-agents help each other or get in each other's way. C and D are already measured;
-E and F need no mining.
+$B-A$ the direction agent, $G-A$ the decay agent, $(H-G)-(B-A)$ whether the two agents
+help or hinder each other. C and D are already measured; E and F need no mining.
 
 Cost is 22--26 mines on the nine-point schedule and six on the reduced one. One mine
 is measured, not guessed: \texttt{meanvar\_20260828\_194432}, the 150-factor library
 this document is built on, took \textbf{15.1 hours of compute}, 160 batches at 5.7
-minutes. Its run spanned 51 hours of wall clock, 34 of them an interruption, so the
-replay is budgeted on machine time: 22--26 mines is 14--16 days, six is under four.
+minutes. Its 51 hours of wall clock included a 34-hour interruption, so the replay is
+budgeted on machine time: 22--26 mines is 14--16 days, six is under four.
 
-The nine trigger points are the first trading day of 2017 through 2025; A and B mine
-at each, G and H at those plus any the decay agent pulls forward, reusing a mine
-wherever a date coincides. The reduced set starts 2016, 2019 and 2022 --- blocks of
-three, three and four years --- and beginning in 2016 rather than 2017, arm C would
-need re-cutting over 2016--2025 to match.
+The nine nominal trigger points are the first trading day of 2017 through 2025, but
+that is a floor and not a schedule: the deterministic layer also mines sooner, whenever
+a third of the active set has hard-decayed or the book's 63-day rank IC has held below
+half its baseline for 60 days, and the agent can pull those forward but never push them
+back. So the replay's dates are not fixed in advance --- A and B mine at least nine
+times each across 2017--2025 and G and H at least as often; the spread above the floor
+is what 22--26 covers, reusing a mine wherever two arms land on the same date. The reduced set is the start of 2016, 2019 and 2022 (blocks of
+three, three and four years) --- a coarser experiment, not the production cadence. It
+begins in 2016, so arm C would need re-cutting over 2016--2025 to match.
 
 Headline metric is stitched CRR. Alongside it, per year and per arm: ARR, IR, MDD,
 rank IC, IC, ICIR, TC, turnover, cost, book size, admissions, tier counts. The
