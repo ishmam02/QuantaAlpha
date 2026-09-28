@@ -83,7 +83,9 @@ validation IC at admission. Healthy at 70\% of baseline or better. Soft decay be
 days, which drops it from scoring but keeps the UUID and re-tests it quarterly.
 Monitor daily, refit monthly, re-mine at least annually and sooner if a third of
 the book hard-decays. Annual is the floor, not a safe choice: the published
-half-life for this kind of factor is now around 18 months.
+half-life for this kind of factor is now around 18 months, and A-share price-volume
+factors' long-short returns have already fallen from about 18\% a year to under 2\% as
+quant assets grew from \textyen 0.76tn to \textyen 3.22tn.
 
 \textbf{The agent.} The deterministic rule can't fire until a breach has held for
 30 days, so there's a month or two of lag to claw back. The agent runs weekly and
@@ -143,8 +145,8 @@ B & agent & deterministic & the direction agent \\
 G & fixed & + decay agent & the decay agent \\
 H & agent & + decay agent & both together \\
 H$^-$ & agent & + agent, no exemptions & what the regime exemption buys \\
-E & Alpha158 & calendar & leakage control --- public handcrafted set, no LLM \\
-F & random DSL & calendar & same, without Alpha158's survivorship \\
+E & GTJA191 & calendar & leakage control --- the market's own public alpha set \\
+F & random DSL & calendar & same, without GTJA191's survivorship \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -199,10 +201,12 @@ like what we see. Arms A and B can't detect it either, since both write factors
 with the same model and the effect cancels. And the whole case for re-mining rests
 on a first-year number.
 
-Hence arms E and F, which have no LLM in them at all: E is Alpha158, a public set of
-handcrafted factors, F is randomly composed expressions, and neither stands in for what a
-firm running this loop would trade --- they show only what the pipeline produces with no
-model in it. Compare year-one IC
+Hence arms E and F, which have no LLM in them at all: E is GTJA191, the 191 price-volume
+alphas Guotai Junan published in 2017 --- the public list this market's research actually
+benchmarks against --- and F is randomly composed expressions. Neither stands in for what
+a firm running this loop would trade; they show only what the pipeline produces with no
+model in it, and GTJA191 is a survivor set for the same reason Alpha158 is, which is why F
+sits beside it. Compare year-one IC
 against steady-state IC as a ratio. If ours is much higher than theirs, that's the leak.
 Until then the number to expect is the steady state --- 0.0526 mean Rank IC over
 2021--2025 with a refreshed combiner, above the 0.03--0.05 band a usable signal
@@ -235,6 +239,12 @@ own is ordinary --- a TC near 0.4 is normal for a long-only book, which usually 
 0.3--0.6 --- so there is no hidden loss to go and recover. The product is too small
 because of the mandate --- 300 names, 50 holdings, long only, measured against a
 cap-weighted index we have no way to hedge.
+
+The industry's own numbers say the same. Across 1,236 A-share index-enhancement products
+the average excess return over the half-year to June 2026 was 3.1 percentage points,
+against 14.2 a year earlier, and CSI300 enhancers have compounded roughly 94\% of excess
+since 2019. We are at 2.68\% over five years. Factor quality is not what separates us
+from them --- delivery is.
 
 The clearest way to see it is to put our excess return next to the index's, year by
 year, on the same annual-refit numbers as Table 1.
