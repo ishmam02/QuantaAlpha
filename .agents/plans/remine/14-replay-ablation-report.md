@@ -1,4 +1,4 @@
-# 14 — Historical replay, the two-arm ablation, and the report
+# 14 — Historical replay, the nine-arm experiment, and the report
 
 **Depends on:** everything. **Last, and once.**
 
@@ -15,20 +15,47 @@ user asked for can be measured at all.
 **Arms** (identical in every other respect — same trigger points, same seeds, same
 protocol, same cost model, same caps):
 
-| arm | directions | purpose |
-|---|---|---|
-| **A — control** | the same fixed initial direction at every re-mine | isolates re-mining itself |
-| **B — treatment** | the `10` direction-selector agent | isolates the agent's contribution |
-| **C — static baseline** | no re-mine, no refit — the 2016-fit book | the number to beat: CRR **−41.32%** |
-| **D — refit only** | refit, never re-mine | already measured: CRR **+2.68%** |
-| **E — non-LLM control** | **Alpha158**, a fixed published pre-LLM factor set, through the identical combiner / gate / cost model / book at every T | **the leakage control.** No LLM touches generation, so its first-year-after-fit lift is pure fit-distance with zero parametric leakage possible |
+| arm | directions | schedule | re-mines | what it isolates |
+|---|---|---|---|---|
+| **C — static** | — | none | no | the number to beat: CRR **−41.32%** |
+| **D — refit only** | — | calendar | no | already measured: CRR **+2.68%** |
+| **A** | fixed | deterministic floor | yes | **re-mining itself** (vs D) |
+| **B** | `10` agent | deterministic floor | yes | **the direction agent** (vs A) |
+| **G** | fixed | **+ decay agent** | yes | **the decay agent** (vs A) |
+| **H** | `10` agent | **+ decay agent** | yes | **the full system**; both agents together |
+| **H⁻** | `10` agent | + agent, **accelerate-only** | yes | **the regime-exemption mechanism** (vs H). Conditional: run only if H beats G |
+| **E — non-LLM control** | **Alpha158** (fixed, published, pre-LLM) | calendar | no | leakage at the **generation** layer |
+| **F — non-LLM control** | **random DSL expressions** | calendar | no | same, without Alpha158's survivorship |
 
-C and D are already measured, so they cost nothing to include and they are what
-makes A and B interpretable. E needs no mining at all — only the existing pipeline
-run on a fixed factor set — so it is the cheapest arm here and the most important
-one for the leakage question below.
+**A, B, G, H are a 2×2 factorial** over {fixed, agent} directions × {deterministic,
++agent} scheduling. Contrasts of interest:
 
-### Why arm E exists
+* `A − D` — is re-mining worth it at all?
+* `B − A` — the direction agent, under deterministic scheduling
+* `G − A` — the decay agent, under a fixed direction
+* `H − G`, `H − B` — each agent in the presence of the other
+* `(H − G) − (B − A)` — the **interaction**: do the two agents compound or conflict?
+* `H⁻ − H` — what the bounded regime exemption is worth (it is the riskiest
+  mechanism in the design, and the only one that can *delay* a demotion)
+
+C and D are already measured, so they cost nothing. E and F need **no mining at
+all** — only the existing pipeline run on a fixed or mechanically generated factor
+set.
+
+**Why the decay-agent arms need their own mines.** The agent changes *when* a
+re-mine fires, so an accelerated trigger is a different mine. Mitigation: cache
+mines keyed on `(direction_source, T)`, so G shares A's mine (and H shares B's)
+wherever trigger dates coincide. Only the divergences cost extra — estimate
+**22-26 mines total** rather than 36.
+
+**Why arm F exists as well as E.** Alpha158 is a *survivor* set: published because
+it worked. It may therefore show unusually flat decay for reasons unrelated to
+leakage, which would make the mined arms look worse by comparison. Randomly
+composed DSL expressions through the same gate have no survivorship and no LLM, so
+F is the cleaner control; E is the cheaper and more interpretable one. Run both and
+report both ratios — if they disagree, the disagreement is itself the finding.
+
+### Why the non-LLM control arms exist
 
 **The A/B ablation cannot detect generation-level parametric leakage**, because
 both arms write factors with the same LLM: the leakage is common mode and
@@ -50,12 +77,13 @@ first-year performance. If that lift is partly hindsight, the payoff is overstat
 and will not appear live.
 
 **The test:** compare `year-1 IC / steady-state IC` — a **ratio**, because Alpha158
-is weaker in level — between each mined arm and arm E. Matching ratios ⇒ the lift
+is weaker in level — between each mined arm and arms E/F. Matching ratios ⇒ the lift
 is honest fit-distance. A materially larger ratio for the mined arms ⇒ the leakage
 signature, isolated at the layer A/B cannot reach.
 
-**Trigger points:** annual, 2017-2025 (9 points × 2 new arms = **18 mines**), or the
-reduced set (2016 / 2019 / 2022 → 6 mines) if `01`'s envelope says so. **The choice
+**Trigger points:** annual, 2017-2025 (9 points × 4 re-mining arms, reduced to an
+estimated **22-26 mines** by the `(direction_source, T)` mine cache above), or the
+reduced set (2016 / 2019 / 2022) if `01`'s envelope says so. **The choice
 is made before any result is seen**, and recorded.
 
 **Walk-forward honesty:** at each trigger point T, everything — market state,
@@ -85,27 +113,27 @@ into `_fdr_bar`. Do not reset `n_tests` between mines.
    flatter, post-T knowledge entering through the *direction* is the only thing
    that would produce it. The bar is "arm B matches arm A's shape", not "arm B
    decays at all", since honest fit-distance decay is the shared baseline.
-2. **Generation layer — first-year ratio, mined arms vs arm E.** The test above is
-   **blind** to leakage common to both LLM arms. Compare
-   `year-1 IC / steady-state IC` against Alpha158's. This is the one that bears on
-   whether re-mining's measured payoff is real.
+2. **Generation layer — first-year ratio, mined arms vs arms E and F.** The test
+   above is **blind** to leakage common to both LLM arms. Compare
+   `year-1 IC / steady-state IC` against the two non-LLM controls. This is the one
+   that bears on whether re-mining's measured payoff is real.
 
 Report the decay slope, the year-of-trough, and the year-1 ratio per arm beside
 the headline. The three `10` controls run alongside and bound the input channel.
 
 **Reporting rule — first year is quoted separately, always.** Never fold
 first-year-after-fit IC into an average and never headline it. State it beside the
-steady-state figure with the arm-E ratio attached. **Until arm E clears year 1, the
+steady-state figure with the control-arm ratio attached. **Until arms E and F clear year 1, the
 deployable expectation is the steady-state IC (~.045-.05), not the first-year
 (~.11)** — and any forward projection of the re-mining payoff uses the
 steady-state number.
 
 The claim is "L1-L3 enforced; decay shape matched between arms; year-1 ratio
-matches the non-LLM control; placebo similarity = X" — never "no leakage".
+matches the non-LLM controls; placebo similarity = X" — never "no leakage".
 
 ## Harness
 
-`scripts/qa_remine_replay.py --arm {A,B,C,D} --triggers ... --resume`
+`scripts/qa_remine_replay.py --arm {A,B,C,D,E,F,G,H,Hminus} --triggers ... --resume`
 
 * Drives the **same** `quantaalpha/loop/scheduler.py` used in live mode — if replay
   and live take different code paths, the replay proves nothing about live.

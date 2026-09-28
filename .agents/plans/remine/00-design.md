@@ -31,7 +31,7 @@ Four measured facts drive the whole design:
    dominant term.
 2. **Refitting the combiner alone recovers ~20%** — and it is the only
    configuration of nine tested with positive CRR (+2.68%). It improves **5 of 5
-   years, +4.57pp/yr mean**, on the *same* factors. **It is currently not done at
+   years, +4.69pp/yr mean**, on the *same* factors. **It is currently not done at
    all.**
 3. **Refreshing the factors is worth ~2× more: ~+90%.** Fresh factors score
    .1001 (2017-18) and .1136 (2016) against .0526 for stale-factors/fresh-combiner
@@ -39,8 +39,8 @@ Four measured facts drive the whole design:
    **⚠ Carries a known confound.** These are *first-year-after-fit* numbers, and
    §5 shows that window is the one place parametric leakage could still operate —
    hindsight can select, from the factors that work before T, those it knows
-   persist longest. Arm E in `14` is the control. **Until it clears, treat +90% as
-   an upper bound**, and note that this figure is what carries re-mined+refit to
+   persist longest. Arms E/F in `14` are the controls. **Until they clear, treat +90%
+   as an upper bound**, and note that this figure is what carries re-mined+refit to
    gross IR 0.68 in point 4.
 4. **Only the combination clears viability.** Implied gross `IR = TC·IC·√N`:
    both stale **0.30**, refit-only **0.36**, re-mined + refit **0.68** — the first
@@ -178,7 +178,7 @@ observe or change, not by intuition.
 |---|---|---|
 | **Live IC update + tier classification** | **Daily** | Cheap (one cross-sectional corr per factor per day, then a rolling mean). The tiers need *sustained* 30/60-day breaches, so daily is the natural resolution of the rule itself. |
 | **Decay agent** | **Weekly + immediately on any tier transition** | The deterministic rule cannot fire before a 30-day sustained breach, so a *daily* agent adds cost without new information. Weekly gives 4-8 observations inside a soft-decay window — enough to act early — and the event trigger removes the latency objection entirely. ~52 scheduled calls/yr. |
-| **Combiner refit** | **Monthly floor**, plus on any tier transition or agent request | An *annual* refit already buys +4.57pp/yr and is the only positive-CRR configuration. A fit is seconds-to-minutes. There is no compute reason to be slower than monthly. **Caveat: a fresher model trades more** — refit cadence is a swept parameter in `12-`, monthly is the default, not a finding. |
+| **Combiner refit** | **Monthly floor**, plus on any tier transition or agent request | An *annual* refit already buys +4.69pp/yr and is the only positive-CRR configuration. A fit is seconds-to-minutes. There is no compute reason to be slower than monthly. **Caveat: a fresher model trades more** — refit cadence is a swept parameter in `12-`, monthly is the default, not a finding. |
 | **Full re-mine** | **Annual hard floor**, earlier on trigger | A mine is the expensive operation (~150 factors of LLM work). Annual is the *minimum* defensible cadence, not a conservative one: our own Rank IC runs .1104 → .054 over three years, and the published estimate for a medium-frequency factor's half-life is now ~**18 months** (against 5-7 years pre-AI). Triggers that fire it earlier are below. |
 | **Re-test of hard-decayed UUIDs** | **Quarterly** | Already specified by `DecayRule.retest_days = 91` and implemented by `decay.due_for_retest`. Regimes return; a retired factor is re-tested, never deleted. |
 
@@ -249,11 +249,13 @@ This lands on the project's core justification: the ~+90% factor-freshness figur
 (fresh .1001 / .1136 vs .0526 stale) is a **first-year** measurement, and an
 annually re-mining loop lives on exactly that number.
 
-Hence **arm E** in `14`: Alpha158 — a fixed, published, pre-LLM factor set — run
-through the identical pipeline at every T. No LLM touches generation, so its
-first-year lift is pure fit-distance. Compare `year-1 IC / steady-state IC` as a
+Hence **arms E and F** in `14`: Alpha158 (a fixed, published, pre-LLM set) and
+randomly composed DSL expressions, both run through the identical pipeline at every
+T. No LLM touches generation, so their first-year lift is pure fit-distance. F is
+needed as well as E because Alpha158 is a *survivor* set and may decay unusually
+flatly for reasons unrelated to leakage. Compare `year-1 IC / steady-state IC` as a
 **ratio**; a materially larger ratio for the mined arms is the leakage signature at
-the layer A/B cannot reach. **Until that control clears, the deployable expectation
+the layer A/B cannot reach. **Until these controls clear, the deployable expectation
 is steady-state IC, not first-year.**
 
 This is about the *old* configuration, where the model got little beyond a window
