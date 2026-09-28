@@ -21,9 +21,38 @@ protocol, same cost model, same caps):
 | **B — treatment** | the `10` direction-selector agent | isolates the agent's contribution |
 | **C — static baseline** | no re-mine, no refit — the 2016-fit book | the number to beat: CRR **−41.32%** |
 | **D — refit only** | refit, never re-mine | already measured: CRR **+2.68%** |
+| **E — non-LLM control** | **Alpha158**, a fixed published pre-LLM factor set, through the identical combiner / gate / cost model / book at every T | **the leakage control.** No LLM touches generation, so its first-year-after-fit lift is pure fit-distance with zero parametric leakage possible |
 
 C and D are already measured, so they cost nothing to include and they are what
-makes A and B interpretable.
+makes A and B interpretable. E needs no mining at all — only the existing pipeline
+run on a fixed factor set — so it is the cheapest arm here and the most important
+one for the leakage question below.
+
+### Why arm E exists
+
+**The A/B ablation cannot detect generation-level parametric leakage**, because
+both arms write factors with the same LLM: the leakage is common mode and
+differences out. A/B tests the *direction agent*; it is blind to leakage inherent
+in using an LLM to author factors at all.
+
+The concern is specific. Admission selects on data ≤ T, so a factor whose edge
+exists only in the future is rejected — but within the pool that works before T,
+hindsight can pick the ones the model knows **persist longest**. That inflates the
+**first-year-after-fit** IC and converges to the honest baseline as even the leaked
+picks decay. It reproduces the observed curve exactly, so the decay shape does not
+discriminate it, and the 2023 trough does not either (by 2023 a leaked pick is dead
+too).
+
+This matters more than it first appears: the entire justification for re-mining is
+a **first-year** measurement — fresh .1001 (2017-18) / .1136 (2016) against .0526
+stale, the ~+90% figure behind gross IR 0.68. An annually re-mining loop *lives on*
+first-year performance. If that lift is partly hindsight, the payoff is overstated
+and will not appear live.
+
+**The test:** compare `year-1 IC / steady-state IC` — a **ratio**, because Alpha158
+is weaker in level — between each mined arm and arm E. Matching ratios ⇒ the lift
+is honest fit-distance. A materially larger ratio for the mined arms ⇒ the leakage
+signature, isolated at the layer A/B cannot reach.
 
 **Trigger points:** annual, 2017-2025 (9 points × 2 new arms = **18 mines**), or the
 reduced set (2016 / 2019 / 2022 → 6 mines) if `01`'s envelope says so. **The choice
@@ -50,16 +79,29 @@ has not necessarily produced alpha. The size decomposition runs on the winner.
 with every mine, and the bar correctly rises), plus the BH/FDR bar already wired
 into `_fdr_bar`. Do not reset `n_tests` between mines.
 
-**Leakage:** the primary test is the **IC decay shape, compared between arms**. If
-arm B (agent directions) decays materially flatter than arm A (fixed direction) —
-its factors holding up in later years — that is the leakage signature, because
-post-T knowledge is the only thing that would produce it. Report the decay slope
-and the year-of-trough per arm beside the headline. On the existing library this
-test already passes (Rank IC falls monotonically from .1104 to a .0160 trough in
-2023, the most-documented break in the sample), so the bar is "arm B matches arm
-A's shape", not "arm B decays at all". The three `10` controls run alongside and
-bound the channel. The claim is "L1-L3 enforced; decay shape matched; placebo
-similarity = X" — never "no leakage".
+**Leakage:** two tests at two different layers, because no single one covers both.
+
+1. **Agent layer — decay shape, arm B vs arm A.** If arm B decays materially
+   flatter, post-T knowledge entering through the *direction* is the only thing
+   that would produce it. The bar is "arm B matches arm A's shape", not "arm B
+   decays at all", since honest fit-distance decay is the shared baseline.
+2. **Generation layer — first-year ratio, mined arms vs arm E.** The test above is
+   **blind** to leakage common to both LLM arms. Compare
+   `year-1 IC / steady-state IC` against Alpha158's. This is the one that bears on
+   whether re-mining's measured payoff is real.
+
+Report the decay slope, the year-of-trough, and the year-1 ratio per arm beside
+the headline. The three `10` controls run alongside and bound the input channel.
+
+**Reporting rule — first year is quoted separately, always.** Never fold
+first-year-after-fit IC into an average and never headline it. State it beside the
+steady-state figure with the arm-E ratio attached. **Until arm E clears year 1, the
+deployable expectation is the steady-state IC (~.045-.05), not the first-year
+(~.11)** — and any forward projection of the re-mining payoff uses the
+steady-state number.
+
+The claim is "L1-L3 enforced; decay shape matched between arms; year-1 ratio
+matches the non-LLM control; placebo similarity = X" — never "no leakage".
 
 ## Harness
 

@@ -36,6 +36,12 @@ Four measured facts drive the whole design:
 3. **Refreshing the factors is worth ~2× more: ~+90%.** Fresh factors score
    .1001 (2017-18) and .1136 (2016) against .0526 for stale-factors/fresh-combiner
    and .0439 for both-stale.
+   **⚠ Carries a known confound.** These are *first-year-after-fit* numbers, and
+   §5 shows that window is the one place parametric leakage could still operate —
+   hindsight can select, from the factors that work before T, those it knows
+   persist longest. Arm E in `14` is the control. **Until it clears, treat +90% as
+   an upper bound**, and note that this figure is what carries re-mined+refit to
+   gross IR 0.68 in point 4.
 4. **Only the combination clears viability.** Implied gross `IR = TC·IC·√N`:
    both stale **0.30**, refit-only **0.36**, re-mined + refit **0.68** — the first
    configuration above the ~0.5 bar.
@@ -230,11 +236,31 @@ points at a factor that *also* worked before T, which is a **credit-assignment**
 problem (the system looks more capable than it is) rather than a performance-
 inflation one.
 
-This finding is about the *old* configuration, where the model got little beyond a
-window range. This design supplies far more period-identifying information, so it
-must be re-established per arm in `14`: **if the agent arm shows flatter IC decay
-than the fixed-direction arm, that is the leakage signature.** Three further
-controls bound the channel:
+**The decay curve does NOT clear the immediate post-fit window, and that is the
+exposure that matters.** Admission rejects a factor whose edge exists only in the
+future — but *within* the pool that works before T, hindsight can select the ones
+the model knows persist longest. That inflates **year 1** and converges to the
+honest baseline as even the leaked picks decay, reproducing the observed curve
+exactly. The 2023 trough does not rule it out either: by 2023 a leaked pick is dead
+too. Worse, **the A/B ablation is blind to it** — both arms author factors with the
+same LLM, so this leakage is common mode and differences out.
+
+This lands on the project's core justification: the ~+90% factor-freshness figure
+(fresh .1001 / .1136 vs .0526 stale) is a **first-year** measurement, and an
+annually re-mining loop lives on exactly that number.
+
+Hence **arm E** in `14`: Alpha158 — a fixed, published, pre-LLM factor set — run
+through the identical pipeline at every T. No LLM touches generation, so its
+first-year lift is pure fit-distance. Compare `year-1 IC / steady-state IC` as a
+**ratio**; a materially larger ratio for the mined arms is the leakage signature at
+the layer A/B cannot reach. **Until that control clears, the deployable expectation
+is steady-state IC, not first-year.**
+
+This is about the *old* configuration, where the model got little beyond a window
+range. This design supplies far more period-identifying information, so it must be
+re-established per arm in `14`: **if the agent arm shows flatter IC decay than the
+fixed-direction arm, that is the leakage signature.** Three further controls bound
+the input channel:
 
 * **Date-relabel placebo (decisive, cheap).** Run the agent on the *same*
   market-state report labelled with a different date. If the directions change
