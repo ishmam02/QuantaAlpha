@@ -23,19 +23,6 @@
 We mine factors once, from a direction someone types in, and then trade them
 forever. That doesn't hold up.
 
-Everything here is from the window we trust --- fit 2005--2016, scored 2017--2025,
-LightGBM combiner, top-50 book, full costs --- and every return is excess over the
-cap-weighted CSI300 total-return index, so CRR means cumulative excess return.
-
-Rank IC by year runs 0.1104, 0.0898, 0.0587, 0.0543, 0.0504, 0.0524, 0.0160,
-0.0288, 0.0469. It falls with distance from the fit and then flattens out around
-0.045. The 2023 hole is real --- IC goes negative for the smaller zoo that year.
-
-The returns are beta, not alpha. Annual excess return correlates $-0.73$ with the
-benchmark's own return and $+0.11$ with our rank IC. Every year we made money was
-a year the index fell. In 2017 we had the best signal this system has ever produced
-out of sample, rank IC 0.1104, and lost 5.45\% because the index rose 24.25\%.
-
 \section{What already works: refitting the combiner}
 
 Refit the combiner every year on data before the year being traded. Same factors
@@ -43,7 +30,11 @@ throughout, nothing re-mined, so any gain comes from the refit alone.
 
 \begin{table}[h]
 \centering
-\caption{\main{}, 147 factors. Excess over the total-return index, net of costs.}
+\caption{\main{}, 147 factors. Fit 2005--2016, scored 2017--2025; LightGBM
+combiner, top-50 book, full cost model. Every return is excess over the
+cap-weighted CSI300 total-return index, so CRR is cumulative excess return.
+Frozen is the single 2016 fit; refit is a fresh fit each year on data before the
+year being traded, with the factor library unchanged throughout.}
 \begin{tabular}{lrrrrr}
 \toprule
 & \multicolumn{2}{c}{frozen 2016 fit} & \multicolumn{2}{c}{annual refit} & \\
@@ -219,14 +210,16 @@ cap-weighted index we have no way to hedge.
 Five things say the same:
 
 \begin{enumerate}[leftmargin=*,itemsep=1pt]
-\item A book holding no mined factors shows the same beta problem, $-0.64$ against
-our $-0.73$. It's the construction, not the factors.
+\item Annual excess return correlates $-0.73$ with the benchmark's own return and
+only $+0.11$ with our rank IC. A book holding no mined factors shows the same thing
+at $-0.64$, so it's the construction, not the factors.
 \item Raising the position cap from 3\% to 10\% left TC at 0.36. The cap isn't what
 binds.
 \item Going dollar-neutral lifted TC to 0.51, which confirms long-only is what
 binds, and still lost money.
 \item Three of our nine configurations do worse than holding no factors.
-\item Our best signal year lost 5.45\%.
+\item Our best signal year lost money. 2017, rank IC 0.1104, the strongest this
+system has produced out of sample: $-5.45\%$, because the index rose 24.25\%.
 \end{enumerate}
 
 \begin{table}[h]
