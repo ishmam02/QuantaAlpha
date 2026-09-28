@@ -62,21 +62,30 @@ def main() -> int:
     ap.add_argument("--protocol", default="quantaalpha/eval/protocol_csi300.yaml")
     ap.add_argument("--out", default="data/results/report_fullcost_yearly.json")
     ap.add_argument("--no-dividend-fix", action="store_true",
-                    help="leave the protocol's price-return cap-weighted benchmark as-is")
+                    help="do not force SH000300TR; use whatever benchmark the "
+                         "--protocol file specifies (the shipped CSI300 protocols "
+                         "already specify it, so this is only meaningful for a "
+                         "custom protocol)")
     a = ap.parse_args()
 
     theta = load_protocol(a.protocol)
-    # DIVIDEND FIX. protocol_csi300.yaml omits benchmark_basis/benchmark_construction,
-    # so it defaults to a PRICE-return, CAP-weighted SH000300 benchmark. The book
-    # prices with ADJUSTED closes (dividends reinvested), so a price-return benchmark
-    # credits the strategy with the index's entire dividend yield as if it were alpha
-    # (+4.25pp/yr measured on CSI300). And the book is structurally equal-weight
-    # (max_weight caps every large constituent), so scoring it against a cap-weighted
-    # index adds an unchosen size bet. Both are put on the same basis here, matching
-    # protocol_csi300_meanvar_soft_linear.yaml:56-58.
+    # BENCHMARK: the official cap-weighted CSI300 TOTAL-RETURN index (沪深300全收益,
+    # CSIndex H00300), written into cn_data as SH000300TR by
+    # scripts/qa_fetch_csi300_total_return.py. The book prices with ADJUSTED closes
+    # (dividends reinvested), so subtracting a PRICE benchmark credited it with the
+    # index's whole dividend yield as if it were alpha -- officially 2.50%/yr on
+    # CSI300, +10.78 pp over 2022-2025.
+    # basis stays "price" because the series is ALREADY total-return; pairing a *TR
+    # ticker with estimated_total double-counts and load_benchmark() raises.
+    # This used to force an EQUAL-weighted basket plus an equal-weighted dividend
+    # estimate (2.40%/yr). Both were wrong: the basket is not the index, and the
+    # official cap-weighted yield is higher and swings 1.67-3.56 pp/yr.
+    # The book is still structurally equal-weight (max_weight caps every large
+    # constituent), so the size bet now sits INSIDE this number -- see
+    # scripts/qa_report_size_decomposition.py, which reports it separately.
     if not a.no_dividend_fix:
-        theta = replace(theta, benchmark_basis="estimated_total",
-                        benchmark_construction="equal")
+        theta = replace(theta, benchmark="SH000300TR",
+                        benchmark_construction="index", benchmark_basis="price")
     print(f"benchmark: basis={theta.benchmark_basis} "
           f"construction={theta.benchmark_construction}", flush=True)
     op = EvaluationOperator(theta)

@@ -274,7 +274,8 @@ class EvaluationOperator:
                     # ``_abs_spearman`` entries, same dict-iteration order, and
                     # eigenvalues are invariant to the block slotting.
                     _R_zoo = spearman_block_cached(
-                        aligned_zoo, (panel_start, panel_end))
+                        aligned_zoo,
+                        (panel_start, panel_end, len(panel.instruments)))
                     _R = np.eye(_n_zoo + _n_cand)
                     _R[:_n_zoo, :_n_zoo] = _R_zoo
                     _R[:_n_zoo, _n_zoo:] = _cz.T

@@ -48,38 +48,68 @@ _REF = Path("data/reference")
 _BETA_WINDOW = 250          # ~1 trading year
 _MIN_NAMES = 20             # a cross-section smaller than this cannot support the fit
 
+# Per-market reference files. The CSI300 files are built by
+# ``quantaalpha.data.reference_sync`` (akshare/baostock); the US files are built
+# by ``scripts/qa_build_us_reference.py`` (yfinance market cap + GICS sectors).
+# The parsing below is identical for both -- US ``code`` is already an uppercase
+# ticker (no ``.`` to strip) and US ``industry`` is already a single GICS letter
+# -- so only the FILE differs by market. ``theta.market`` selects which.
+_MCAP_PATHS = {
+    "csi300": _REF / "market_cap.parquet",
+    "sp500": _REF / "market_cap_us.parquet",
+}
+_INDUSTRY_PATHS = {
+    "csi300": _REF / "industry.parquet",
+    "sp500": _REF / "industry_us.parquet",
+}
 
-@lru_cache(maxsize=4)
-def _load_market_cap() -> pd.DataFrame:
-    path = _REF / "market_cap.parquet"
+
+@lru_cache(maxsize=8)
+def _load_market_cap(market: str = "csi300") -> pd.DataFrame:
+    path = _MCAP_PATHS.get(market)
+    if path is None:
+        raise ValueError(
+            f"unknown market {market!r}; expected one of {list(_MCAP_PATHS)}")
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} missing -- run quantaalpha.data.reference_sync.fetch_market_cap()")
+        build = ("run scripts/qa_build_us_reference.py"
+                 if market != "csi300"
+                 else "run quantaalpha.data.reference_sync.fetch_market_cap()")
+        raise FileNotFoundError(f"{path} missing -- {build}")
     return pd.read_parquet(path)
 
 
-@lru_cache(maxsize=4)
-def _load_industry() -> pd.Series:
-    """instrument -> CSRC TOP-LEVEL industry letter.
+@lru_cache(maxsize=8)
+def _load_industry(market: str = "csi300") -> pd.Series:
+    """instrument -> TOP-LEVEL industry letter for the given market.
 
-    Known limitation, to be disclosed: baostock returns a current snapshot, not
-    membership with in/out dates, so this applies today's classification to the
-    whole history. Industry assignment changes rarely, so the bias is small --
-    but it is not zero.
+    CSI300: the CSRC top-level category (~19 buckets, the leading letter of the
+    classification code). US: a single GICS-sector letter (T/H/F/D/S/C/I/E/U/M/R)
+    from ``scripts/qa_build_us_reference.py``.
+
+    Known limitation, to be disclosed for BOTH markets: the classification is a
+    CURRENT snapshot applied to the whole history (baostock returns one
+    ``updateDate``; yfinance ``.info['sector']`` is today's sector), not
+    membership with in/out dates. Industry assignment changes rarely, so the bias
+    is small -- but it is not zero.
     """
-    path = _REF / "industry.parquet"
+    path = _INDUSTRY_PATHS.get(market)
+    if path is None:
+        raise ValueError(
+            f"unknown market {market!r}; expected one of {list(_INDUSTRY_PATHS)}")
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} missing -- run quantaalpha.data.reference_sync.fetch_industry()")
+        build = ("run scripts/qa_build_us_reference.py"
+                 if market != "csi300"
+                 else "run quantaalpha.data.reference_sync.fetch_industry()")
+        raise FileNotFoundError(f"{path} missing -- {build}")
     df = pd.read_parquet(path)
     code = df["code"].str.replace(".", "", regex=False).str.upper()   # sh.600000 -> SH600000
     top = df["industry"].fillna("").str.slice(0, 1).replace("", "?")
     return pd.Series(top.to_numpy(), index=code.to_numpy()).groupby(level=0).first()
 
 
-def size_frame(panel: PanelBundle) -> pd.DataFrame:
+def size_frame(panel: PanelBundle, market: str = "csi300") -> pd.DataFrame:
     """``log(circ_mv)``, aligned to the panel grid."""
-    mc = _load_market_cap()
+    mc = _load_market_cap(market)
     wide = mc.pivot(index="date", columns="instrument", values="circ_mv")
     wide = wide.reindex(index=panel.dates, columns=panel.instruments).ffill()
     return np.log(wide.where(wide > 0))
@@ -102,8 +132,8 @@ def beta_frame(panel: PanelBundle, benchmark: pd.Series,
     return beta.shift(1)
 
 
-def _industry_dummies(instruments: pd.Index) -> pd.DataFrame:
-    ind = _load_industry().reindex(instruments)
+def _industry_dummies(instruments: pd.Index, market: str = "csi300") -> pd.DataFrame:
+    ind = _load_industry(market).reindex(instruments)
     d = pd.get_dummies(ind.fillna("?"), prefix="ind", dtype=float)
     # Drop one level: with an intercept, a full dummy set is collinear.
     return d.iloc[:, 1:] if d.shape[1] > 1 else d
@@ -148,10 +178,12 @@ def residualize(signal_wide: pd.DataFrame, panel: PanelBundle, theta: Protocol,
     n_mad = float(getattr(theta.admission, "winsor_mad", 5.0) or 5.0)
     sig = winsorize(sig, n_mad)
 
+    market = getattr(theta, "market", "csi300")
+
     # Only include factors that actually carry values. An all-NaN column makes
     # `isfinite(X).all(axis=1)` false for EVERY name, which silently skips every
     # date and returns an all-NaN residual -- the failure mode this hit first.
-    factors: dict[str, pd.DataFrame] = {"size": size_frame(panel)}
+    factors: dict[str, pd.DataFrame] = {"size": size_frame(panel, market)}
     if benchmark is not None:
         factors["beta"] = beta_frame(panel, benchmark)
     factors.update(extra or {})
@@ -165,7 +197,7 @@ def residualize(signal_wide: pd.DataFrame, panel: PanelBundle, theta: Protocol,
     factors = {k: winsorize(f.reindex(index=sig.index, columns=sig.columns), n_mad)
                for k, f in factors.items()}
 
-    dummies = _industry_dummies(panel.instruments)          # static, names x K
+    dummies = _industry_dummies(panel.instruments, market)  # static, names x K
     dum = dummies.to_numpy(dtype=float)
 
     out = pd.DataFrame(np.nan, index=sig.index, columns=sig.columns)
@@ -244,7 +276,8 @@ def residualize_vs_library(signal_wide: pd.DataFrame, zoo_signals: dict,
 
 
 def exposure_report(signal_wide: pd.DataFrame, panel: PanelBundle,
-                    benchmark: pd.Series | None = None) -> dict:
+                    benchmark: pd.Series | None = None,
+                    market: str = "csi300") -> dict:
     """Average cross-sectional correlation of the signal with each risk factor.
 
     This is what the generator has never been shown. "Your factor was 0.71
@@ -253,7 +286,7 @@ def exposure_report(signal_wide: pd.DataFrame, panel: PanelBundle,
     """
     sig = signal_wide.reindex(index=panel.dates, columns=panel.instruments)
     sig = sig.where(panel.universe)
-    size = size_frame(panel)
+    size = size_frame(panel, market)
     out: dict[str, float] = {}
 
     def _corr(a: pd.DataFrame, b: pd.DataFrame) -> float:

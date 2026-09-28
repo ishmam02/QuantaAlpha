@@ -89,8 +89,8 @@ def main() -> int:
     a = ap.parse_args()
 
     theta = load_protocol(a.protocol)
-    theta = replace(theta, benchmark_basis="estimated_total",
-                    benchmark_construction="equal")
+    theta = replace(theta, benchmark="SH000300TR",
+                    benchmark_construction="index", benchmark_basis="price")
     op = EvaluationOperator(theta)
     # panel must span every horizon we score on
     lo = min(w[0] for w in HORIZONS.values())

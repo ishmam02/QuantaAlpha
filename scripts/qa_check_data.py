@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """Pre-flight check: is the market data and the factor cache usable?
 
-Answers the two questions that silently ruin a long mine:
+Answers the three questions that silently ruin a long mine:
 
   1. Which price/volume fields does the Qlib data actually serve? A field the data
      lacks cannot be added to ``generate.py``.
   2. Which fields does the factor cache expose to the generator? The cache -- not the
      raw Qlib data -- is what mined formulas are computed against, so a field missing
      here means every formula referencing it is silently dropped.
+  3. Is the cache the reference cache? With generate.py's default fields, its content
+     must match the reference fingerprint, so every setup mines against the same panel.
 
 Run before any long mine:
 
@@ -16,15 +18,30 @@ Run before any long mine:
 from __future__ import annotations
 import collections
 import glob
+import hashlib
 import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Factor code runs against the data/ copies. The repo-root copies feed the generator's
+# column list and the automatic rebuild (RUNNING.md 3.2, "Why two folders"), so they
+# are checked too when present, but a missing one is not an error.
 CACHES = [
     ROOT / "data/git_ignore_folder/factor_implementation_source_data/daily_pv.h5",
     ROOT / "data/git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5",
 ]
+MIRRORS = [ROOT / "git_ignore_folder" / c.parent.name / c.name for c in CACHES]
+
+# Content fingerprints of the reference cache, from content_digest() below. generate.py
+# with its defaults, run on the Hugging Face cn_data.zip, reproduces both exactly
+# (verified 2026-09-16). HDF5 bytes differ from write to write even when the content is
+# identical, so the fingerprint covers the content, not the file.
+REFERENCE_FIELDS = ["$open", "$close", "$high", "$low", "$volume", "$factor", "$vwap"]
+REFERENCE_DIGEST = {
+    "factor_implementation_source_data": "dd5541b38b2d2a69",
+    "factor_implementation_source_data_debug": "b98eb53ae1fd7769",
+}
 # The field list is read out of generate.py rather than restated here. A hand-kept copy
 # drifts, and a stale copy makes this check call a healthy cache broken -- which is
 # exactly what a pre-flight check must never do. Parsed from the source with ast so that
@@ -53,6 +70,23 @@ ok = True
 
 def section(title: str) -> None:
     print(f"\n{title}\n" + "-" * len(title))
+
+
+def content_digest(df) -> str:
+    """Fingerprint of a cache's column names, dtypes, index and values."""
+    import numpy as np
+
+    h = hashlib.sha256()
+    h.update(repr([(str(c), str(t)) for c, t in df.dtypes.items()]).encode())
+    h.update(repr(list(df.index.names)).encode())
+    h.update(df.index.get_level_values(0).values.astype("datetime64[ns]").astype("int64").tobytes())
+    h.update("\n".join(df.index.get_level_values(1)).encode())
+    values = np.ascontiguousarray(df.to_numpy())
+    # NaN bit patterns can vary by platform, so hash where the NaNs are, not their bits.
+    nan = np.isnan(values)
+    h.update(nan.tobytes())
+    h.update(np.where(nan, values.dtype.type(0), values).tobytes())
+    return h.hexdigest()[:16]
 
 
 # ---------------------------------------------------------------- Qlib raw data
@@ -108,12 +142,16 @@ except ImportError:
     pd = None
 
 if pd is not None:
+    # A deliberate FIELDS edit (RUNNING.md 4.1.1) changes the content, so only a cache
+    # built from the reference field list is held to the reference fingerprint.
+    compare = FIELDS == REFERENCE_FIELDS
     found_any = False
-    for cache in CACHES:
+    for cache in CACHES + MIRRORS:
         if not cache.exists():
-            print(f"  absent: {cache.relative_to(ROOT)}")
+            optional = "" if cache in CACHES else " (optional: a mine builds it if missing)"
+            print(f"  absent: {cache.relative_to(ROOT)}{optional}")
             continue
-        found_any = True
+        found_any = found_any or cache in CACHES
         d = pd.read_hdf(cache)
         cols = list(d.columns)
         dates = d.index.get_level_values(0)
@@ -123,10 +161,22 @@ if pd is not None:
         missing = [f for f in EXPECTED_CACHE if f not in cols]
         if missing:
             print(f"    MISSING {' '.join(missing)} -- formulas using them cannot be computed.")
-            print("    -> delete the cache and re-run a mine to rebuild it (RUNNING.md 4.1.1).")
+            print("    -> rebuild it with quantaalpha/factors/data_template/generate.py (RUNNING.md 3.2, Step 3).")
             ok = False
+        elif compare:
+            digest, want = content_digest(d), REFERENCE_DIGEST[cache.parent.name]
+            if digest == want:
+                print(f"    matches the reference cache (fingerprint {digest})")
+            else:
+                print(f"    DIFFERS from the reference cache (fingerprint {digest}, expected {want})")
+                print("    -> rebuild with generate.py's defaults from the Hugging Face cn_data.zip and copy")
+                print("       the result into both cache folders (RUNNING.md 3.2, Step 3).")
+                ok = False
+        del d
+    if not compare:
+        print("  generate.py FIELDS differ from the reference set; content not compared.")
     if not found_any:
-        print("  no cache yet -- the first mine builds one. That is expected on a fresh setup.")
+        print("  no cache in data/git_ignore_folder/ yet -- build it before mining (RUNNING.md 3.2, Step 3).")
 
 # ---------------------------------------------------------------- verdict
 section("Verdict")

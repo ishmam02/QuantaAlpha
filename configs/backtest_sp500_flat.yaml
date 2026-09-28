@@ -1,0 +1,128 @@
+######################################################################
+# Backtest V2 — S&P 500, FLAT (realistic-flat) cost, test 2022-2025
+# US mirror of configs/backtest.yaml (which is CSI300). Differences:
+#   - data: us_data / region us / market sp500  (QLIB_DATA_DIR env overrides provider_uri)
+#   - benchmark: GSPC (S&P 500 index; cap-weighted — cf. CSI300's SH000300)
+#   - costs: FLAT symmetric commission open=close=0.00005 (0.5bps), min_cost 0,
+#     no stamp duty / no spread / no impact  (mirrors protocol_sp500_lightgbm_topk_flat
+#     kappa0=0.00005). CSI300's open 0.0005 / close 0.0015 (stamp duty) dropped.
+#   - limit_threshold 1.0 (US has no daily price-limit board; 0.095 was CSI300's 10% limit)
+#   - llm.cache_dir: data/results/factor_cache_us  (US-ONLY md5(expr) cache; the btv2
+#     calculator key is md5(expr) market-agnostic, so pointing at the US cache is what
+#     prevents a cross-market leak. auto_extract_cache MUST stay false or it pulls
+#     CSI300 factors in.)
+#   - model num_threads 6 (20 thrashes the 8-core box; memory qa-replay-gil-multiprocessing)
+# Label, model hyperparams, TopkDropout topk50/n_drop5, segments all UNCHANGED from
+# btv2 — that is the point of running btv2 (close-to-close label, btv2 preprocess).
+######################################################################
+
+random_seed: 42
+
+experiment:
+  name: "backtest_v2_us_flat"
+  recorder: "backtest_v2_us_recorder"
+  output_dir: "data/results/backtest_v2_us"
+  output_metrics_file: "backtest_metrics.json"
+
+factor_source:
+  type: "custom"
+  custom:
+    json_files: []
+    quality_filter: null
+    max_factors: null
+    use_llm_for_incompatible: true
+
+data:
+  provider_uri: "~/.qlib/qlib_data/us_data"   # env QLIB_DATA_DIR / QLIB_PROVIDER_URI override this
+  region: "us"
+  market: "sp500"
+  start_time: "2016-01-01"
+  end_time: "2025-12-26"
+
+dataset:
+  label: "Ref($close, -2) / Ref($close, -1) - 1"   # btv2 close-to-close label (unchanged)
+
+  learn_processors:
+    - class: "Fillna"
+      kwargs:
+        fields_group: "feature"
+    - class: "ProcessInf"
+    - class: "DropnaLabel"
+    - class: "CSRankNorm"
+      kwargs:
+        fields_group: "feature"
+    - class: "CSRankNorm"
+      kwargs:
+        fields_group: "label"
+
+  infer_processors:
+    - class: "Fillna"
+      kwargs:
+        fields_group: "feature"
+    - class: "ProcessInf"
+    - class: "CSRankNorm"
+      kwargs:
+        fields_group: "feature"
+    - class: "CSRankNorm"
+      kwargs:
+        fields_group: "label"
+
+  segments:
+    train: ["2016-01-01", "2020-12-31"]
+    valid: ["2021-01-01", "2021-12-31"]
+    test:  ["2022-01-01", "2025-12-26"]
+
+model:
+  type: "lgb"
+  params:
+    loss: "mse"
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 6          # was 20 (thrashes 8-core box)
+    seed: 42
+    random_state: 42
+    early_stopping_round: 50
+    num_boost_round: 500
+    min_child_samples: 100
+    feature_fraction_bynode: 0.8
+
+backtest:
+  strategy:
+    class: "TopkDropoutStrategy"
+    module_path: "qlib.contrib.strategy"
+    kwargs:
+      signal: "<PRED>"
+      topk: 50
+      n_drop: 5
+
+  backtest:
+    start_time: "2022-01-01"
+    end_time: "2025-12-26"
+    account: 100000000
+    benchmark: "GSPC"       # S&P 500 index (cap-weighted); features/GSPC exists in us_data
+    exchange_kwargs:
+      limit_threshold: 1.0  # US has no daily price-limit board (CSI300 used 0.095 = 10%)
+      deal_price: "open"
+      open_cost: 0.00005    # FLAT: 0.5bps symmetric commission, no stamp duty
+      close_cost: 0.00005   # FLAT: same on the sell side
+      min_cost: 0           # US has no minimum ticket charge (CSI300 used 5 yuan)
+
+llm:
+  enabled: true
+  timeout: 300
+  max_retries: 3
+  cache_results: true
+  cache_dir: "data/results/factor_cache_us"   # US-ONLY md5(expr) cache (prevents cross-market leak)
+  auto_extract_cache: false   # MUST stay false: auto-extract scans CSI300 main logs
+  debug: false
+
+factor_calculation:
+  output_dir: "data/results/computed_factors_us"
+  save_intermediate: false
+  n_jobs: 4
+  data_file: null

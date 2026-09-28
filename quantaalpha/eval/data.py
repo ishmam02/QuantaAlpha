@@ -115,7 +115,7 @@ def _align(df: pd.DataFrame, panel: PanelBundle, *, mask: bool = True) -> pd.Dat
     return out
 
 
-def _membership_mask(
+def _membership_mask_config(
     instruments_config: object, dates: pd.Index, columns: pd.Index
 ) -> pd.DataFrame:
     """Point-in-time CSI 300 membership as a boolean ``(T × N)`` mask.
@@ -124,6 +124,15 @@ def _membership_mask(
     ``(start, end)`` spans during which it was a constituent. Using those spans
     rather than a static end-of-sample list is what prevents survivorship bias
     from entering every downstream metric.
+
+    NOTE: this used to be called ``_membership_mask``, which the spell-file
+    implementation further down then SHADOWED -- so every call resolved to that
+    one instead, and ``load_panel`` was handing a qlib config dict to a function
+    expecting a market-name string. That built a nonsense path, missed, and took
+    the all-True fallback. Measured effect was nil (qlib NaN-fills non-members, so
+    ``close.notna()`` reproduced the right mask), but the engine should not depend
+    on that accident. Renamed so the two no longer collide; ``load_panel`` now
+    calls the spell-file version with a proper string.
     """
     from qlib.data import D
 
@@ -163,7 +172,11 @@ def load_panel(theta: Protocol, start: str, end: str) -> PanelBundle:
     dates = frames["close"].index
     columns = frames["close"].columns
 
-    universe = _membership_mask(instruments, dates, columns)
+    # Pass the market NAME, not the qlib instruments config: the live
+    # _membership_mask reads the spell file and expects a string. (It previously
+    # received `instruments`, a dict, which silently fell through to an all-True
+    # mask -- see _membership_mask_config's note.)
+    universe = _membership_mask(theta.market, dates, columns)
     # A name with no price on a date cannot be traded on it, whatever the
     # index membership file says.
     universe = universe & frames["close"].notna()
@@ -188,7 +201,8 @@ def load_panel(theta: Protocol, start: str, end: str) -> PanelBundle:
 
 
 def estimated_dividend_return(start: str, end: str,
-                              max_daily: float = 0.25) -> pd.Series:
+                              max_daily: float = 0.25,
+                              market: str = "csi300") -> pd.Series:
     """Daily dividend return of the universe.
 
     The income component is the gap between a TOTAL-return series and a
@@ -212,7 +226,7 @@ def estimated_dividend_return(start: str, end: str,
     _init_qlib()
     from qlib.data import D
 
-    raw = D.features(D.instruments("csi300"), ["$close", "$factor"],
+    raw = D.features(D.instruments(market), ["$close", "$factor"],
                      start_time=start, end_time=end)
     if raw.empty:
         return pd.Series(dtype=float)
@@ -271,7 +285,14 @@ def _membership_mask(market: str, dates: pd.Index, instruments: pd.Index) -> pd.
     at a median 447 names for a 300-name index -- so weighting or averaging its
     output without this mask silently uses a larger, different universe.
     """
-    path = Path.home() / ".qlib/qlib_data/cn_data/instruments" / f"{market}.txt"
+    # Resolve the instruments dir from QLIB_PROVIDER_URI (default cn_data) so this
+    # works for ANY provider root -- us_data/instruments/sp500.txt as well as
+    # cn_data/instruments/csi300.txt. Hardcoding cn_data here meant the equal-weight
+    # benchmark's membership mask silently read the wrong spell file for any other
+    # market (the US equal_weight_benchmark would have loaded CSI300 membership).
+    root = Path(os.path.expanduser(
+        os.environ.get("QLIB_PROVIDER_URI", "~/.qlib/qlib_data/cn_data")))
+    path = root / "instruments" / f"{market}.txt"
     mask = pd.DataFrame(False, index=dates, columns=instruments)
     if not path.exists():
         return ~mask.astype(bool) | True        # no spell file -> keep everything
@@ -308,7 +329,19 @@ def load_benchmark(theta: Protocol, start: str, end: str) -> pd.Series:
 
     basis = str(getattr(theta, "benchmark_basis", "price")).strip().lower()
     if basis in ("estimated_total", "total"):
-        div = estimated_dividend_return(start, end)
+        # GUARD: a benchmark that is ALREADY a total-return index (SH000300TR, the
+        # official 沪深300全收益) must not also receive an estimated dividend add-on --
+        # that double-counts the yield (~2.5 pp/yr on CSI300) and silently flatters
+        # every excess return. Such a ticker is already "total", so the correct basis
+        # is "price" (add nothing).
+        if str(theta.benchmark).upper().endswith("TR"):
+            raise ValueError(
+                f"benchmark {theta.benchmark!r} is already a TOTAL-RETURN index, but "
+                f"benchmark_basis={basis!r} would add an estimated dividend yield on "
+                f"top of it -- double-counting ~2.5 pp/yr. Set benchmark_basis: price."
+            )
+        div = estimated_dividend_return(start, end,
+                                        market=getattr(theta, "market", "csi300"))
         if not div.empty:
             ret = ret.add(div.reindex(ret.index).fillna(0.0), fill_value=0.0)
     ret.name = "benchmark"

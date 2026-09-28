@@ -5,7 +5,8 @@ factor library. Written to be followed by a person or executed by an AI agent: e
 step states what to run, what you should see, and how to tell whether it worked.
 
 > **The short version.** Install into a conda environment, put the Qlib China A-share
-> data where `.env` points, add an LLM API key, then run `scripts/qa_mine.sh` to mine
+> data where `.env` points, build the factor cache with `generate.py` (the downloaded
+> one has no `$return` or `$vwap`), add an LLM API key, then run `scripts/qa_mine.sh` to mine
 > and `python -m quantaalpha.backtest.run_backtest` to evaluate. Expect **10–30 hours**
 > for a full 150-factor mine and about **5 minutes** for a backtest.
 
@@ -102,32 +103,180 @@ Then edit `.env`. The keys that must be correct before anything runs:
 
 ### 3.2 Get the market data
 
-The system needs Qlib-format China A-share daily data (2005–2026), roughly 5 GB.
+All the price data comes from the Hugging Face dataset
+[`QuantaAlpha/qlib_csi300`](https://huggingface.co/datasets/QuantaAlpha/qlib_csi300):
+
+| File | Size | Contents | Needed for |
+|---|---|---|---|
+| `cn_data.zip` | 493 MB | Qlib-format China A-share daily data, 2005-01-04 to 2026-01-09, ten fields per stock | Qlib init, the evaluation protocol, backtests |
+| `daily_pv.h5` | 398 MB | The **factor cache**: a pre-computed price/volume panel | Factor mining |
+| `daily_pv_debug.h5` | 1.4 MB | A 100-stock, 2018–2019 slice of the cache | Mining in debug mode |
+
+Mining and evaluation read prices from different places. Mined formulas are computed
+against the factor cache. The evaluation protocol that scores them reads
+`$open $high $low $close $volume $amount $vwap $factor` directly from the Qlib directory
+([`quantaalpha/eval/data.py:32`](quantaalpha/eval/data.py#L32)). Both must be complete, and
+the cache you download is not: Step 3 fixes it.
+
+#### Step 1: Download
 
 ```bash
-mkdir -p data/qlib
-# Option A — Hugging Face (recommended)
-huggingface-cli download <dataset-id> --local-dir data/qlib --repo-type dataset
-# Option B — direct download, then unpack
-# wget <url> -O cn_data.zip && unzip cn_data.zip -d data/qlib
+# Option A: huggingface-cli (recommended)
+pip install huggingface_hub
+huggingface-cli download QuantaAlpha/qlib_csi300 --repo-type dataset --local-dir ./hf_data
+
+# Option B: wget
+mkdir -p hf_data
+wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/cn_data.zip
+wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/daily_pv.h5
+wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/daily_pv_debug.h5
 ```
 
-**Verify** — you must have all three subdirectories:
+#### Step 2: Extract and place
+
+```bash
+# 1. Qlib data -> data/qlib/cn_data/
+mkdir -p data/qlib
+unzip hf_data/cn_data.zip -d ./data/qlib
+
+# 2. Factor cache -> both cache folders (see "Why two folders" below)
+for root in git_ignore_folder data/git_ignore_folder; do
+  mkdir -p "$root/factor_implementation_source_data" "$root/factor_implementation_source_data_debug"
+  cp hf_data/daily_pv.h5       "$root/factor_implementation_source_data/daily_pv.h5"
+  cp hf_data/daily_pv_debug.h5 "$root/factor_implementation_source_data_debug/daily_pv.h5"
+done
+```
+
+> **Note**: `daily_pv_debug.h5` must be renamed to `daily_pv.h5` when placed in the debug
+> folder, as above.
+
+**Why two folders.** The cache location is a relative path
+([`quantaalpha/factors/coder/config.py:10-13`](quantaalpha/factors/coder/config.py#L10-L13)),
+and a mine resolves it in two different places:
+
+- **`data/git_ignore_folder/`**: factor code runs against this copy, which is linked into
+  every workspace as `./daily_pv.h5`. `factor.py` resolves the path against the parent of
+  `DATA_RESULTS_DIR`, which is `data/` with the §3.1 settings.
+- **`git_ignore_folder/` at the repository root**: the list of columns shown to the
+  generator comes from this copy's debug file. If this folder is missing, the first mine
+  rebuilds the cache here, and only here.
+
+Keep the two copies identical; `qa_check_data.py` checks both. If you launch with
+`QA_QLIB_DATA_DIR` set (see the US subsection below), `run.sh` exports an absolute path
+instead, and only `data/git_ignore_folder/` is read.
+
+#### Step 3: Add `$return` and `$vwap` to the cache (required)
+
+The `daily_pv.h5` on Hugging Face is out of date. It has six columns
+(`$open $close $high $low $volume $factor`), but mining uses eight. The two it lacks are
+the base features the generator's prompt offers besides OHLCV
+([`prompts.yaml:379`](quantaalpha/factors/prompts/prompts.yaml#L379)):
+
+| Missing column | What it is | Reference-library formulas that use it |
+|---|---|---|
+| `$return` | Daily close-to-close return, derived per stock | 67 of 150 |
+| `$vwap` | Volume-weighted average price, read from Qlib | 26 of 150 |
+
+A formula that uses a missing column fails to compute and is dropped, but the run carries
+on. So a mine on the downloaded cache finishes normally while quietly searching a smaller
+space.
+
+The script that writes all eight columns is
+[`quantaalpha/factors/data_template/generate.py`](quantaalpha/factors/data_template/generate.py).
+It reads `$vwap` from the Qlib data you unpacked in Step 2 and computes `$return` from
+`$close`:
+
+```bash
+export QLIB_DATA_DIR="$PWD/data/qlib/cn_data"      # absolute path; generate.py reads it
+cd quantaalpha/factors/data_template
+python generate.py                                 # writes daily_pv_all.h5 + daily_pv_debug.h5 here
+cd ../../..
+for root in git_ignore_folder data/git_ignore_folder; do
+  cp quantaalpha/factors/data_template/daily_pv_all.h5   "$root/factor_implementation_source_data/daily_pv.h5"
+  cp quantaalpha/factors/data_template/daily_pv_debug.h5 "$root/factor_implementation_source_data_debug/daily_pv.h5"
+done
+```
+
+The build took 1.5 minutes on a 16 GB Mac (2026-09-16) and ends with
+`wrote daily_pv_all.h5   14,215,449 rows x 8 cols, 5982 instruments`. Its first six
+columns are identical to the downloaded file, so the build only adds the two missing
+columns. It also overwrites both cache files, so if you plan to run it you can skip
+downloading `daily_pv.h5` and `daily_pv_debug.h5` in Step 1; it needs only
+`cn_data.zip`.
+
+**Everyone gets the same cache.** These commands, run on the Hugging Face `cn_data.zip`,
+produce a cache identical in content to the reference cache. It has the same eight
+float32 columns in the same order (`$open $close $high $low $volume $factor $return
+$vwap`), the same rows, and the same values. This was verified on 2026-09-16 from a fresh
+unzip, with pyqlib 0.9.7 and pandas 2.3.3. Leave `QA_DATA_START` and the `QA_DEBUG_*`
+variables unset, since they change what gets built. `QA_DATA_CHUNK` changes only memory
+use: a build with `QA_DATA_CHUNK=200` produced the same fingerprints.
+
+HDF5 files differ byte for byte between builds even when their content is identical, so
+don't compare them with `md5`. Instead, `qa_check_data.py` fingerprints each cache's
+content and prints `matches the reference cache` when it agrees with:
+
+| Cache file (in both folders) | Rows | Fingerprint |
+|---|---|---|
+| `factor_implementation_source_data/daily_pv.h5` | 14,215,449 | `dd5541b38b2d2a69` |
+| `factor_implementation_source_data_debug/daily_pv.h5` | 48,700 | `b98eb53ae1fd7769` |
+
+To change which columns the cache carries, see §4.1.1. The check skips the fingerprint
+comparison once `FIELDS` differs from the reference list.
+
+#### Step 4: Reference data for the evaluation protocol
+
+Before scoring a candidate, the evaluation protocol strips out its size and industry
+exposure ([`quantaalpha/eval/neutralize.py`](quantaalpha/eval/neutralize.py)). Neither
+download includes size or industry data.
+[`quantaalpha/data/reference_sync.py`](quantaalpha/data/reference_sync.py) builds both
+from free sources into `data/reference/`:
+
+| File | Contents | Built by |
+|---|---|---|
+| `industry.parquet` | CSRC industry code for every A-share (5,553 rows on 2026-09-16) | `fetch_industry()`: one baostock query, a few seconds |
+| `market_cap.parquet` | Daily circulating market cap for the 934 stocks ever in CSI300 | `fetch_market_cap()`: one paced akshare request per stock. About 6 s per listed stock (2026-09-16), longer for delisted ones, so allow two hours or more. Resumable. |
+
+```bash
+pip install akshare baostock      # not installed by `pip install -e .`
+python - <<'PY'
+from quantaalpha.data.reference_sync import fetch_industry, fetch_market_cap
+fetch_industry()
+# Called with no arguments, fetch_market_cap() reads CSI300 membership from
+# ~/.qlib/qlib_data/cn_data, which exists only after run.sh has run once.
+# Pass the membership from Step 2 instead.
+codes = sorted({line.split()[0] for line in open("data/qlib/cn_data/instruments/csi300.txt") if line.strip()})
+fetch_market_cap(codes=codes)     # re-run to resume if interrupted
+PY
+```
+
+If either file is missing, a mine still runs. Each candidate logs
+`neutralization failed for <formula> (FileNotFoundError); scoring raw` and is judged on
+its raw signal, which cannot tell a real factor from a disguised size bet. If that line
+appears in a mine's log, these files are missing.
+
+#### Verify
+
+You must have all three Qlib subdirectories:
 
 ```bash
 ls data/qlib/cn_data          # expect: calendars  features  instruments
 ```
 
-Then check which price/volume fields your copy carries — this determines what the
-generator can build formulas from:
+Then check the Qlib fields and the factor cache:
 
 ```bash
 python scripts/qa_check_data.py
 ```
 
-A full copy has ten fields: `open close high low volume amount vwap adjclose factor
-change`; the bare minimum is `open close high low volume`. The same script also
-inspects the factor cache (§4.1.1) and prints `READY` when both are usable.
+A full Qlib copy has ten fields (`open close high low volume amount vwap adjclose factor
+change`); the bare minimum is `open close high low volume`. The script then checks all
+four cache files, in `data/git_ignore_folder/` and at the repository root. After Step 3,
+each should show eight columns and `matches the reference cache`, followed by `READY`.
+
+- `MISSING $vwap $return` means that copy is still the downloaded one: run Step 3.
+- `DIFFERS from the reference cache` means it was built from other data or settings (or
+  is left over from an older `generate.py`): rebuild it with Step 3.
 
 ```bash
 python - <<'PY'
@@ -144,6 +293,69 @@ PY
 Expect **~5,100 trading days ending in 2026** and several hundred stocks. If the
 calendar is short or the dates are wrong, the download is incomplete — fix it now
 rather than debugging a failed mine later.
+
+#### S&P 500 (US transfer) — optional
+
+The US dataset has the same two parts (a Qlib directory and `daily_pv.h5`), on
+[`QuantaAlpha/qlib_sp500`](https://huggingface.co/datasets/QuantaAlpha/qlib_sp500).
+Its `daily_pv.h5` already has all eight columns, including `$return` and `$vwap`, so it
+needs no Step 3. `run.sh` reads the US cache only from `data/git_ignore_folder/`; it
+switches there when `QA_QLIB_DATA_DIR` points at `us_data`:
+
+```bash
+huggingface-cli download QuantaAlpha/qlib_sp500 --repo-type dataset --local-dir ./hf_data_us
+mkdir -p data/qlib
+unzip hf_data_us/us_data.zip -d ./data/qlib          # -> ./data/qlib/us_data/
+mkdir -p data/git_ignore_folder/factor_implementation_source_data_us
+mkdir -p data/git_ignore_folder/factor_implementation_source_data_us_debug
+cp hf_data_us/daily_pv.h5        data/git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5
+cp hf_data_us/daily_pv_debug.h5  data/git_ignore_folder/factor_implementation_source_data_us_debug/daily_pv.h5
+```
+
+Point `.env` at `./data/qlib/us_data` (`QLIB_DATA_DIR` + `QLIB_PROVIDER_URI`) and
+verify the same way:
+
+```bash
+python - <<'PY'
+import qlib
+from qlib.data import D
+qlib.init(provider_uri="data/qlib/us_data", region="us")
+cal = D.calendar(start_time="2005-01-01", end_time="2026-12-31")
+print(f"{len(cal)} trading days, {cal[0].date()} to {cal[-1].date()}")
+names = D.list_instruments(D.instruments("sp500"), as_list=True)
+print(f"{len(names)} tickers in sp500 membership")
+PY
+```
+
+Expect **~5,300 NYSE sessions 2005→2026** and ~490 S&P 500 tickers.
+
+The US version of Step 4 is `data/reference/market_cap_us.parquet` and
+`industry_us.parquet`. [`scripts/qa_build_us_reference.py`](scripts/qa_build_us_reference.py)
+builds both from yfinance, falling back to Wikipedia for sectors. It is resumable and
+reads tickers from the US cache above:
+
+```bash
+pip install yfinance                         # the script's only dependency beyond pip install -e .
+python scripts/qa_build_us_reference.py
+```
+
+Then run the transfer, the decisive method-vs-market test. For the matched baseline,
+compare against `qa_eval_oneshot.py` on the CSI300 protocol:
+
+```bash
+conda run -n quantaalpha python scripts/qa_transfer_us.py \
+  --library data/factorlib/all_factors_library_meanvar_20260828_194432.json \
+  --protocol quantaalpha/eval/protocol_sp500_meanvar_soft_linear.yaml \
+  --cache data/git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5 \
+  --qlib-dir data/qlib/us_data --report
+```
+
+To rebuild the US data yourself (yfinance + chinobing membership + SEC EDGAR
+free-float), see `scripts/qa_build_us_data.py`; to repackage/publish it, see
+`scripts/qa_publish_us_data.py`. **Limitations**: `$vwap` is the `(O+H+L+C)/4`
+typical-price proxy (no free 2005-2026 daily VWAP); `instruments/sp500.txt` is
+point-in-time (adds + removes since 1996; includes dropped names like Lehman/Bear
+Stearns/Sears).
 
 ### 3.3 Choose an LLM
 
@@ -195,12 +407,11 @@ python -c "import json,glob; f=sorted(glob.glob('data/factorlib/all_factors_libr
 > `len(json.load(...))` returns **2** (the two top-level keys), not the factor count.
 > Always use `len(d["factors"])`.
 
-**First-run note.** The first mine builds an HDF5 cache of price/volume data before it
-can compute anything. This takes several minutes. If you launch many parallel tasks on a
-cold cache they will all try to build it at once and can exceed the internal timeout —
-so run the smoke test first and let it populate
-`data/git_ignore_folder/factor_implementation_source_data/daily_pv.h5`. Every later run
-reuses it.
+**First-run note.** Build the factor cache (§3.2, Step 3) before the first mine. A mine
+that finds no cache folder at the repository root builds the cache itself, but only
+there: `data/git_ignore_folder/`, the copy factor code actually runs against, stays empty.
+And if you launch many parallel tasks on a cold cache, they all try to build it at once
+and can exceed the internal timeout.
 
 ### 4.1.1 Which fields the generator can use — check this before a long run
 
@@ -216,44 +427,36 @@ It lists the fields your Qlib copy serves, the columns your cache exposes, and p
 `READY` or the specific thing to fix. Run it before any long mine.
 
 **The cache carries eight columns:** `$open $close $high $low $volume $factor $vwap`
-fetched from Qlib, plus a `$return` computed from close. Your Qlib copy also serves
+fetched from Qlib, plus a `$return` computed from close. The `daily_pv.h5` on Hugging
+Face has only the first six; §3.2 Step 3 adds the other two. Your Qlib copy also serves
 `$amount`, `$adjclose` and `$change`, but the cache deliberately does not expose them —
 the reference libraries were mined without them, so adding one changes what the search
 can reach. That the cache is a subset matters because mined formulas use the richer
-fields it *does* carry: in the reference library **26 of 150 formulas reference
-`$vwap`**, for example `RANK(TS_MEAN($vwap * $volume, 20) / (TS_MEAN($vwap * $volume,
-120) + 1e-8))`. A cache lacking that column cannot compute any of them.
+fields it *does* carry. In the reference library, **26 of 150 formulas reference
+`$vwap`** (for example `RANK(TS_MEAN($vwap * $volume, 20) / (TS_MEAN($vwap * $volume,
+120) + 1e-8))`) and **67 reference `$return`**. A cache missing either column cannot
+compute those formulas.
 
 To change which fields are exposed, edit the `FIELDS` list at the top of
-`quantaalpha/factors/data_template/generate.py` — `qa_check_data.py` reads that same
-list, so the check follows your edit automatically. Then delete the stale cache so the
-next run rebuilds it:
+`quantaalpha/factors/data_template/generate.py`. `qa_check_data.py` reads that same
+list, so the check follows your edit automatically. Then rebuild with the §3.2 Step 3
+commands, which overwrite both cache folders, so you don't need to delete anything first.
+Don't delete the cache files and wait for a mine to rebuild them: a mine rebuilds only
+when the repo-root cache *folder* is missing, and then only that copy.
 
-```bash
-rm -f data/git_ignore_folder/factor_implementation_source_data*/daily_pv*.h5
-```
-
-Only add a field your Qlib data actually serves — `qa_check_data.py` lists them, and
+Only add a field your Qlib data actually serves. `qa_check_data.py` lists them, and
 requesting a missing one fails the rebuild. The cache starts at 2008 by default;
 override with `QA_DATA_START=2005-01-01` if a protocol needs more history.
 
-To rebuild the cache directly rather than waiting for a mine to do it (about 25 minutes,
-and the only way to get a cache without spending LLM credits):
-
-```bash
-cd quantaalpha/factors/data_template
-python generate.py                     # writes daily_pv_all.h5 + daily_pv_debug.h5 here
-cp daily_pv_all.h5   ../../../data/git_ignore_folder/factor_implementation_source_data/daily_pv.h5
-cp daily_pv_debug.h5 ../../../data/git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5
-cd ../../..
-python scripts/qa_check_data.py        # expect READY
-```
-
-This is deterministic: rebuilding against the same Qlib snapshot reproduces the
-reference cache **bit for bit** (verified 2026-09-01 — 14,215,449 rows × 8 columns,
-5,982 instruments, maximum absolute difference 0.000). If your machine has 16 GB of RAM
-or less and the build dies with no error message, it was killed for memory — lower the
-chunk size with `QA_DATA_CHUNK=200 python generate.py`.
+Building the cache with `generate.py` (§3.2 Step 3) is the only way to get a complete
+cache without spending LLM credits, and it is deterministic: rebuilding against the same
+Qlib snapshot reproduces every value of the reference cache **bit for bit** (the HDF5
+file bytes still differ, which is why `qa_check_data.py` compares content fingerprints).
+This was verified on 2026-09-01 and again on 2026-09-16: 14,215,449 rows × 8 columns,
+5,982 instruments, maximum absolute difference 0.000. If your machine has 16 GB of RAM
+or less and the build dies with no error message, it was killed for running out of
+memory. Lower the chunk size with `QA_DATA_CHUNK=200 python generate.py`; the result is
+the same.
 
 ### 4.2 Full production mine (10–30 hours)
 
@@ -381,8 +584,11 @@ Use it to rank libraries, not to judge profitability.
 | Library shows "2 factors" | You measured `len(json.load(...))`. Use `len(d["factors"])`. |
 | All LLM calls fail | Check `OPENAI_API_KEY` / `OPENAI_BASE_URL` with the §3.3 snippet; check quota. |
 | Mine dies when the terminal closes | Launch under `screen` as in §4.2. |
-| First run times out building data | Cold HDF5 cache built by many parallel tasks. Run the §4.1 smoke test first, then relaunch. |
-| Formulas using `$vwap` fail to compute | Your cache lacks the column. Run `python scripts/qa_check_data.py`; rebuild per §4.1.1. |
+| First run times out building data | Many parallel tasks are building a cold HDF5 cache at once. Build it first (§3.2, Step 3), then relaunch. |
+| Formulas using `$vwap` or `$return` fail to compute | Your cache is the Hugging Face download, which has neither column. Run `python scripts/qa_check_data.py`, then rebuild (§3.2, Step 3). |
+| `qa_check_data.py` says `DIFFERS from the reference cache` | That copy was built from different Qlib data or settings, or by an older `generate.py`. Rebuild with the §3.2 Step 3 commands, which write both folders. |
+| Factor feedback shows `FileNotFoundError` for `./daily_pv.h5` | `data/git_ignore_folder/` has no cache. With default settings, a mine's automatic build fills only the repo-root folder. Place and build the cache in both (§3.2, Steps 2–3). |
+| Log shows `neutralization failed ... scoring raw` | `data/reference/market_cap.parquet` or `industry.parquet` is missing, so candidates are scored without size/industry neutralization. Build them (§3.2, Step 4). |
 | `pytest tests/` aborts with `INTERNALERROR ... SystemExit` | Expected: most files here are standalone scripts, not pytest tests. Run them individually — see §6.1. |
 | Fewer factors than expected survive | Same cause: formulas referencing a missing field are dropped. Check the cache columns first (§4.1.1). |
 | Mine "stuck" but CPU is high | It is working. Factor evaluation is compute-bound and slows as the library grows. |
@@ -507,7 +713,8 @@ QA_ORIG_DIR=/path/to/qa_orig_mine python scripts/qa_report_learning.py
 |---|---|---|
 | `.env` | — | `cp configs/.env.example .env`, then fill in (§3.1). Never copy a filled-in one — it holds an API key. |
 | `data/qlib/` | 706 MB | Download the Qlib dataset (§3.2). |
-| `data/git_ignore_folder/` | 490 MB | Built automatically on the first mine, or directly via `generate.py` (§4.1.1). Reproduces bit for bit. |
+| Cache folders in `data/git_ignore_folder/` and `git_ignore_folder/` | 490 MB per CSI300 copy | CSI300: download, then add `$return` and `$vwap` with `generate.py` (§3.2, Steps 2–3). The content matches the reference fingerprints. US: copy from the US download (§3.2). |
+| `data/reference/` | 64 MB | CSI300: `reference_sync` (§3.2, Step 4). US: `scripts/qa_build_us_reference.py`. |
 | `data/results/workspace_*` | 190 GB | Per-run scratch. **Do not copy.** Regenerated by mining. |
 | `log/`, `mlruns/` | 175 GB | Run logs. **Do not copy.** |
 
@@ -562,14 +769,15 @@ Each round yields roughly ten factors, so 15 rounds produces about 150.
 
 ## 10. Checklist
 
-Before a long run, confirm all five:
+Before a long run, confirm all seven:
 
 - [ ] `python -c "import quantaalpha, qlib, lightgbm"` succeeds
 - [ ] `ls data/qlib/cn_data` shows `calendars features instruments`
 - [ ] The calendar check in §3.2 prints ~5,100 days ending 2026
+- [ ] `python scripts/qa_check_data.py` prints `READY`, and the cache has all eight
+      columns, including `$return` and `$vwap` (§3.2, Step 3)
+- [ ] `data/reference/market_cap.parquet` and `industry.parquet` exist (§3.2, Step 4)
 - [ ] The LLM test in §3.3 prints `LLM OK`
 - [ ] The §4.1 smoke test produced a library file with a non-zero factor count
-- [ ] The cache (§4.1.1) contains every field you intend the generator to use ---
-      in particular `$vwap`, if you are reproducing the reference run
 
-All six passing means a full mine will run.
+All seven passing means a full mine will run.

@@ -80,8 +80,8 @@ def main() -> int:
     a = ap.parse_args()
 
     theta = load_protocol(a.protocol)
-    theta = replace(theta, benchmark_basis="estimated_total",
-                    benchmark_construction="equal")   # dividend fix
+    theta = replace(theta, benchmark="SH000300TR",
+                    benchmark_construction="index", benchmark_basis="price")   # official cap-weighted CSI300 total return
     op = EvaluationOperator(theta)
     p_start, p_end, eval_window = op._windows(True)
     panel = op._panel(p_start, p_end)

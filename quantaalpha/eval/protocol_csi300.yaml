@@ -16,7 +16,18 @@
 
 protocol_id: csi300_v1
 market: csi300
-benchmark: SH000300 # conf_combined_factors.yaml:14, backtest.yaml:127
+# Official cap-weighted CSI300 TOTAL-RETURN index (沪深300全收益, CSIndex H00300),
+# written into cn_data by scripts/qa_fetch_csi300_total_return.py. This file
+# previously left benchmark_construction/benchmark_basis unset, which defaulted to
+# index/price -- i.e. the cap-weighted PRICE index, excluding dividends, while the
+# book prices with dividend-reinvested adjusted closes. That handed the strategy
+# ~2.5 pp/yr of market dividend yield as if it were alpha. Both fields are now set
+# explicitly so the basis cannot drift with a dataclass default.
+# benchmark_basis MUST stay "price": SH000300TR is already total-return, and
+# load_benchmark() raises if a *TR ticker is paired with estimated_total.
+benchmark: SH000300TR
+benchmark_construction: index
+benchmark_basis: price
 periods_per_year: 252
 
 splits:

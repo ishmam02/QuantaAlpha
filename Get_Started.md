@@ -101,6 +101,34 @@ cp hf_data/daily_pv_debug.h5  git_ignore_folder/factor_implementation_source_dat
 
 The system *can* generate `daily_pv.h5` itself from Qlib data ([`quantaalpha/factors/data_template/generate.py`](quantaalpha/factors/data_template/generate.py)), but it is slow — downloading is strongly preferred.
 
+#### S&P 500 (US transfer) data — optional
+
+For the CSI300→S&P 500 **transfer** test (mine CSI300, recompute on US, no re-mining),
+download [QuantaAlpha/qlib_sp500](https://huggingface.co/datasets/QuantaAlpha/qlib_sp500):
+
+```bash
+huggingface-cli download QuantaAlpha/qlib_sp500 --repo-type dataset --local-dir ./hf_data_us
+unzip hf_data_us/us_data.zip -d ./data/qlib          # -> ./data/qlib/us_data/
+mkdir -p git_ignore_folder/factor_implementation_source_data_us
+mkdir -p git_ignore_folder/factor_implementation_source_data_us_debug
+cp hf_data_us/daily_pv.h5        git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5
+cp hf_data_us/daily_pv_debug.h5  git_ignore_folder/factor_implementation_source_data_us_debug/daily_pv.h5
+```
+
+Set `QLIB_DATA_DIR=./data/qlib/us_data` (`QLIB_PROVIDER_URI` likewise) and run:
+
+```bash
+conda run -n quantaalpha python scripts/qa_transfer_us.py \
+  --library data/factorlib/all_factors_library_meanvar_20260828_194432.json \
+  --protocol quantaalpha/eval/protocol_sp500_meanvar_soft_linear.yaml \
+  --cache git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5 \
+  --qlib-dir data/qlib/us_data --report
+```
+
+> `$vwap` is the `(O+H+L+C)/4` typical-price proxy (no free 2005-2026 daily VWAP source);
+> `instruments/sp500.txt` is point-in-time (adds + removes since 1996; includes dropped names).
+> Rebuild with `scripts/qa_build_us_data.py` (yfinance + chinobing + SEC EDGAR free-float).
+
 > ⚠️ **Feature-set divergence from the paper — read before mining.** The paper mines over six basic features: **open / high / low / close / volume / vwap**. The mining code does **not** use `$vwap`: [`generate.py`](quantaalpha/factors/data_template/generate.py) pulls only OHLCV and computes `$return = close.pct_change()` as the sixth feature, and the mining prompts ([`factors/prompts/prompts.yaml`](quantaalpha/factors/prompts/prompts.yaml)) advertise `$return` (line 352: "base features … $close, $open, $high, $low, $volume, $return"; line 426: "$return: daily return of the stock"). The HF `daily_pv.h5` ships with columns `[$open, $close, $high, $low, $volume, $factor]` — it has `$factor` (adjustment factor), **not** `$vwap` and **not** `$return`, so it is **stale** relative to [`generate.py`](quantaalpha/factors/data_template/generate.py). Consequence: a `$return`-based factor `SyntaxError`s at execution because `$return` isn't in the panel. Fix before mining: either run [`generate.py`](quantaalpha/factors/data_template/generate.py) (adds `$return`), or patch the downloaded file with `df['$return'] = df.groupby(level='instrument')['$close'].pct_change().fillna(0)` and atomic-save. The standalone **backtest** path is fine either way — it loads `$vwap` from Qlib *and* derives `$return` ([`backtest/custom_factor_calculator.py:579,85-86`](quantaalpha/backtest/custom_factor_calculator.py#L579)), so it supports both. But the mined pool is built over `$return`, not the paper's `$vwap`. See [§20.5](#205-reproducibility-caveats--discrepancies) #8 for the full impact and the paper-faithful fix.
 
 ### Configure

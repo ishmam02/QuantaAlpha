@@ -46,18 +46,40 @@ market: csi300
 # alpha being searched for. "estimated_total" puts both sides on the same basis.
 # Expect every headline number to fall by roughly that much: the drop IS the
 # correction, not a regression.
-# EQUAL-WEIGHT is the primary benchmark, because the book is structurally
-# equal-weight: max_weight 0.03 caps a 6%-index-weight name at 3%, a permanent
-# -3% active position in every large constituent. Measured cost of scoring that
-# book against a cap-weighted index: -9.8pp (2019), -13.1pp (2020), +6.0pp
-# (2021) -- a size bet nobody chose and, without free-float weights, nobody can
-# remove from the construction.
+# THE OFFICIAL CAP-WEIGHTED TOTAL-RETURN INDEX is the benchmark (changed
+# 2026-09-26). SH000300TR is the official 沪深300全收益 (CSI 300 Total Return
+# Index, CSIndex code H00300), fetched by scripts/qa_fetch_csi300_total_return.py
+# and written into cn_data as an instrument. It is gate-validated against the
+# published annual returns (2017-2025, all within 0.36 pp) and spans 2005-01-04
+# onward, so it covers train and valid as well as test.
 #
-# Report "index" alongside as the conventional number, with the alpha-vs-beta
-# size decomposition, so the gap is visible rather than buried.
-benchmark_construction: equal
-benchmark_basis: estimated_total
-benchmark: SH000300 # conf_combined_factors.yaml:14, backtest.yaml:127
+# benchmark_basis MUST stay "price": the series is ALREADY total-return, so
+# "estimated_total" would add a dividend yield on top and double-count ~2.5 pp/yr.
+# load_benchmark() raises on that combination.
+#
+# Why this replaces the previous equal-weight basket. Two things were wrong before:
+#   (a) an equal-weighted basket of constituents is neither the index nor
+#       cap-weighted, and
+#   (b) the estimated dividend add-on was an EQUAL-weighted cross-sectional mean
+#       (2.40%/yr), whereas the official cap-weighted yield is 2.50%/yr and swings
+#       1.67-3.56 pp year to year -- CSI300's mega-caps are high-yield banks and
+#       insurers, so equal-weighting understates it.
+# A circulating-market-cap RECONSTRUCTION was also tried and failed
+# (data/results/synth_benchmark_validation.json: validated false, total_variation
+# 0.252; circ_mv overweights state holdings, ~3.58%/yr tracking error) -- which is
+# why the official series is fetched rather than rebuilt.
+#
+# THE SIZE BET IS NOW INSIDE THE HEADLINE NUMBER, AND MUST BE REPORTED APART.
+# The book is structurally equal-weight: max_weight 0.03 caps a 6%-index-weight
+# name at 3%, a permanent -3% active position in every large constituent.
+# Measured cost of scoring that book against a cap-weighted index: -9.8pp (2019),
+# -13.1pp (2020), +6.0pp (2021) -- a size bet nobody chose. Scoring against the
+# cap-weighted index does not remove that bet, it absorbs it, so
+# scripts/qa_report_size_decomposition.py splits excess into factor alpha / size
+# tilt / residual beta and both are reported together.
+benchmark_construction: index
+benchmark_basis: price          # SH000300TR is already total-return -- add nothing
+benchmark: SH000300TR # official CSI300 Total Return (H00300); price index is SH000300
 periods_per_year: 252
 
 splits:

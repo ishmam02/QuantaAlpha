@@ -835,7 +835,8 @@ class NetCostFactorRunner(QlibFactorRunner):
             if _neutralize_ok:
                 try:
                     sig = residualize(sig_raw, panel, self.theta)
-                    sheet.update(exposure_report(sig_raw, panel))
+                    _mkt = getattr(self.theta, "market", "csi300")
+                    sheet.update(exposure_report(sig_raw, panel, market=_mkt))
                 except Exception as exc:
                     logger.warning("neutralization failed for %s (%s); scoring raw",
                                    _short(expr), type(exc).__name__)
@@ -1228,7 +1229,8 @@ class NetCostFactorRunner(QlibFactorRunner):
                     # built in the repository's insertion order (as before), so
                     # the shared block is bit-identical to a fresh build.
                     _repo_sigs = {e: s for e, (s, _) in self._repository.items()}
-                    _R_repo = spearman_block_cached(_repo_sigs, (start, end))
+                    _R_repo = spearman_block_cached(
+                        _repo_sigs, (start, end, len(panel.instruments)))
                     _kept_sigs = {e: s for e, s, _t, _r, _h in kept}
                     _er_held = effective_rank_cached(
                         _R_repo, _repo_sigs, _kept_sigs)

@@ -211,6 +211,40 @@ QLIB_DATA_DIR=./data/qlib/cn_data
 DATA_RESULTS_DIR=./data/results
 ```
 
+##### S&P 500 (US transfer) data — optional
+
+To run the CSI300→S&P 500 **transfer** test (mine CSI300, recompute on US data, no
+re-mining), download the US dataset from
+[QuantaAlpha/qlib_sp500](https://huggingface.co/datasets/QuantaAlpha/qlib_sp500):
+
+```bash
+huggingface-cli download QuantaAlpha/qlib_sp500 --repo-type dataset --local-dir ./hf_data_us
+unzip hf_data_us/us_data.zip -d ./data/qlib          # -> ./data/qlib/us_data/
+mkdir -p git_ignore_folder/factor_implementation_source_data_us
+mkdir -p git_ignore_folder/factor_implementation_source_data_us_debug
+cp hf_data_us/daily_pv.h5        git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5
+cp hf_data_us/daily_pv_debug.h5  git_ignore_folder/factor_implementation_source_data_us_debug/daily_pv.h5
+```
+
+Then point `.env` at the US dir and run the transfer (compare against
+`qa_eval_oneshot.py` on the CSI300 protocol for the matched baseline):
+
+```bash
+QLIB_DATA_DIR=./data/qlib/us_data
+QLIB_PROVIDER_URI=./data/qlib/us_data
+conda run -n quantaalpha python scripts/qa_transfer_us.py \
+  --library data/factorlib/all_factors_library_meanvar_20260828_194432.json \
+  --protocol quantaalpha/eval/protocol_sp500_meanvar_soft_linear.yaml \
+  --cache git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5 \
+  --qlib-dir data/qlib/us_data --report
+```
+
+> **Limitations**: `$vwap` is the `(O+H+L+C)/4` typical-price proxy (no free source
+> carries 2005-2026 daily VWAP); `instruments/sp500.txt` is point-in-time (adds +
+> removes since 1996; includes dropped names like Lehman/Bear Stearns/Sears). See
+> the dataset card for full details. Build it yourself with `scripts/qa_build_us_data.py`
+> (yfinance + chinobing membership + SEC EDGAR free-float).
+
 The HDF5 data directories can also be customized via environment variables if you prefer a different location:
 
 ```bash

@@ -1,0 +1,14 @@
+# Optional dependencies for building the S&P 500 Qlib dataset (scripts/qa_build_us_data.py)
+# and publishing it to HuggingFace (scripts/qa_publish_us_data.py). Not required for
+# CSI300 mining/eval or for running the US transfer on a pre-built dataset.
+#
+#   pip install -e ".[us-data]"
+#
+# Sources: yfinance (OHLC + AdjClose + Volume), exchange_calendars (day_future.txt tail),
+# index-constitution (S&P 500 membership; bundled pickles, read directly), edgartools
+# (SEC EDGAR free-float; imports as `edgar`). No paid API key; SEC EDGAR needs
+# EDGAR_IDENTITY="Name <email>" for the required User-Agent.
+yfinance
+exchange_calendars
+index-constitution
+edgartools

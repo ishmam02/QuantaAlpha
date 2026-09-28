@@ -320,8 +320,11 @@ def spearman_block_cached(signals: dict, panel_key) -> "np.ndarray":
     and keyed by ``(tuple(exprs in that order), panel_key)``. Both callers pass
     the repository's insertion order on the same panel grid, so a block built
     by one is reused by the other. ``panel_key`` is whatever the caller uses to
-    identify the alignment grid (a ``(start, end)`` panel span), so a re-split
-    misses rather than returning a stale block.
+    identify the alignment grid -- a ``(start, end, n_instruments)`` triple, the
+    date span PLUS the instrument count (matching the aligned-cache grid key in
+    eval/data.py) -- so a re-split OR a different-market panel (different
+    n_instruments) misses rather than returning a stale block: a US zoo block
+    (734 instruments) can never collide with a CSI300 one even on the same dates.
     """
     key = (tuple(signals), panel_key)
     cached = _SPEARMAN_BLOCK_CACHE.get(key)

@@ -205,6 +205,36 @@ QLIB_DATA_DIR=./data/qlib/cn_data
 DATA_RESULTS_DIR=./data/results
 ```
 
+##### S&P 500（美股迁移测试）数据 — 可选
+
+如需运行 CSI300→S&P 500 **迁移测试**（在 CSI300 挖掘、在美股重算、不重新挖掘），
+从 [QuantaAlpha/qlib_sp500](https://huggingface.co/datasets/QuantaAlpha/qlib_sp500) 下载美股数据集：
+
+```bash
+huggingface-cli download QuantaAlpha/qlib_sp500 --repo-type dataset --local-dir ./hf_data_us
+unzip hf_data_us/us_data.zip -d ./data/qlib          # -> ./data/qlib/us_data/
+mkdir -p git_ignore_folder/factor_implementation_source_data_us
+mkdir -p git_ignore_folder/factor_implementation_source_data_us_debug
+cp hf_data_us/daily_pv.h5        git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5
+cp hf_data_us/daily_pv_debug.h5  git_ignore_folder/factor_implementation_source_data_us_debug/daily_pv.h5
+```
+
+将 `.env` 指向美股目录后运行迁移（与 `qa_eval_oneshot.py` + CSI300 协议的基线对比）：
+
+```bash
+QLIB_DATA_DIR=./data/qlib/us_data
+QLIB_PROVIDER_URI=./data/qlib/us_data
+conda run -n quantaalpha python scripts/qa_transfer_us.py \
+  --library data/factorlib/all_factors_library_meanvar_20260828_194432.json \
+  --protocol quantaalpha/eval/protocol_sp500_meanvar_soft_linear.yaml \
+  --cache git_ignore_folder/factor_implementation_source_data_us/daily_pv.h5 \
+  --qlib-dir data/qlib/us_data --report
+```
+
+> **限制**：`$vwap` 为 `(O+H+L+C)/4` 典型价格代理（无免费来源覆盖 2005-2026 日度 VWAP）；
+> `instruments/sp500.txt` 为时点成分股（1996 年以来加入+退出事件，含已剔除个股如雷曼/贝尔斯登/西尔斯）。详见数据集卡片。
+> 可用 `scripts/qa_build_us_data.py`（yfinance + chinobing 成分股 + SEC EDGAR 自由流通股）自行构建。
+
 HDF5 数据目录也可以通过环境变量自定义（如果你希望放在其他位置）：
 
 ```bash

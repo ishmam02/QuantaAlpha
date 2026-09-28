@@ -128,7 +128,12 @@ release-notes.md
 # ---- Sphinx documentation ----
 docs/_build/
 .claude
-hf_data
+# hf_data* (not just hf_data): the US mirror lives in hf_data_us/ and carries a
+# 97MB us_data.zip that the old bare `hf_data` pattern did not match. The mirror
+# is reproducible from scripts/qa_build_us_data.py + qa_publish_us_data.py, both
+# tracked, so the data itself does not belong in git history.
+hf_data*
+.playwright-mcp/
 logs
 tools
 

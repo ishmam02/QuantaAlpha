@@ -122,8 +122,8 @@ def main() -> int:
     a = ap.parse_args()
 
     base = load_protocol(a.protocol)
-    base = replace(base, benchmark_basis="estimated_total",
-                   benchmark_construction="equal")
+    base = replace(base, benchmark="SH000300TR",
+                   benchmark_construction="index", benchmark_basis="price")
     base = replace(base, splits=replace(base.splits,
                    final_test=(a.window[0], a.window[1])))
     print(f"window {a.window} | basis {base.benchmark_basis}", flush=True)

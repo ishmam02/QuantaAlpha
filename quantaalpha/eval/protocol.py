@@ -246,6 +246,13 @@ class Portfolio:
     # Explicit one-way turnover budget per rebalance. This is the knob top-k
     # dropout does not have: there, turnover is whatever n_drop/topk dictates.
     turnover_cap: float = 0.10
+    # Rebalance cadence in trading days. 1 = daily (the default, so every
+    # existing protocol keeps its meaning). >1 holds the book unchanged on the
+    # in-between days -- turnover falls ~every_n-fold with no special case in
+    # the cost model -- which is the natural turnover lever for a Kelly
+    # mean-variance book whose signal is slow. Read via getattr in
+    # ``portfolio.mean_variance``; declared here so the YAML loader accepts it.
+    rebalance_every: int = 1
     # Cap on any single position, so the optimiser cannot answer "concentrate
     # everything in the highest-scoring name", which is optimal under a
     # diagonal risk model and untradeable in practice.

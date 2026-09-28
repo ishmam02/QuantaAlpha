@@ -389,7 +389,13 @@ class BacktestRunner:
                         dates = result.index.get_level_values('datetime')
                     except KeyError:
                         dates = result.index.get_level_values(0)
-                    if isinstance(selector, tuple) and len(selector) == 2:
+                    # NOTE: DatasetH.prepare("<seg>") passes self.segments[seg] as the
+                    # selector. YAML `segments: train: ["...", "..."]` deserializes to a
+                    # LIST, not a tuple, so checking `isinstance(selector, tuple)` alone
+                    # never sliced -> every segment returned the full date range -> the
+                    # model trained on the test period (train/test contamination). Accept
+                    # list too so segments are actually date-clamped.
+                    if isinstance(selector, (tuple, list)) and len(selector) == 2:
                         start, end = selector
                         mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
                         result = result.loc[mask]

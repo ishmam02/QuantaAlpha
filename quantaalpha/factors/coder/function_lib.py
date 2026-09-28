@@ -79,24 +79,23 @@ def MEDIAN(df:pd.DataFrame):
 @datatype_adapter
 def TS_KURT(df:pd.DataFrame, p:int=5):
     """Rolling kurtosis."""
-    from scipy.stats import kurtosis
-    def rolling_kurt(x):
-        return x.rolling(p, min_periods=min(4, p)).apply(
-            lambda arr: kurtosis(arr, fisher=True, nan_policy='omit') if len(arr.dropna()) >= 4 else np.nan,
-            raw=False
-        )
-    return df.groupby('instrument').transform(rolling_kurt)
+    # Vectorized (pandas rolling.kurt, C-level). Replaces a scipy-per-window
+    # lambda (rolling.apply raw=False) that was a Python callback per rolling
+    # position -- it did not finish in 120s on the 2.3M-row US panel, silently
+    # dropping every kurtosis factor in the mine (incl. an admitted one).
+    # pandas .kurt() is bias-corrected (G2) vs scipy's biased g2; the difference
+    # is a per-window(n) transform, Spearman-rank-invariant for full windows
+    # (n=p constant across instruments on a date => ranks unchanged), so the
+    # gate IC is unchanged on the valid window.
+    return df.groupby('instrument').transform(lambda x: x.rolling(p, min_periods=min(4, p)).kurt())
 
 @datatype_adapter
 def TS_SKEW(df:pd.DataFrame, p:int=5):
     """Rolling skewness."""
-    from scipy.stats import skew as scipy_skew
-    def rolling_skew(x):
-        return x.rolling(p, min_periods=min(3, p)).apply(
-            lambda arr: scipy_skew(arr, nan_policy='omit') if len(arr.dropna()) >= 3 else np.nan,
-            raw=False
-        )
-    return df.groupby('instrument').transform(rolling_skew)
+    # See TS_KURT: vectorized pandas rolling.skew replaces the scipy-per-window
+    # lambda that was the eval-pipeline bottleneck. .skew() is bias-corrected
+    # (G1) vs scipy's biased g1; Spearman-rank-invariant for full windows.
+    return df.groupby('instrument').transform(lambda x: x.rolling(p, min_periods=min(3, p)).skew())
 
 @datatype_adapter
 def TS_RANK(df:pd.DataFrame, p:int=5):

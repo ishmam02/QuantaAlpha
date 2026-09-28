@@ -1,0 +1,153 @@
+# =====================================================================
+# S&P 500 transfer protocol -- LightGBM + topk_dropout (the backtest_v2 /
+# paper-faithful evaluation path), FULL realistic US cost model.
+#
+# This is the protocol for the CSI300->S&P 500 transfer backtest in the TEST
+# range (2016-2026) with the combiner/construction the backtest_v2 simple
+# backtest uses (LightGBM + TopkDropout), priced at the FULL US cost model.
+# A companion protocol (..._flat.yaml) runs the same book at the flat-fee
+# backtest_v2 cost so the two can be compared. The meanvar zoo
+# (all_factors_library_meanvar_20260828_194432) is the factor set; its factors are
+# recomputed on US data and re-combined here -- the zoo's stored backtest_results
+# (CSI300) are NOT used.
+#
+# vs protocol_csi300.yaml (the canonical LightGBM+topk realistic protocol):
+#   - market/benchmark: sp500 / ^GSPC (unused under benchmark_construction: equal)
+#   - splits: the production re-split (2005-2012 / 2013-2015 / 2016-2026), NOT the
+#     old 2016-2020/2021/2022-2025 split, so the test range matches the CSI300
+#     production zoo's final_test.
+#   - costs: US-realistic (spread+impact dominated, ~0 commission) vs CSI stamp-duty.
+#   - constraints: off (no A-share +/-10% price limits).
+#   - $vwap is the (O+H+L+C)/4 proxy (no free 2005-2026 daily VWAP) -- a data
+#     property, documented in the dataset card, not a protocol knob.
+# =====================================================================
+protocol_id: sp500_v1_lightgbm_topk
+market: sp500
+benchmark: GSPC
+benchmark_construction: index
+benchmark_basis: estimated_total
+periods_per_year: 252
+
+splits:
+  # Production re-split (same windows the CSI300 meanvar zoo was mined/validated
+  # against): train 2005-2012 / valid 2013-2015 / final_test 2016-2026, folds 2.
+  train: ["2005-01-01", "2012-12-31"]
+  valid: ["2013-01-01", "2015-12-31"]
+  final_test: ["2016-01-01", "2026-01-09"]
+  search_is: train
+  search_oos: valid
+
+execution:
+  delta: 1
+  fill_rule: open_next
+  label_expr: "Ref($open, -2) / Ref($open, -1) - 1"   # open-to-open, matches the fill rule
+
+combiner: # procedure A -- LightGBM (backtest_v2 / paper path), seed included
+  model: lightgbm
+  # 5-seed ensemble (the report's test_seeds) -- combiner.py fits one LightGBM per
+  # seed and averages, removing combiner-seed bias (a single seed's fit can swing
+  # the book on seed noise alone).
+  seeds: [42, 1, 7, 13, 29]
+  params:
+    loss: mse
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 20
+    early_stopping_round: 50
+    num_boost_round: 500
+  engine: backtest_v2 # ports the published preprocessing path (ProcessInf + CSRankNorm)
+  base_features:
+    - "($close-$open)/$open"
+    - "$volume/Mean($volume, 20)"
+    - "($high-$low)/Ref($close, 1)"
+    - "$close/Ref($close, 1)-1"
+  fit_split: train
+
+portfolio: # topk_dropout construction (mirrors protocol_csi300.yaml + configs/backtest.yaml)
+  cost_aware_dropout: true
+  swap_hurdle: 1.0
+  construction: topk_dropout
+  topk: 50
+  n_drop: 5
+  signed: false
+  gross_leverage: 1.0
+  turnover_cap: 0.02      # inert under topk_dropout (mean-variance knob); kept for hash parity
+  risk_aversion: 25.0     # inert under topk_dropout
+  max_weight: 0.03
+  covariance: diagonal     # inert under topk_dropout
+
+costs: # FULL US-realistic cost model (calibrated to 2024 S&P 500 figures)
+  # US is spread+impact-dominated (zero retail commission, no stamp duty) -- the
+  # opposite of CSI300 where the flat stamp-duty fee (kappa0=0.0020) dominates.
+  # Sources: half-spread 1-3bps (QuanterLab), impact 2-5bps @1% ADV (Kissell 2024
+  # Q1), ~0 retail commission + SEC fee 0.278bps (JoF 2025). Round-trip ~= 10bps.
+  kappa0: 0.00005   # ~0.5bps one-way turnover (commission + SEC fee + FINRA TAF)
+  kappa1: 0.012     # slippage; ~1.6bps one-way at US large-cap sigma~=1.3%/day
+  kappa2: 0.003     # impact; 3bps at 1% ADV
+  impact_exponent: 1.5
+  beta_per_day: 0.0004
+  beta_offlist: .inf
+  vol_window: 20
+  adv_window: 20
+  nav: 100000000.0
+  adv_scale: 1.0    # USD: us_data $amount is already true USD notional
+
+constraints:
+  enabled: false   # no A-share +/-10% price-limit / suspension rules for US equities
+
+gates:
+  gamma_delta: null
+  gamma_ic: null
+  gamma_ir: null
+  tau_max: null
+  rho_bar: 0.60
+  gamma_cx: null
+  turnover_basis: book
+
+decay:
+  K: 4
+  lambda_d: 0.5
+
+overfit:
+  delta_ref: 0.40
+
+utility:
+  mode: weighted_rank
+  omega:
+    effectiveness: 0.30
+    arr: 0.10
+    stability: 0.15
+    turnover: 0.10
+    diversity: 0.15
+    overfit: 0.10
+    decay: 0.10
+
+admission:
+  enabled: true
+  book_eval_every: 25
+  max_library: 40
+  winsor_mad: 5.0
+  fdr_q: 0.10
+  require_mechanism: true
+  require_sign_match: true
+  min_capacity_cny: 100000000.0
+  mode: standalone
+  k_sigma: 3.0
+  test_seeds: [42, 1, 7, 13, 29]
+  blocking: false
+  min_coverage: 0.30
+  capacity: null
+  evict_every: 20
+  evict_below: 0.0
+  tau_admit: 0.50
+  tau_evict: 0.25
+  min_size: 6
+
+walk_forward:
+  enabled: true
+  folds: 2

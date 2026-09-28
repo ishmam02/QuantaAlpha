@@ -1,0 +1,192 @@
+# =====================================================================
+# S&P 500 EVALUATION PROTOCOL -- ICIR combiner + topk_dropout construction
+# (clone of protocol_sp500_meanvar_soft_linear with construction flipped to
+# topk_dropout; combiner.model stays icir, so this isolates CONSTRUCTION vs the
+# mean_variance baseline -- same combiner, same costs, same splits, same gates).
+# Original header: # S&P 500 EVALUATION PROTOCOL -- mirror of protocol_csi300_meanvar_soft_linear
+# with US-realistic costs and the A-share trading constraints OFF. Same
+# construction, same ICIR combiner, same splits, same gates as the CSI300
+# protocol, so a US TRANSFER (mine CSI300 -> recompute on S&P 500, no re-mining)
+# isolates METHOD vs MARKET rather than protocol drift.
+#
+# Differences from the CSI300 protocol (everything else is byte-identical):
+#   - market: sp500, benchmark: ^GSPC. ^GSPC is an index and is NOT fetched into
+#     us_data; it is unused under benchmark_construction: equal (the equal-weight
+#     member portfolio is the benchmark) and kept only for the conventional
+#     report line. yfinance CAN serve ^GSPC, so a price-return benchmark is a
+#     one-line add later, not a data rebuild.
+#   - costs: US-realistic, calibrated to measured 2024 S&P 500 figures (see the
+#     costs block). The US is spread+impact-dominated (zero retail commission, no
+#     stamp duty) -- the opposite of CSI300, where the flat stamp-duty fee
+#     (kappa0=0.0020) dominates.
+#   - constraints: enabled: false. The A-share +/-10% price-limit and suspension
+#     rules in eval/tradability.py do not apply to US equities (a US name can move
+#     >10% in a day on earnings, etc.).
+#   - $vwap in the US factor cache is the (O+H+L+C)/4 typical-price PROXY: free
+#     Alpaca reaches only 2020 and no free source carries 2005-2026 daily VWAP,
+#     so the 26/150 $vwap factors compute on typical price, not volume-weighted
+#     price. This is a property of the DATA, documented in the dataset card, not
+#     a protocol knob.
+# =====================================================================
+protocol_id: sp500_v1_icir_topk
+market: sp500
+benchmark: ^GSPC
+benchmark_construction: equal
+benchmark_basis: estimated_total
+periods_per_year: 252
+
+splits:
+  # IDENTICAL to the CSI300 production re-split (train 2005-2012 / valid 2013-2015
+  # / final_test 2016-2026, folds 2) so the US transfer is scored on the same
+  # windows the CSI300 zoo was mined and validated against. See the CSI300
+  # protocol for the full rationale (long holdout for the decay study; folds=2
+  # because a third fold would train on <1.7y). Neither fold touches final_test.
+  train: ["2005-01-01", "2012-12-31"]
+  valid: ["2013-01-01", "2015-12-31"]
+  final_test: ["2016-01-01", "2026-01-09"]
+  search_is: train
+  search_oos: valid
+
+execution: # Eq. 4-5 -- identical to CSI300
+  delta: 1
+  fill_rule: open_next # Phi = open(t+1); matches deal_price:open
+  # OPEN-to-open, matching the fill rule. IC measures open-to-open predictability,
+  # the quantity the book actually trades -- not comparable to any close-to-close
+  # IC. Quote it as such (same caveat as the CSI300 protocol).
+  label_expr: "Ref($open, -2) / Ref($open, -1) - 1"
+
+combiner: # procedure A -- identical to CSI300 (ICIR linear combiner, seed included)
+  # ICIR LINEAR COMBINER (Ding-Martin Redux). w_i = mean(IC_i)/std(IC_i), shrunk
+  # toward 1/N by shrinkage 0.5. The LightGBM keys below are INERT under model:icir
+  # and kept so the file can be flipped back to the boosted path. See the CSI300
+  # protocol for the full derivation.
+  model: icir
+  seeds: [42]
+  params:
+    shrinkage: 0.5
+    loss: mse
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 20
+    early_stopping_round: 50
+    num_boost_round: 500
+  engine: backtest_v2
+  base_features:
+    - "($close-$open)/$open"
+    - "$volume/Mean($volume, 20)"
+    - "($high-$low)/Ref($close, 1)"
+    - "$close/Ref($close, 1)-1"
+  fit_split: train
+
+portfolio: # Eq. 6 -- identical to CSI300 (same construction isolates method vs market)
+  cost_aware_dropout: true
+  swap_hurdle: 1.0
+  construction: topk_dropout
+  scale_split: valid
+  topk: 50
+  n_drop: 5
+  signed: false # long-only + benchmark excess (matched to the CSI300 baseline)
+  gross_leverage: 1.0
+  turnover_cap: 0.02
+  risk_aversion: 25.0
+  max_weight: 0.03
+  covariance: diagonal
+  cost_in_objective: true
+  cost_hurdle: 1.0
+  trade_penalty: 5.0
+
+costs: # Eq. 7 -- US-realistic, calibrated to measured 2024 S&P 500 figures
+  # The US market is spread+impact-dominated (zero retail commission, no stamp
+  # duty), the opposite of CSI300 where the flat stamp-duty fee (kappa0=0.0020)
+  # dominates. Targets from the literature:
+  #   half-spread 1-3bps  (QuanterLab, "Foundations of Transaction Costs")
+  #   market impact 2-5bps at 1% ADV; ~17bps total large-cap at 10% ADV
+  #                       (Kissell 2024 Q1 Market Impact Report)
+  #   ~0 retail commission + SEC fee $27.80/$1M ~= 0.278bps on the sell side
+  #                       (JoF 2025 "Actual Retail Price": 7-46bps round-trip
+  #                        incl. spread; S&P 500 systematically the cheapest)
+  kappa0: 0.00005   # ~0.5bps per one-way turnover (institutional commission + SEC
+                    # fee + FINRA TAF; ~0 under zero-commission retail -- kept at a
+                    # conservative institutional level). cf. CSI 0.0020 (stamp duty).
+  kappa1: 0.012     # slippage = kappa1 * Sum(sigma*|dw|); at median US large-cap
+                    # sigma ~= 1.3%/day -> ~1.6bps one-way, inside the 1-3bps
+                    # half-spread band. cf. CSI 0.03 (sigma 1.97% -> 5.9bps).
+  kappa2: 0.003     # impact; kappa2*sqrt(p) at 1% participation -> 3bps, inside the
+                    # 2-5bps @1% ADV band (US large caps more liquid than CSI).
+                    # cf. CSI 0.01 (10bps @1% ADV).
+  impact_exponent: 1.5 # phi proportional to |dw|^{3/2}/sqrt(ADV)
+  beta_per_day: 0.0004 # ~10%/yr borrow; inert while signed:false
+  beta_offlist: .inf   # unshortable names
+  vol_window: 20
+  adv_window: 20
+  nav: 100000000.0     # $100M, same scale convention as CSI (NAV 1e8 normalizes ADV)
+  adv_scale: 1.0       # USD: us_data $amount is already true USD notional (cf. CSI
+                       # 1000.0, which unscaled Qlib cn_data CNY-thousands -> yuan)
+  # Round-trip sanity: 2*(0.5bps flat + 1.6bps spread + 3bps impact @1% ADV) ~= 10bps,
+  # matching the 5-10bps retail / <=20bps institutional round-trip targets. A
+  # kappa0/kappa1/kappa2 sensitivity sweep is cheap to add.
+
+constraints:
+  # OFF. The A-share +/-10% daily price-limit and suspension rules in
+  # eval/tradability.py are market mechanics that do not apply to US equities -- a
+  # US name can move >10% in a day (earnings, FDA, etc.) and there is no main-board
+  # suspension regime to enforce. enabled:false restores the unconstrained
+  # behaviour; the other fields are inert under it.
+  enabled: false
+
+gates: # F_Theta -- identical to CSI300
+  gamma_delta: null
+  gamma_ic: null
+  gamma_ir: null
+  tau_max: null
+  rho_bar: 0.60
+  gamma_cx: null
+  turnover_basis: book
+
+decay: # identical to CSI300
+  K: 4
+  lambda_d: 0.5
+
+overfit: # identical to CSI300
+  delta_ref: 0.40
+
+utility: # identical to CSI300
+  mode: weighted_rank
+  omega: # sums to 1
+    effectiveness: 0.30
+    arr: 0.10
+    stability: 0.15
+    turnover: 0.10
+    diversity: 0.15
+    overfit: 0.10
+    decay: 0.10
+
+admission: # identical to CSI300 (the gate is off for the one-shot transfer; kept for parity)
+  enabled: true
+  book_eval_every: 25
+  max_library: 40
+  winsor_mad: 5.0
+  fdr_q: 0.10
+  require_mechanism: true
+  require_sign_match: true
+  min_capacity_cny: 100000000.0   # $100M ADV floor (field name says cny; USD here)
+  mode: standalone
+  k_sigma: 3.0
+  test_seeds: [42, 1, 7, 13, 29]
+  blocking: false
+  min_coverage: 0.30
+  capacity: null
+  evict_every: 20
+  evict_below: 0.0
+  tau_admit: 0.50
+  tau_evict: 0.25
+  min_size: 6
+
+walk_forward: # identical to CSI300
+  enabled: true
+  folds: 2

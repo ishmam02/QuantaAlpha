@@ -1,0 +1,215 @@
+# =====================================================================
+# S&P 500 EVALUATION PROTOCOL -- NET FRACTIONAL-KELLY (mean-variance).
+# Clone of protocol_sp500_lightgbm_topk_full.yaml with the portfolio
+# construction switched from topk_dropout (equal-weight top-50, drop 5) to
+# mean_variance, configured as a net-of-cost FRACTIONAL-KELLY book.
+#
+# Everything OUTSIDE the portfolio block is byte-identical to the top-k
+# protocol: same LightGBM combiner, same US-realistic kappa costs, same
+# splits, same gates. So a Kelly-vs-top-k comparison on the same walk-forward
+# split isolates the CONSTRUCTION (how edge -> weights) holding the combiner,
+# the cost model, and the train/valid/test windows fixed.
+#
+# Why this is Kelly, not just "mean-variance":
+#   mu = beta * yhat  (execution.prediction_scale, OLS slope of return on
+#                      prediction, fit on scale_split=valid -- expected-return
+#                      units), and Sigma = sigma^2 * horizon_scale (variance
+#                      on the SAME label-horizon clock, portfolio.py:463). The
+#   MV objective  max w'mu - (lambda/2) w'Sigma w - costs
+#   therefore has lambda as the INVERSE Kelly fraction:
+#       lambda = 1   -> full Kelly (log-growth optimal)
+#       lambda = 2   -> 1/2-Kelly  (headline; textbook choice under edge
+#                                   estimation error)
+#       lambda = 4   -> 1/4-Kelly  (more diffuse)
+#   The top-k protocol's risk_aversion 25.0 is ~25x above Kelly -- that is the
+#   "buys 34 equal-weight stocks" wall (mu/(lambda*sigma^2) ~ flat -> every
+#   name pins at the 0.03 cap), NOT a calibrated Kelly choice.
+#
+# Why 1/2-Kelly (lambda=2) is the headline, not full Kelly:
+#   Kelly assumes you KNOW the edge. The live combiner Rank IC ~0.012 is just
+#   under the 0.0162 topk break-even, and beta calibrated on valid is ~2.7x
+#   more optimistic than on a window the model did not fit (protocol.py:281).
+#   Full Kelly on a noisy, slightly-over-estimated edge over-bets and is
+#   fragile; fractional Kelly (1/2) is the standard remedy for estimation error.
+#   The driver also reports lambda in {1,4,8} on uszoo as a sensitivity table
+#   (no test-window selection -- the headline 1/2-Kelly is chosen a priori).
+#
+# Knobs changed vs topk_full (portfolio block only):
+#   construction:    topk_dropout -> mean_variance
+#   max_weight:      0.03 -> 0.10   (0.03 + gross 1.0 forced >=34 names at the
+#                                    cap = the equal-weight wall; 0.10 frees the
+#                                    optimizer to concentrate ~10-20 names by edge)
+#   risk_aversion:   25.0 -> 2.0    (25x-above-Kelly -> 1/2-Kelly; driver sweeps)
+#   turnover_cap:    0.02 -> 1.0    (0.02 was the topk turnover PIN; with
+#                                    cost_in_objective true, turnover is
+#                                    endogenous and the cap should not bind)
+#   trade_penalty:   5.0 -> 0.0     (inertia kappa: 0 = move fully toward the Kelly
+#                                    target each rebalance. With cost_in_objective
+#                                    true the no-trade band is the SOLE turnover
+#                                    gate; a uszoo sweep showed kappa 0/0.25/1.0
+#                                    all within 0.05pp, so extra inertia is inert
+#                                    and a redundant second gate. 5.0 froze the book.)
+#   rebalance_every: (new) 1        (DAILY re-solve -- the label is 1-day open-to-
+#                                    open, so the book refreshes daily to track the
+#                                    forecast; cost_in_objective keeps turnover
+#                                    endogenous (~0.3/yr). A uszoo sweep showed
+#                                    weekly every=5 loses 7pp (-13.99 vs -7.07): it
+#                                    holds a stale 1-day forecast for 5 days. every>1
+#                                    only fits a multi-day label. default 1 = daily
+#                                    keeps every other protocol unchanged.)
+# Kept identical: cost_in_objective true, covariance diagonal, cost_hurdle 1.0,
+#   scale_split valid, signed false (signed MV is unimplemented, portfolio.py:424),
+#   gross_leverage 1.0 (sum w = 1 is enforced by mv_weights_exact), swap_hurdle,
+#   cost_aware_dropout true (gates the operator cost-aware branch, operator.py:657).
+#
+# diagonal + cost_in_objective -> riskmodel.mv_weights_exact: the EXACT solver
+# (bisection on the budget multiplier eta; matches SLSQP to L1 1.6e-13, 28x
+# faster than the old non-converging subgradient). factor+costed still runs the
+# subgradient, so diagonal is the higher-quality costed path -- chosen on purpose.
+# =====================================================================
+protocol_id: sp500_v1_lightgbm_kelly_full
+market: sp500
+benchmark: ^GSPC
+benchmark_construction: equal
+benchmark_basis: estimated_total
+periods_per_year: 252
+
+splits:
+  # IDENTICAL to the top-k protocol (the driver overrides these to the
+  # walk-forward 2016-2020 / 2021 / 2022-2025 split for the forward test).
+  train: ["2005-01-01", "2012-12-31"]
+  valid: ["2013-01-01", "2015-12-31"]
+  final_test: ["2016-01-01", "2026-01-09"]
+  search_is: train
+  search_oos: valid
+
+execution: # Eq. 4-5 -- identical to topk_full
+  delta: 1
+  fill_rule: open_next # Phi = open(t+1); matches deal_price:open
+  # OPEN-to-open, matching the fill rule. IC measures open-to-open predictability,
+  # the quantity the book actually trades -- not comparable to any close-to-close
+  # IC. Quote it as such (same caveat as the CSI300 protocol).
+  label_expr: "Ref($open, -2) / Ref($open, -1) - 1"
+
+combiner: # identical to topk_full (same LightGBM combiner isolates construction)
+  model: lightgbm
+  seeds: [42]
+  params:
+    shrinkage: 0.5
+    loss: mse
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 210
+    colsample_bytree: 0.8879
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    num_threads: 20
+    early_stopping_round: 50
+    num_boost_round: 500
+  engine: backtest_v2
+  base_features:
+    - "($close-$open)/$open"
+    - "$volume/Mean($volume, 20)"
+    - "($high-$low)/Ref($close, 1)"
+    - "$close/Ref($close, 1)-1"
+  fit_split: train
+
+portfolio: # NET FRACTIONAL-KELLY -- mean-variance construction (the only change vs topk_full)
+  cost_aware_dropout: true       # gates the operator cost-aware branch (operator.py:657)
+  swap_hurdle: 1.0               # inert under mean_variance (kept for parity)
+  construction: mean_variance    # MV optimizer (portfolio.mean_variance) -- the Kelly book
+  scale_split: valid             # beta = cov(p,r)/var(p) on valid 2021 (OOS-honest, pre-final_test)
+  topk: 50                       # inert under mean_variance (kept for parity)
+  n_drop: 5                      # inert under mean_variance (kept for parity)
+  signed: false                  # MUST be false -- signed MV is unimplemented (portfolio.py:424)
+  gross_leverage: 1.0            # fully invested; sum w = 1 enforced by mv_weights_exact
+  turnover_cap: 1.0              # effectively off; cost_in_objective makes turnover endogenous
+  risk_aversion: 2.0             # lambda = inverse Kelly fraction. 1=full, 2=1/2-Kelly (headline),
+                                #   4=1/4-Kelly. mu=beta*yhat (expected-return units), Sigma=
+                                #   sigma^2*horizon_scale (matching-clock variance), so lambda is
+                                #   exactly the inverse Kelly fraction. Driver sweeps {1,4,8} on
+                                #   uszoo for sensitivity; headline 1/2-Kelly chosen a priori.
+  max_weight: 0.10               # frees the optimizer to concentrate by edge (0.03 forced the
+                                #   equal-weight-34 wall; 0.10 -> ~10-20 names differentiate)
+  covariance: diagonal           # diagonal+costed -> mv_weights_exact (exact solver, high quality)
+  cost_in_objective: true        # net-of-cost objective; no-trade band, turnover endogenous
+  cost_hurdle: 1.0               # break-even on the modelled cost
+  trade_penalty: 0.0             # inertia kappa: 0 = move FULLY toward the Kelly target whenever
+                                #   the cost no-trade band permits. With cost_in_objective true the
+                                #   band is the SOLE turnover gate (a uszoo sweep showed trade_penalty
+                                #   0 vs 0.25 vs 1.0 all within 0.05pp -- inert); a second inertia
+                                #   gate would be redundant and over-freeze. 0 = clean single gate.
+  rebalance_every: 1             # DAILY re-solve. The label is 1-day open-to-open, so the book must
+                                #   refresh daily to stay aligned with the forecast; cost_in_objective
+                                #   keeps turnover endogenous (~0.3/yr -- it does NOT over-trade). A
+                                #   uszoo sweep showed weekly (every=5) loses 7pp (-13.99 vs -7.07):
+                                #   it holds a stale 1-day forecast for 5 days. every>1 only fits a
+                                #   multi-day label. (new field; default 1=daily keeps others unchanged)
+
+costs: # Eq. 7 -- byte-identical to topk_full (US-realistic, calibrated to 2024 S&P 500)
+  kappa0: 0.00005   # ~0.5bps one-way (institutional commission + SEC fee + FINRA TAF)
+  kappa1: 0.012     # slippage = kappa1*Sum(sigma*|dw|); ~1.6bps one-way at median US sigma
+  kappa2: 0.003     # impact; kappa2*sqrt(p) at 1% participation -> 3bps
+  impact_exponent: 1.5
+  beta_per_day: 0.0004 # ~10%/yr borrow; inert while signed:false
+  beta_offlist: .inf
+  vol_window: 20
+  adv_window: 20
+  nav: 100000000.0
+  adv_scale: 1.0
+
+constraints:
+  enabled: false   # A-share price-limit/suspension rules do not apply to US equities
+
+gates: # identical to topk_full
+  gamma_delta: null
+  gamma_ic: null
+  gamma_ir: null
+  tau_max: null
+  rho_bar: 0.60
+  gamma_cx: null
+  turnover_basis: book
+
+decay: # identical to topk_full
+  K: 4
+  lambda_d: 0.5
+
+overfit: # identical to topk_full
+  delta_ref: 0.40
+
+utility: # identical to topk_full
+  mode: weighted_rank
+  omega:
+    effectiveness: 0.30
+    arr: 0.10
+    stability: 0.15
+    turnover: 0.10
+    diversity: 0.15
+    overfit: 0.10
+    decay: 0.10
+
+admission: # identical to topk_full (gate off for the one-shot eval; kept for parity)
+  enabled: true
+  book_eval_every: 25
+  max_library: 40
+  winsor_mad: 5.0
+  fdr_q: 0.10
+  require_mechanism: true
+  require_sign_match: true
+  min_capacity_cny: 100000000.0
+  mode: standalone
+  k_sigma: 3.0
+  test_seeds: [42, 1, 7, 13, 29]
+  blocking: false
+  min_coverage: 0.30
+  capacity: null
+  evict_every: 20
+  evict_below: 0.0
+  tau_admit: 0.50
+  tau_evict: 0.25
+  min_size: 6
+
+walk_forward: # identical to topk_full
+  enabled: true
+  folds: 2

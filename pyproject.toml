@@ -55,6 +55,7 @@ dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.dynamic.optional-dependencies]
 docs = {file = ["requirements/docs.txt"]}
+us-data = {file = ["requirements/us-data.txt"]}
 
 [tool.setuptools_scm]
 local_scheme = "no-local-version"

@@ -107,7 +107,12 @@ def main() -> int:
         tc = res.get("m_transfer_coefficient")
         rows.append({"noise": k, "rank_ic": ic, "net_ir": ir, "net_arr": arr,
                      "tc": tc})
-        print(f"{k:>7g} {ic:>+9.4f} {ir:>+9.3f} {100*arr:>+9.2f}% {tc:>+7.3f}"
+        # operator returns TC=None for non-icir combiners (lightgbm); coerce for
+        # the print only so the ladder can score any combiner. Stored rows keep
+        # the raw value for the crossing/assert logic.
+        _ic_f = float(ic) if ic is not None else float("nan")
+        _tc_f = float(tc) if tc is not None else float("nan")
+        print(f"{k:>7g} {_ic_f:>+9.4f} {ir:>+9.3f} {100*arr:>+9.2f}% {_tc_f:>+7.3f}"
               f"  {time.time()-t0:.0f}", flush=True)
 
     ics = [r["rank_ic"] for r in rows if r["rank_ic"] is not None]

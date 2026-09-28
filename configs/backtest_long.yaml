@@ -124,7 +124,14 @@ backtest:
     start_time: "2016-01-01"
     end_time: "2026-01-09"
     account: 100000000
-    benchmark: "SH000300"
+    # Official cap-weighted CSI300 TOTAL-RETURN index (沪深300全收益, H00300),
+    # written into cn_data by scripts/qa_fetch_csi300_total_return.py.
+    # WAS "SH000300" -- the PRICE index, dividends excluded. The book prices with
+    # qlib ADJUSTED closes (dividends reinvested), so subtracting a price benchmark
+    # credited the strategy with the market's whole dividend yield (~2.5 pp/yr;
+    # +10.78 pp over 2022-2025). qlib derives bench as $close/Ref($close,1)-1 from
+    # this ticker, so pointing it at the TR series fixes btv2 with no code change.
+    benchmark: "SH000300TR"
     exchange_kwargs:
       limit_threshold: 0.095
       deal_price: "open"
@@ -153,5 +160,11 @@ llm:
 factor_calculation:
   output_dir: "data/results/computed_factors"
   save_intermediate: true
-  n_jobs: 4
+  # n_jobs 4 -> 1 (2026-09-26). Each worker forks a full copy of the loaded panel;
+  # on this 16 GB box (swap already ~8 GB used before the run) that pushed
+  # rep/orig150 over the line and macOS jetsam'd it with SIGKILL after 12.9 min.
+  # Factor computation is a pure function of the panel, so serializing it changes
+  # no result -- only wall time, and only for the handful of factors not already
+  # in the H5 cache (149/150 were cached on the last run).
+  n_jobs: 1
   data_file: null  # When null, data is fetched from qlib

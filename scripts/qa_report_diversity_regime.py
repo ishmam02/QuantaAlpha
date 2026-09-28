@@ -95,8 +95,8 @@ def main() -> int:
     a = ap.parse_args()
 
     theta = load_protocol(a.protocol)
-    theta = replace(theta, benchmark_basis="estimated_total",
-                    benchmark_construction="equal")
+    theta = replace(theta, benchmark="SH000300TR",
+                    benchmark_construction="index", benchmark_basis="price")
     # Redundancy is judged with the GATE's OWN threshold and primitive, so both
     # libraries are held to the identical bar the admission gate applied: rho_bar
     # from the protocol the gate actually ran under, and the same |Spearman| the

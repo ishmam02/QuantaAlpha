@@ -35,6 +35,86 @@ else
     exit 1
 fi
 
+# QA_QLIB_DATA_DIR overrides QLIB_DATA_DIR *after* .env is sourced. Same
+# clobber problem as QA_CHAT_MODEL below: sourcing .env assigns QLIB_DATA_DIR
+# unconditionally (the cn_data default), so a pre-exported us_data value is
+# silently overwritten. Used to mine/backtest on a non-default market (us_data
+# for the S&P 500) without editing .env, which would break the CSI300 default.
+#
+# It must ALSO override QLIB_PROVIDER_URI + QLIB_REGION: the eval engine
+# (_init_qlib, quantaalpha/eval/data.py) reads QLIB_PROVIDER_URI/QLIB_REGION,
+# NOT QLIB_DATA_DIR, and .env sets both to the cn_data/cn default. Without
+# these, a US mine initialized qlib on cn_data and aborted at the first eval
+# with "instrument not exists: .../cn_data/instruments/sp500.txt" (loop 0
+# skipped, every generation round wasting LLM calls with zero admissions
+# possible). Derive the qlib region from the dir basename (us_data->us,
+# cn_data->cn) so the one QA_QLIB_DATA_DIR knob switches the whole engine.
+if [ -n "${QA_QLIB_DATA_DIR:-}" ]; then
+    export QLIB_DATA_DIR="${QA_QLIB_DATA_DIR}"
+    export QLIB_PROVIDER_URI="${QA_QLIB_DATA_DIR}"
+    case "$(basename "${QA_QLIB_DATA_DIR}")" in
+        us_data) export QLIB_REGION="us" ;;
+        cn_data) export QLIB_REGION="cn" ;;
+    esac
+fi
+
+# The factor-EXECUTION cache (daily_pv.h5) must switch WITH the eval engine
+# above. FACTOR_COSTEER_SETTINGS.data_folder (factors/coder/config.py) defaults
+# to the CSI300 cache; pydantic reads FACTOR_CoSTEER_DATA_FOLDER from the env
+# (env_prefix "FACTOR_CoSTEER_"), so exporting it here points factor.py at the
+# market's cache. The eval engine switched (above) but this cache did not, so a
+# US mine executed every expression on the CSI300 daily_pv.h5 (5982 SH/SZ
+# instruments) while the eval panel was US (435 US tickers): align_signal
+# reindexed the CSI300 signal onto the US universe -> all-NaN -> n<100 at every
+# horizon -> "no horizon produced a usable IC series" -> one constant fallback
+# IC for ALL 63 factors (zero admissions, identical RankIC/ICIR/U to 16 digits).
+# QA_FACTOR_DATA_DIR wins over the derived default for a custom cache path; when
+# neither is set the pydantic default (CSI300 cache) stands, so CSI300 is unchanged.
+if [ -n "${QA_FACTOR_DATA_DIR:-}" ]; then
+    export FACTOR_CoSTEER_DATA_FOLDER="${QA_FACTOR_DATA_DIR}"
+    export FACTOR_CoSTEER_DATA_FOLDER_DEBUG="${QA_FACTOR_DATA_DIR_DEBUG:-${QA_FACTOR_DATA_DIR}_debug}"
+elif [ -n "${QA_QLIB_DATA_DIR:-}" ]; then
+    # ABSOLUTE paths: factors/coder/factor.py:142-145 resolves a relative
+    # FACTOR_CoSTEER_DATA_FOLDER by joining it under
+    # workspace_path.parent.parent.parent (== data/), so a relative value
+    # carrying a "data/" prefix doubles to data/data/... -> the folder is not
+    # found -> linking is skipped -> the factor code's `./daily_pv.h5` read
+    # raises FileNotFoundError and EVERY factor fails. The pydantic default
+    # (factors/coder/config.py:10) sidesteps this by being relative WITHOUT a
+    # "data/" prefix; exporting an absolute ${SCRIPT_DIR}/data/... path is
+    # taken as-is (factor.py:145) and is robust to the workspace depth, so
+    # both markets use that form here.
+    case "$(basename "${QA_QLIB_DATA_DIR}")" in
+        us_data)
+            export FACTOR_CoSTEER_DATA_FOLDER="${SCRIPT_DIR}/data/git_ignore_folder/factor_implementation_source_data_us"
+            export FACTOR_CoSTEER_DATA_FOLDER_DEBUG="${SCRIPT_DIR}/data/git_ignore_folder/factor_implementation_source_data_us_debug" ;;
+        cn_data|*)
+            export FACTOR_CoSTEER_DATA_FOLDER="${SCRIPT_DIR}/data/git_ignore_folder/factor_implementation_source_data"
+            export FACTOR_CoSTEER_DATA_FOLDER_DEBUG="${SCRIPT_DIR}/data/git_ignore_folder/factor_implementation_source_data_debug" ;;
+    esac
+fi
+
+# The RAW SIGNAL cache (data/results/factor_cache/{md5(expression)}.pkl) is keyed
+# by md5(expression) ONLY -- market-agnostic (eval/data.py:327-330). Left shared,
+# a US eval looking up an expression any prior CSI300 run computed hits the same
+# .pkl and gets SH/SZ signals -> align_signal onto the US panel -> all-NaN (the
+# original constant-IC bug, via a second route). Worse, the sync writer
+# (library.py:_sync_h5_to_md5_cache) SKIPS when the .pkl already exists, so a US
+# execution cannot overwrite a stale CSI300 .pkl. Isolate the cache dir per
+# market via FACTOR_CACHE_DIR (eval/data.py:30 reads it). QA_FACTOR_CACHE_DIR
+# wins over the derived default; when neither is set the pydantic default
+# (data/results/factor_cache) stands, so CSI300 is unchanged.
+if [ -n "${QA_FACTOR_CACHE_DIR:-}" ]; then
+    export FACTOR_CACHE_DIR="${QA_FACTOR_CACHE_DIR}"
+elif [ -n "${QA_QLIB_DATA_DIR:-}" ]; then
+    case "$(basename "${QA_QLIB_DATA_DIR}")" in
+        us_data)
+            export FACTOR_CACHE_DIR="data/results/factor_cache_us" ;;
+        cn_data|*)
+            export FACTOR_CACHE_DIR="data/results/factor_cache" ;;
+    esac
+fi
+
 # QA_CHAT_SEED overrides CHAT_SEED *after* .env is sourced. Sourcing .env
 # assigns CHAT_SEED unconditionally, so an exported value is silently clobbered
 # -- which would have left every replication of a paper run on an identical LLM
@@ -168,8 +248,13 @@ if [ -n "${QLIB_DATA}" ]; then
     # a non-existent data dir (data_path=~/.qlib/qlib_data/data/qlib/cn_data).
     QLIB_DATA_ABS="$(cd "${QLIB_DATA}" && pwd)"
     mkdir -p "${QLIB_SYMLINK_DIR}"
-    if [ ! -L "${QLIB_SYMLINK_DIR}/cn_data" ] || [ "$(readlink "${QLIB_SYMLINK_DIR}/cn_data")" != "${QLIB_DATA_ABS}" ]; then
-        ln -sfn "${QLIB_DATA_ABS}" "${QLIB_SYMLINK_DIR}/cn_data"
+    # Leaf name = the unpacked dir's basename so the symlink matches whatever
+    # market was unpacked -- cn_data for A-shares, us_data for S&P 500 -- and
+    # QLIB_PROVIDER_URI=~/.qlib/qlib_data/<leaf> resolves for either. Hardcoding
+    # cn_data here meant only the A-share root got a symlink.
+    QLIB_SYMLINK_NAME="$(basename "${QLIB_DATA_ABS}")"
+    if [ ! -L "${QLIB_SYMLINK_DIR}/${QLIB_SYMLINK_NAME}" ] || [ "$(readlink "${QLIB_SYMLINK_DIR}/${QLIB_SYMLINK_NAME}")" != "${QLIB_DATA_ABS}" ]; then
+        ln -sfn "${QLIB_DATA_ABS}" "${QLIB_SYMLINK_DIR}/${QLIB_SYMLINK_NAME}"
     fi
 fi
 
@@ -263,6 +348,43 @@ export QA_MAX_ROUNDS_CAP="${QA_MAX_ROUNDS_CAP:-60}"
 # vs 9.2 GB at 3, and 3 swaps. Independent of QA_SEED_WORKERS, which sizes the
 # eval fork pool.
 export MULTI_PROC_N="${MULTI_PROC_N:-2}"
+
+# -----------------------------------------------------------------------------
+# Market/protocol guard: fail LOUD before any LLM spend.
+# -----------------------------------------------------------------------------
+# QA_PROTOCOL defaults to the CSI300 protocol (line above), while the
+# FACTOR_CoSTEER_DATA_FOLDER + FACTOR_CACHE_DIR blocks switch WITH QA_QLIB_DATA_DIR.
+# So setting QA_QLIB_DATA_DIR=us_data WITHOUT also setting QA_PROTOCOL silently
+# ran US data under the CSI300 protocol (theta hash fbefcb65f408aee0) -- a
+# misconfigured mine that wastes LLM budget on a market/protocol mismatch and
+# admissions scored against the wrong cost model. The protocol does NOT auto-
+# switch with the data dir, so guard it: the protocol path's market token must
+# match the effective qlib data dir. (An accidental launch hit exactly this.)
+case "$(basename "${QLIB_DATA_DIR:-}")" in
+    us_data) _data_market="sp500" ;;
+    cn_data) _data_market="csi300" ;;
+    *) _data_market="" ;;
+esac
+if [ -n "${_data_market:-}" ]; then
+    case "${QA_PROTOCOL}" in
+        *csi300*)
+            if [ "${_data_market}" = "sp500" ]; then
+                echo "Error: QLIB_DATA_DIR is us_data but QA_PROTOCOL is the CSI300 protocol" >&2
+                echo "       (${QA_PROTOCOL})." >&2
+                echo "  A US mine must use the S&P 500 protocol. Set:" >&2
+                echo "    QA_PROTOCOL=\${SCRIPT_DIR}/quantaalpha/eval/protocol_sp500_meanvar_soft_linear.yaml" >&2
+                exit 1
+            fi ;;
+        *sp500*)
+            if [ "${_data_market}" = "csi300" ]; then
+                echo "Error: QLIB_DATA_DIR is cn_data but QA_PROTOCOL is the S&P 500 protocol" >&2
+                echo "       (${QA_PROTOCOL})." >&2
+                echo "  A CSI300 mine must use the CSI300 protocol. Set:" >&2
+                echo "    QA_PROTOCOL=\${SCRIPT_DIR}/quantaalpha/eval/protocol_csi300_meanvar_soft_linear.yaml" >&2
+                exit 1
+            fi ;;
+    esac
+fi
 
 # -----------------------------------------------------------------------------
 # Preflight: fail before any LLM spend, not five minutes into the run
