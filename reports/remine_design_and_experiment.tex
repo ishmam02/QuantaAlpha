@@ -46,14 +46,14 @@ year being traded, with the factor library unchanged throughout.}
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 year & $\rid$ & ARR & $\rid$ & ARR & $\Delta$ARR \\
 \midrule
-2021 & 0.0504 & $+5.82\%$  & 0.0586 & $+11.40\%$ & $+5.58$ pp \\
-2022 & 0.0524 & $+1.81\%$  & 0.0598 & $+8.98\%$  & $+7.17$ pp \\
+2021 & 0.0504 & $+5.82\%$  & 0.0586 & $+11.40\%$ & $+5.59$ pp \\
+2022 & 0.0524 & $+1.81\%$  & 0.0598 & $+8.98\%$  & $+7.18$ pp \\
 2023 & 0.0160 & $-7.42\%$  & 0.0298 & $-1.99\%$  & $+5.43$ pp \\
 2024 & 0.0288 & $-4.31\%$  & 0.0533 & $-3.75\%$  & $+0.56$ pp \\
 2025 & 0.0469 & $-14.94\%$ & 0.0616 & $-10.25\%$ & $+4.69$ pp \\
 \midrule
 mean & 0.0389 & & 0.0526 & & $+4.69$ pp \\
-\textbf{CRR} & & $\bm{-18.8\%}$ & & $\bm{+2.68\%}$ & $+21.5$ pp \\
+\textbf{CRR} & & $\bm{-18.2\%}$ & & $\bm{+2.68\%}$ & $+20.9$ pp \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -229,10 +229,10 @@ equity signal on every predictive-power metric, and its first year is above it. 
 system finds alpha. That was the research question and the answer is yes.
 
 Where it goes wrong is construction. Take
-$\mathrm{IR}=\mathrm{TC}\cdot\mathrm{IC}\cdot\sqrt{N}$: with IC 0.0425,
-$\sqrt{300}=17.3$ and TC 0.37, gross IR comes out around 0.3. Each term on its own
-is ordinary. A TC of 0.37 is normal for a long-only book, which usually runs
-0.3--0.6, so there is no hidden loss to go and recover. The product is too small
+$\mathrm{IR}=\mathrm{TC}\cdot\mathrm{RankIC}\cdot\sqrt{N}$: with Rank IC
+0.0439, $\sqrt{300}=17.3$ and TC 0.39, gross IR comes out at 0.30. Each term on its
+own is ordinary --- a TC near 0.4 is normal for a long-only book, which usually runs
+0.3--0.6 --- so there is no hidden loss to go and recover. The product is too small
 because of the mandate --- 300 names, 50 holdings, long only, measured against a
 cap-weighted index we have no way to hedge.
 
